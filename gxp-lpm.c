@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * GXP power management interface.
+ * GXP local power management interface.
  *
  * Copyright (C) 2021 Google LLC
  */
@@ -36,7 +36,7 @@ static void enable_state(struct gxp_dev *gxp, uint psm, uint state)
 	lpm_write_32_psm(gxp, psm, offset, 0x1);
 }
 
-static bool is_initialized(struct gxp_dev *gxp, uint psm)
+bool gxp_lpm_is_initialized(struct gxp_dev *gxp, uint psm)
 {
 	u32 status = lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET);
 
@@ -55,28 +55,6 @@ static uint get_state(struct gxp_dev *gxp, uint psm)
 	u32 status = lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET);
 
 	return status & PSM_CURR_STATE_MASK;
-}
-
-int gxp_blk_set_state(struct gxp_dev *gxp, unsigned long state)
-{
-	int ret = 0;
-
-#ifdef CONFIG_GXP_CLOUDRIPPER
-	ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, state);
-	dev_dbg(gxp->dev, "%s: state %lu, ret %d\n", __func__, state, ret);
-#endif
-	return ret;
-}
-
-int gxp_blk_get_state(struct gxp_dev *gxp)
-{
-	int ret = 0;
-
-#ifdef CONFIG_GXP_CLOUDRIPPER
-	ret = exynos_acpm_get_rate(AUR_DVFS_DOMAIN, AUR_DEBUG_CORE_FREQ);
-	dev_dbg(gxp->dev, "%s: state %d\n", __func__, ret);
-#endif
-	return ret;
 }
 
 static int set_state_internal(struct gxp_dev *gxp, uint psm, uint target_state)
@@ -143,7 +121,7 @@ static int psm_enable(struct gxp_dev *gxp, uint psm)
 	int i = 10000;
 
 	/* Return early if LPM is already initialized */
-	if (is_initialized(gxp, psm)) {
+	if (gxp_lpm_is_initialized(gxp, psm)) {
 		if (psm != LPM_TOP_PSM) {
 			/* Ensure core is in PS2 */
 			return set_state(gxp, psm, LPM_PG_W_RET_STATE);
@@ -228,7 +206,7 @@ int gxp_lpm_up(struct gxp_dev *gxp, uint core)
 	dev_notice(gxp->dev, "Enabling Core%u PSM...\n", core);
 	if (psm_enable(gxp, core)) {
 		dev_notice(gxp->dev, "Timed out!\n");
-		return 0;
+		return -ETIMEDOUT;
 	}
 	dev_notice(gxp->dev, "Enabled\n");
 

@@ -445,6 +445,75 @@ alloc_sgt_for_buffer(void *ptr, size_t size,
 	return sgt;
 }
 
+#ifdef CONFIG_ANDROID
+int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
+			   struct edgetpu_ext_mailbox_info *mbx_info)
+{
+	struct gxp_dma_iommu_manager *mgr = container_of(
+		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
+	uint orig_core_list = core_list;
+	u64 queue_iova;
+	int core;
+	int ret;
+	int i = 0;
+
+	while (core_list) {
+		phys_addr_t cmdq_pa = mbx_info->mailboxes[i].cmdq_pa;
+		phys_addr_t respq_pa = mbx_info->mailboxes[i++].respq_pa;
+
+		core = ffs(core_list) - 1;
+		core_list &= ~BIT(core);
+		queue_iova = GXP_IOVA_TPU_MBX_BUFFER(core);
+		ret = iommu_map(mgr->core_domains[core], queue_iova,
+				cmdq_pa, mbx_info->cmdq_size, IOMMU_WRITE);
+		if (ret)
+			goto error;
+		ret = iommu_map(mgr->core_domains[core],
+				queue_iova + mbx_info->cmdq_size, respq_pa,
+				mbx_info->respq_size, IOMMU_READ);
+		if (ret) {
+			iommu_unmap(mgr->core_domains[core], queue_iova,
+				    mbx_info->cmdq_size);
+			goto error;
+		}
+	}
+	return 0;
+
+error:
+	core_list ^= orig_core_list;
+	while (core_list) {
+		core = ffs(core_list) - 1;
+		core_list &= ~BIT(core);
+		queue_iova = GXP_IOVA_TPU_MBX_BUFFER(core);
+		iommu_unmap(mgr->core_domains[core], queue_iova,
+			    mbx_info->cmdq_size);
+		iommu_unmap(mgr->core_domains[core], queue_iova +
+			    mbx_info->cmdq_size, mbx_info->respq_size);
+	}
+	return ret;
+}
+
+void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
+			      struct gxp_tpu_mbx_desc mbx_desc)
+{
+	struct gxp_dma_iommu_manager *mgr = container_of(
+		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
+	uint core_list = mbx_desc.phys_core_list;
+	u64 queue_iova;
+	int core;
+
+	while (core_list) {
+		core = ffs(core_list) - 1;
+		core_list &= ~BIT(core);
+		queue_iova = GXP_IOVA_TPU_MBX_BUFFER(core);
+		iommu_unmap(mgr->core_domains[core], queue_iova,
+			    mbx_desc.cmdq_size);
+		iommu_unmap(mgr->core_domains[core], queue_iova +
+			    mbx_desc.cmdq_size, mbx_desc.respq_size);
+	}
+}
+#endif  // CONFIG_ANDROID
+
 void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 			     dma_addr_t *dma_handle, gfp_t flag,
 			     uint gxp_dma_flags)

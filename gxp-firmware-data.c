@@ -9,6 +9,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/genalloc.h>
 
+#include "gxp.h"
 #include "gxp-firmware-data.h"
 #include "gxp-host-device-structs.h"
 #include "gxp-internal.h"
@@ -94,7 +95,7 @@ struct gxp_fw_data_manager {
 	struct fw_memory_allocator *allocator;
 	struct fw_memory sys_desc_mem;
 	struct fw_memory wdog_mem;
-	struct fw_memory logging_tracing_mem;
+	struct fw_memory telemetry_mem;
 };
 
 /* A container holding information for a single GXP application. */
@@ -272,22 +273,22 @@ static struct fw_memory init_watchdog(struct gxp_fw_data_manager *mgr)
 	return mem;
 }
 
-static struct fw_memory init_logging_tracing(struct gxp_fw_data_manager *mgr)
+static struct fw_memory init_telemetry(struct gxp_fw_data_manager *mgr)
 {
-	struct gxp_logging_tracing_descriptor *lt_region;
+	struct gxp_telemetry_descriptor *tel_region;
 	struct fw_memory mem;
 
-	mem_alloc_allocate(mgr->allocator, &mem, sizeof(*lt_region),
-			   __alignof__(struct gxp_logging_tracing_descriptor));
+	mem_alloc_allocate(mgr->allocator, &mem, sizeof(*tel_region),
+			   __alignof__(struct gxp_telemetry_descriptor));
 
-	lt_region = mem.host_addr;
+	tel_region = mem.host_addr;
 
 	/*
-	 * Logging and tracing is disabled for now.
+	 * Telemetry is disabled for now.
 	 * Subsuequent calls to the FW data module can be used to populate or
 	 * depopulate the descriptor pointers on demand.
 	 */
-	memset(lt_region, 0x00, sizeof(*lt_region));
+	memset(tel_region, 0x00, sizeof(*tel_region));
 
 	return mem;
 }
@@ -595,10 +596,9 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 	mgr->wdog_mem = init_watchdog(mgr);
 	mgr->system_desc->watchdog_dev_addr = mgr->wdog_mem.device_addr;
 
-	/* Allocate the descriptor for device-side logging and tracing */
-	mgr->logging_tracing_mem = init_logging_tracing(mgr);
-	mgr->system_desc->logging_tracing_dev_addr =
-		mgr->logging_tracing_mem.device_addr;
+	/* Allocate the descriptor for device-side telemetry */
+	mgr->telemetry_mem = init_telemetry(mgr);
+	mgr->system_desc->telemetry_dev_addr = mgr->telemetry_mem.device_addr;
 
 	return res;
 
@@ -689,7 +689,7 @@ void gxp_fw_data_destroy(struct gxp_dev *gxp)
 {
 	struct gxp_fw_data_manager *mgr = gxp->data_mgr;
 
-	mem_alloc_free(mgr->allocator, &mgr->logging_tracing_mem);
+	mem_alloc_free(mgr->allocator, &mgr->telemetry_mem);
 	mem_alloc_free(mgr->allocator, &mgr->wdog_mem);
 	mem_alloc_free(mgr->allocator, &mgr->sys_desc_mem);
 	mem_alloc_destroy(mgr->allocator);
@@ -707,4 +707,28 @@ void gxp_fw_data_destroy(struct gxp_dev *gxp)
 		devm_kfree(gxp->dev, gxp->data_mgr);
 		gxp->data_mgr = NULL;
 	}
+}
+
+int gxp_fw_data_set_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
+					  u32 *buffer_addrs,
+					  u32 per_buffer_size)
+{
+	struct gxp_telemetry_descriptor *descriptor =
+		gxp->data_mgr->telemetry_mem.host_addr;
+	struct telemetry_descriptor *core_descriptors;
+	int i;
+
+	if (type == GXP_TELEMETRY_TYPE_LOGGING)
+		core_descriptors = descriptor->per_core_loggers;
+	else if (type == GXP_TELEMETRY_TYPE_TRACING)
+		core_descriptors = descriptor->per_core_tracers;
+	else
+		return -EINVAL;
+
+	for (i = 0; i < NUM_CORES; i++) {
+		core_descriptors[i].buffer_addr = buffer_addrs[i];
+		core_descriptors[i].buffer_size = per_buffer_size;
+	}
+
+	return 0;
 }

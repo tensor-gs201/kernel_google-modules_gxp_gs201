@@ -11,8 +11,9 @@
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
 #include "gxp-internal.h"
-#include "gxp-lpm.h"
+#include "gxp-pm.h"
 #include "gxp-mailbox.h"
+#include "gxp-telemetry.h"
 #include "gxp-vd.h"
 
 static int gxp_debugfs_lpm_test(void *data, u64 val)
@@ -165,7 +166,7 @@ static int gxp_blk_powerstate_set(void *data, u64 val)
 	int ret = 0;
 
 	if (val >= AUR_DVFS_MIN_STATE) {
-		ret = gxp_blk_set_state(gxp, val);
+		ret = gxp_pm_blk_set_state_acpm(gxp, val);
 	} else {
 		ret = -EINVAL;
 		dev_err(gxp->dev, "Incorrect state %llu\n", val);
@@ -177,7 +178,7 @@ static int gxp_blk_powerstate_get(void *data, u64 *val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
 
-	*val = gxp_blk_get_state(gxp);
+	*val = gxp_pm_blk_get_state_acpm(gxp);
 	return 0;
 }
 
@@ -189,6 +190,66 @@ static int gxp_debugfs_coredump(void *data, u64 val)
 	return gxp_debugfs_mailbox(data, GXP_MBOX_CODE_COREDUMP);
 }
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_coredump_fops, NULL, gxp_debugfs_coredump,
+			 "%llu\n");
+
+static int gxp_log_buff_set(void *data, u64 val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	int i;
+	u64 **buffers;
+	u64 *ptr;
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
+	if (!gxp->telemetry_mgr->logging_buff_data) {
+		dev_err(gxp->dev, "%s: Logging buffer has not been created\n",
+			__func__);
+		mutex_unlock(&gxp->telemetry_mgr->lock);
+		return -ENODEV;
+	}
+
+	buffers = (u64 **)gxp->telemetry_mgr->logging_buff_data->buffers;
+	for (i = 0; i < GXP_NUM_CORES; i++) {
+		ptr = buffers[i];
+		*ptr = val;
+	}
+	dev_dbg(gxp->dev,
+		"%s: log buff first bytes: [0] = %llu, [1] = %llu, [2] = %llu, [3] = %llu (val=%llu)\n",
+		__func__, *buffers[0], *buffers[1], *buffers[2], *buffers[3],
+		val);
+
+	mutex_unlock(&gxp->telemetry_mgr->lock);
+
+	return 0;
+}
+
+static int gxp_log_buff_get(void *data, u64 *val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	u64 **buffers;
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
+	if (!gxp->telemetry_mgr->logging_buff_data) {
+		dev_err(gxp->dev, "%s: Logging buffer has not been created\n",
+			__func__);
+		mutex_unlock(&gxp->telemetry_mgr->lock);
+		return -ENODEV;
+	}
+
+	buffers = (u64 **)gxp->telemetry_mgr->logging_buff_data->buffers;
+	dev_dbg(gxp->dev,
+		"%s: log buff first bytes: [0] = %llu, [1] = %llu, [2] = %llu, [3] = %llu\n",
+		__func__, *buffers[0], *buffers[1], *buffers[2], *buffers[3]);
+
+	*val = *buffers[0];
+
+	mutex_unlock(&gxp->telemetry_mgr->lock);
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(gxp_log_buff_fops, gxp_log_buff_get, gxp_log_buff_set,
 			 "%llu\n");
 
 void gxp_create_debugfs(struct gxp_dev *gxp)
@@ -209,6 +270,7 @@ void gxp_create_debugfs(struct gxp_dev *gxp)
 			    &gxp_blk_powerstate_fops);
 	debugfs_create_file("coredump", 0200, gxp->d_entry, gxp,
 			    &gxp_coredump_fops);
+	debugfs_create_file("log", 0600, gxp->d_entry, gxp, &gxp_log_buff_fops);
 }
 
 void gxp_remove_debugfs(struct gxp_dev *gxp)

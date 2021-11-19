@@ -10,6 +10,9 @@
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/types.h>
+#ifdef CONFIG_ANDROID
+#include <soc/google/tpu-ext.h>
+#endif
 
 #include "gxp-internal.h"
 
@@ -73,6 +76,29 @@ int gxp_dma_map_resources(struct gxp_dev *gxp);
  * This function should be called after gxp_dma_map_resources().
  */
 void gxp_dma_unmap_resources(struct gxp_dev *gxp);
+
+#ifdef CONFIG_ANDROID
+/**
+ * gxp_dma_map_tpu_buffer() - Map the tpu mbx queue buffers with fixed IOVAs
+ * @gxp: The GXP device to setup the mappings for
+ * @core_list: A bitfield enumerating the physical cores the mapping is for
+ * @mbx_info: Structure holding TPU-DSP mailbox queue buffer information
+ *
+ * Return:
+ * * 0    - Mappings created successfully
+ * * -EIO - Failed to create the mappings
+ */
+int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
+			   struct edgetpu_ext_mailbox_info *mbx_info);
+
+/**
+ * gxp_dma_unmap_tpu_buffer() - Unmap IOVAs mapped by gxp_dma_map_tpu_buffer()
+ * @gxp: The GXP device that was passed to gxp_dma_map_tpu_buffer()
+ * @mbx_desc: Structure holding info for already mapped TPU-DSP mailboxes.
+ */
+void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
+			      struct gxp_tpu_mbx_desc mbx_desc);
+#endif  // CONFIG_ANDROID
 
 /**
  * gxp_dma_alloc_coherent() - Allocate and map a coherent buffer for a GXP core

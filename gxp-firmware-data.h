@@ -53,4 +53,23 @@ void gxp_fw_data_destroy_app(struct gxp_dev *gxp, void *application);
  */
 void gxp_fw_data_destroy(struct gxp_dev *gxp);
 
+/**
+ * gxp_fw_data_set_telemetry_descriptors() - Set new logging or tracing buffers
+ *                                           for firmware to write to.
+ * @gxp: The GXP device to set buffer descriptors for
+ * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ * @buffer_addrs: An array containing the IOVA each physical core can access
+ *                its logging or tracing buffer at
+ * @per_buffer_size: The size of each core's logging or tracing buffer in bytes
+ *
+ * `gxp_fw_data_init()` must have been called before this function.
+ *
+ * Return:
+ * 0       - Success
+ * -EINVAL - Invalid @type provided
+ */
+int gxp_fw_data_set_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
+					  u32 *buffer_addrs,
+					  u32 per_buffer_size);
+
 #endif /* __GXP_FIRMWARE_DATA_H__ */

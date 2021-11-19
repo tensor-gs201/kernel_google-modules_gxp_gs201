@@ -17,6 +17,8 @@ gxp-objs +=	\
 		gxp-mapping.o \
 		gxp-platform.o \
 		gxp-range-alloc.o \
+		gxp-pm.o \
+		gxp-telemetry.o \
 		gxp-vd.o
 
 KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
@@ -54,6 +56,16 @@ endif
 ccflags-y += -DCONFIG_GXP_$(GXP_PLATFORM)
 
 KBUILD_OPTIONS += CONFIG_GXP=m
+
+ifdef CONFIG_GXP_TEST
+subdir-ccflags-y        += -Wall -Werror
+obj-y           += unittests/
+include $(srctree)/drivers/gxp/unittests/Makefile.include
+$(call include_test_path, $(gxp-objs))
+endif
+
+# Access TPU driver's exported symbols.
+KBUILD_EXTRA_SYMBOLS += ../google-modules/edgetpu/janeiro/drivers/edgetpu/Module.symvers
 
 modules modules_install clean:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) W=1 $(KBUILD_OPTIONS) $(@)

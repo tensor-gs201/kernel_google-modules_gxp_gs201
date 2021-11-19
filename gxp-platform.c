@@ -15,12 +15,16 @@
 #include <linux/fs.h>
 #include <linux/genalloc.h>
 #include <linux/kthread.h>
+#include <linux/log2.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/uaccess.h>
+#ifdef CONFIG_ANDROID
+#include <soc/google/tpu-ext.h>
+#endif
 
 #include "gxp.h"
 #include "gxp-debug-dump.h"
@@ -32,6 +36,8 @@
 #include "gxp-mailbox.h"
 #include "gxp-mailbox-driver.h"
 #include "gxp-mapping.h"
+#include "gxp-pm.h"
+#include "gxp-telemetry.h"
 #include "gxp-vd.h"
 
 #ifdef CONFIG_ANDROID
@@ -418,6 +424,319 @@ static int gxp_allocate_vd(struct gxp_client *client,
 	return ret;
 }
 
+static int
+gxp_etm_trace_start_command(struct gxp_client *client,
+			    struct gxp_etm_trace_start_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_etm_trace_start_ioctl ibuf;
+	int phys_core;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	ibuf.trace_ram_enable &= ETM_TRACE_LSB_MASK;
+	ibuf.atb_enable &= ETM_TRACE_LSB_MASK;
+
+	if (!ibuf.trace_ram_enable && !ibuf.atb_enable)
+		return -EINVAL;
+
+	if (!(ibuf.sync_msg_period == 0 ||
+	    (ibuf.sync_msg_period <= ETM_TRACE_SYNC_MSG_PERIOD_MAX &&
+	     ibuf.sync_msg_period >= ETM_TRACE_SYNC_MSG_PERIOD_MIN &&
+	     is_power_of_2(ibuf.sync_msg_period))))
+		return -EINVAL;
+
+	if (ibuf.pc_match_mask_length > ETM_TRACE_PC_MATCH_MASK_LEN_MAX)
+		return -EINVAL;
+
+	phys_core = gxp_vd_virt_core_to_phys_core(client, ibuf.virtual_core_id);
+	if (phys_core < 0) {
+		dev_err(gxp->dev, "Trace start failed: Invalid virtual core id (%u)\n",
+			ibuf.virtual_core_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * TODO (b/185260919): Pass the etm trace configuration to system FW
+	 * once communication channel between kernel and system FW is ready
+	 * (b/185819530).
+	 */
+
+	return 0;
+}
+
+static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
+					 __u16 __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	u16 virtual_core_id;
+	int phys_core;
+
+	if (copy_from_user(&virtual_core_id, argp, sizeof(virtual_core_id)))
+		return -EFAULT;
+
+
+	phys_core = gxp_vd_virt_core_to_phys_core(client, virtual_core_id);
+	if (phys_core < 0) {
+		dev_err(gxp->dev, "Trace stop via software trigger failed: Invalid virtual core id (%u)\n",
+			virtual_core_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * TODO (b/185260919): Pass the etm stop signal to system FW once
+	 * communication channel between kernel and system FW is ready
+	 * (b/185819530).
+	 */
+
+	return 0;
+}
+
+static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
+					 __u16 __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	u16 virtual_core_id;
+	int phys_core;
+
+	if (copy_from_user(&virtual_core_id, argp, sizeof(virtual_core_id)))
+		return -EFAULT;
+
+	phys_core = gxp_vd_virt_core_to_phys_core(client, virtual_core_id);
+	if (phys_core < 0) {
+		dev_err(gxp->dev, "Trace cleanup failed: Invalid virtual core id (%u)\n",
+			virtual_core_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * TODO (b/185260919): Pass the etm clean up signal to system FW once
+	 * communication channel between kernel and system FW is ready
+	 * (b/185819530).
+	 */
+
+	return 0;
+}
+
+static int
+gxp_etm_get_trace_info_command(struct gxp_client *client,
+			       struct gxp_etm_get_trace_info_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_etm_get_trace_info_ioctl ibuf;
+	int phys_core;
+	u32 *trace_header;
+	u32 *trace_data;
+	int ret = 0;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	if (ibuf.type > 1)
+		return -EINVAL;
+
+	phys_core = gxp_vd_virt_core_to_phys_core(client, ibuf.virtual_core_id);
+	if (phys_core < 0) {
+		dev_err(gxp->dev, "Get trace info failed: Invalid virtual core id (%u)\n",
+			ibuf.virtual_core_id);
+		return -EINVAL;
+	}
+
+	trace_header = kzalloc(GXP_TRACE_HEADER_SIZE, GFP_KERNEL);
+	trace_data = kzalloc(GXP_TRACE_RAM_SIZE, GFP_KERNEL);
+
+	/*
+	 * TODO (b/185260919): Get trace information from system FW once
+	 * communication channel between kernel and system FW is ready
+	 * (b/185819530).
+	 */
+
+	if (copy_to_user((void __user *)ibuf.trace_header_addr, trace_header,
+			 GXP_TRACE_HEADER_SIZE)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	if (ibuf.type == 1) {
+		if (copy_to_user((void __user *)ibuf.trace_data_addr,
+				 trace_data, GXP_TRACE_RAM_SIZE)) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+
+out:
+	kfree(trace_header);
+	kfree(trace_data);
+
+	return ret;
+}
+
+static int gxp_enable_telemetry(struct gxp_client *client,
+				__u8 __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	__u8 type;
+
+	if (copy_from_user(&type, argp, sizeof(type)))
+		return -EFAULT;
+
+	if (type != GXP_TELEMETRY_TYPE_LOGGING &&
+	    type != GXP_TELEMETRY_TYPE_TRACING)
+		return -EINVAL;
+
+	return gxp_telemetry_enable(gxp, type);
+}
+
+static int gxp_disable_telemetry(struct gxp_client *client, __u8 __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	__u8 type;
+
+	if (copy_from_user(&type, argp, sizeof(type)))
+		return -EFAULT;
+
+	if (type != GXP_TELEMETRY_TYPE_LOGGING &&
+	    type != GXP_TELEMETRY_TYPE_TRACING)
+		return -EINVAL;
+
+	return gxp_telemetry_disable(gxp, type);
+}
+
+static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
+				 struct gxp_tpu_mbx_queue_ioctl __user *argp)
+{
+#ifdef CONFIG_ANDROID
+	struct gxp_dev *gxp = client->gxp;
+	struct edgetpu_ext_mailbox_info *mbx_info;
+	struct gxp_tpu_mbx_queue_ioctl ibuf;
+	struct edgetpu_ext_client_info gxp_tpu_info;
+	u32 phys_core_list = 0;
+	u32 virtual_core_list;
+	u32 core_count;
+	int ret = 0;
+
+	if (!gxp->tpu_dev.mbx_paddr) {
+		dev_err(gxp->dev, "%s: TPU is not available for interop\n",
+			__func__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	virtual_core_list = ibuf.virtual_core_list;
+	core_count = hweight_long(virtual_core_list);
+	phys_core_list = gxp_vd_virt_core_list_to_phys_core_list(
+		client, virtual_core_list);
+	if (!phys_core_list) {
+		dev_err(gxp->dev, "%s: invalid virtual core list 0x%x\n",
+			__func__, virtual_core_list);
+		return -EINVAL;
+	}
+
+	mbx_info =
+		kmalloc(sizeof(struct edgetpu_ext_mailbox_info) + core_count *
+			sizeof(struct edgetpu_ext_mailbox_descriptor),
+			GFP_KERNEL);
+	if (!mbx_info)
+		return -ENOMEM;
+
+	mutex_lock(&gxp->vd_lock);
+
+	if (client->tpu_mbx_allocated) {
+		dev_err(gxp->dev, "%s: Mappings already exist for TPU mailboxes\n",
+			__func__);
+		ret = -EBUSY;
+		goto error;
+	}
+
+	gxp_tpu_info.tpu_fd = ibuf.tpu_fd;
+	gxp_tpu_info.mbox_map = phys_core_list;
+	gxp_tpu_info.attr = (struct edgetpu_mailbox_attr __user *)ibuf.attr_ptr;
+	ret = edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
+				     EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
+				     ALLOCATE_EXTERNAL_MAILBOX, &gxp_tpu_info,
+				     mbx_info);
+	if (ret) {
+		dev_err(gxp->dev, "%s: Failed to allocate ext tpu mailboxes %d\n",
+			__func__, ret);
+		goto error;
+	}
+	/* Align queue size to page size for iommu map. */
+	mbx_info->cmdq_size = ALIGN(mbx_info->cmdq_size, PAGE_SIZE);
+	mbx_info->respq_size = ALIGN(mbx_info->respq_size, PAGE_SIZE);
+
+	ret = gxp_dma_map_tpu_buffer(gxp, phys_core_list, mbx_info);
+	if (ret) {
+		dev_err(gxp->dev, "%s: failed to map TPU mailbox buffer %d\n",
+			__func__, ret);
+		edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
+				       EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
+				       FREE_EXTERNAL_MAILBOX, &gxp_tpu_info,
+				       NULL);
+		goto error;
+	}
+	client->mbx_desc.phys_core_list = phys_core_list;
+	client->mbx_desc.cmdq_size = mbx_info->cmdq_size;
+	client->mbx_desc.respq_size = mbx_info->respq_size;
+	client->tpu_mbx_allocated = true;
+
+error:
+	mutex_unlock(&gxp->vd_lock);
+
+	kfree(mbx_info);
+	return ret;
+#else
+	return -ENODEV;
+#endif
+}
+
+static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
+				   struct gxp_tpu_mbx_queue_ioctl __user *argp)
+{
+#ifdef CONFIG_ANDROID
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_tpu_mbx_queue_ioctl ibuf;
+	struct edgetpu_ext_client_info gxp_tpu_info;
+	int ret = 0;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	mutex_lock(&gxp->vd_lock);
+
+	if (!client->tpu_mbx_allocated) {
+		dev_err(gxp->dev, "%s: No mappings exist for TPU mailboxes\n",
+			__func__);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	gxp_dma_unmap_tpu_buffer(gxp, client->mbx_desc);
+
+	gxp_tpu_info.tpu_fd = ibuf.tpu_fd;
+	ret = edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
+				     EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
+				     FREE_EXTERNAL_MAILBOX, &gxp_tpu_info,
+				     NULL);
+	if (ret) {
+		dev_err(gxp->dev, "%s: Failed to free ext tpu mailboxes %d\n",
+			__func__, ret);
+		goto out;
+	}
+	client->tpu_mbx_allocated = false;
+
+out:
+	mutex_unlock(&gxp->vd_lock);
+
+	return ret;
+#else
+	return -ENODEV;
+#endif
+}
+
 static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 {
 	struct gxp_client *client = file->private_data;
@@ -446,6 +765,30 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 	case GXP_ALLOCATE_VIRTUAL_DEVICE:
 		ret = gxp_allocate_vd(client, argp);
 		break;
+	case GXP_ETM_TRACE_START_COMMAND:
+		ret = gxp_etm_trace_start_command(client, argp);
+		break;
+	case GXP_ETM_TRACE_SW_STOP_COMMAND:
+		ret = gxp_etm_trace_sw_stop_command(client, argp);
+		break;
+	case GXP_ETM_TRACE_CLEANUP_COMMAND:
+		ret = gxp_etm_trace_cleanup_command(client, argp);
+		break;
+	case GXP_ETM_GET_TRACE_INFO_COMMAND:
+		ret = gxp_etm_get_trace_info_command(client, argp);
+		break;
+	case GXP_ENABLE_TELEMETRY:
+		ret = gxp_enable_telemetry(client, argp);
+		break;
+	case GXP_DISABLE_TELEMETRY:
+		ret = gxp_disable_telemetry(client, argp);
+		break;
+	case GXP_MAP_TPU_MBX_QUEUE:
+		ret = gxp_map_tpu_mbx_queue(client, argp);
+		break;
+	case GXP_UNMAP_TPU_MBX_QUEUE:
+		ret = gxp_unmap_tpu_mbx_queue(client, argp);
+		break;
 	default:
 		ret = -ENOTTY; /* unknown command */
 	}
@@ -453,8 +796,31 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 	return ret;
 }
 
+static int gxp_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct gxp_client *client = file->private_data;
+
+	if (!client)
+		return -ENODEV;
+
+	switch (vma->vm_pgoff << PAGE_SHIFT) {
+	case GXP_MMAP_LOG_BUFFER_OFFSET:
+		return gxp_telemetry_mmap_buffers(client->gxp,
+						  GXP_TELEMETRY_TYPE_LOGGING,
+						  vma);
+	case GXP_MMAP_TRACE_BUFFER_OFFSET:
+		return gxp_telemetry_mmap_buffers(client->gxp,
+						  GXP_TELEMETRY_TYPE_TRACING,
+						  vma);
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct file_operations gxp_fops = {
 	.owner = THIS_MODULE,
+	.llseek = no_llseek,
+	.mmap = gxp_mmap,
 	.open = gxp_open,
 	.release = gxp_release,
 	.unlocked_ioctl = gxp_ioctl,
@@ -467,6 +833,7 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	struct resource *r;
 	phys_addr_t offset, base_addr;
 	struct device_node *np;
+	struct platform_device *tpu_pdev;
 	int ret;
 	int i __maybe_unused;
 	bool tpu_found __maybe_unused;
@@ -506,7 +873,7 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
+#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	pm_runtime_enable(dev);
 	ret = pm_runtime_get_sync(dev);
 	if (ret) {
@@ -541,6 +908,11 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		dev_warn(dev, "No tpu-device in device tree\n");
 		tpu_found = false;
 	}
+	tpu_pdev = of_find_device_by_node(np);
+	if (!tpu_pdev) {
+		dev_err(dev, "TPU device not found\n");
+		tpu_found = false;
+	}
 	/* get tpu mailbox register base */
 	ret = of_property_read_u64_index(np, "reg", 0, &base_addr);
 	of_node_put(np);
@@ -556,6 +928,8 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		tpu_found = false;
 	}
 	if (tpu_found) {
+		gxp->tpu_dev.dev = &tpu_pdev->dev;
+		get_device(gxp->tpu_dev.dev);
 		gxp->tpu_dev.mbx_paddr = base_addr + offset;
 	} else {
 		dev_warn(dev, "TPU will not be available for interop\n");
@@ -566,7 +940,7 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	ret = gxp_dma_init(gxp);
 	if (ret) {
 		dev_err(dev, "Failed to initialize GXP DMA interface\n");
-		goto err;
+		goto err_put_tpu_dev;
 	}
 
 	gxp->mailbox_mgr = gxp_mailbox_create_manager(gxp, GXP_NUM_CORES);
@@ -609,7 +983,9 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	}
 
 	gxp_fw_data_init(gxp);
+	gxp_telemetry_init(gxp);
 	gxp_create_debugfs(gxp);
+	gxp_pm_init(gxp);
 	dev_dbg(dev, "Probe finished\n");
 
 	return 0;
@@ -620,6 +996,10 @@ err_debug_dump_exit:
 	gxp_debug_dump_exit(gxp);
 err_dma_exit:
 	gxp_dma_exit(gxp);
+err_put_tpu_dev:
+#ifndef CONFIG_GXP_USE_SW_MAILBOX
+	put_device(gxp->tpu_dev.dev);
+#endif
 err:
 	misc_deregister(&gxp->misc_dev);
 	devm_kfree(dev, (void *)gxp);
@@ -637,12 +1017,16 @@ static int gxp_platform_remove(struct platform_device *pdev)
 	gxp_vd_destroy(gxp);
 	gxp_dma_unmap_resources(gxp);
 	gxp_dma_exit(gxp);
+#ifndef CONFIG_GXP_USE_SW_MAILBOX
+	put_device(gxp->tpu_dev.dev);
+#endif
 	misc_deregister(&gxp->misc_dev);
 
 #ifdef CONFIG_GXP_CLOUDRIPPER
 	// Request to power off BLK_AUR
-	pm_runtime_put_sync(dev);
+	gxp_pm_blk_off(gxp);
 	pm_runtime_disable(dev);
+	gxp_pm_destroy(gxp);
 #endif
 
 	devm_kfree(dev, (void *)gxp);

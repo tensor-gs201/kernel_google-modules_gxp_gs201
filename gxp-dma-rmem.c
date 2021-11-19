@@ -181,6 +181,20 @@ void gxp_dma_unmap_resources(struct gxp_dev *gxp)
 	/* no mappings to undo */
 }
 
+#ifdef CONFIG_ANDROID
+int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
+			   struct edgetpu_ext_mailbox_info *mbx_info)
+{
+	return -ENODEV;
+}
+
+void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
+			      struct gxp_tpu_mbx_desc mbx_desc)
+{
+	/* no mappings to undo */
+}
+#endif  // CONFIG_ANDROID
+
 void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 			     dma_addr_t *dma_handle, gfp_t flag,
 			     uint gxp_dma_flags)

@@ -10,6 +10,15 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
+/*
+ * mmap offsets for logging and tracing buffers
+ * Requested size will be divided evenly among all cores. The whole buffer
+ * must be page-aligned, and the size of each core's buffer must be a multiple
+ * of PAGE_SIZE.
+ */
+#define GXP_MMAP_LOG_BUFFER_OFFSET	0x10000
+#define GXP_MMAP_TRACE_BUFFER_OFFSET	0x20000
+
 #define GXP_IOCTL_BASE 0xEE
 
 /* GXP map flag macros */
@@ -216,5 +225,169 @@ struct gxp_virtual_device_ioctl {
 /* Allocate virtual device. */
 #define GXP_ALLOCATE_VIRTUAL_DEVICE \
 	_IOWR(GXP_IOCTL_BASE, 6, struct gxp_virtual_device_ioctl)
+
+#define ETM_TRACE_LSB_MASK 0x1
+#define ETM_TRACE_SYNC_MSG_PERIOD_MIN 8
+#define ETM_TRACE_SYNC_MSG_PERIOD_MAX 256
+#define ETM_TRACE_PC_MATCH_MASK_LEN_MAX 31
+
+/*
+ * For all *_enable and pc_match_sense fields, only the least significant bit is
+ * considered. All other bits are ignored.
+ */
+struct gxp_etm_trace_start_ioctl {
+	__u16 virtual_core_id;
+	__u8 trace_ram_enable; /* Enables local trace memory. */
+	/* When set, trace output is sent out on the ATB interface. */
+	__u8 atb_enable;
+	/* Enables embedding timestamp information in trace messages. */
+	__u8 timestamp_enable;
+	/*
+	 * Determines the rate at which synchronization messages are
+	 * automatically emitted in the output trace.
+	 * Valid values: 0, 8, 16, 32, 64, 128, 256
+	 * Eg. A value of 16 means 1 synchronization message will be emitted
+	 * every 16 messages.
+	 * A value of 0 means no synchronization messages will be emitted.
+	 */
+	__u16 sync_msg_period;
+	__u8 pc_match_enable; /* PC match causes Stop trigger. */
+	/*
+	 * 32-bit address to compare to processor PC when pc_match_enable = 1.
+	 * A match for a given executed instruction triggers trace stop.
+	 * Note: trigger_pc is ignored when pc_match_enable = 0.
+	 */
+	__u32 trigger_pc;
+	/*
+	 * Indicates how many of the lower bits of trigger_pc to ignore.
+	 * Valid values: 0 to 31
+	 * Note: pc_match_mask_length is ignored when pc_match_enable = 0.
+	 */
+	__u8 pc_match_mask_length;
+	/* When 0, match when the processor's PC is in-range of trigger_pc and
+	 * mask. When 1, match when the processor's PC is out-of-range of
+	 * trigger_pc and mask.
+	 * Note: pc_match_sense is ignored when pc_match_enable = 0.
+	 */
+	__u8 pc_match_sense;
+};
+
+/* Configure ETM trace registers and start ETM tracing. */
+#define GXP_ETM_TRACE_START_COMMAND \
+	_IOW(GXP_IOCTL_BASE, 7, struct gxp_etm_trace_start_ioctl)
+
+/*
+ * Halts trace generation via a software trigger. The virtual core id is passed
+ * in as an input.
+ */
+#define GXP_ETM_TRACE_SW_STOP_COMMAND \
+	_IOW(GXP_IOCTL_BASE, 8, __u16)
+
+/*
+ * Users should call this IOCTL after tracing has been stopped for the last
+ * trace session of the core. Otherwise, there is a risk of having up to 3 bytes
+ * of trace data missing towards the end of the trace session.
+ * This is a workaround for b/180728272 and b/181623511.
+ * The virtual core id is passed in as an input.
+ */
+#define GXP_ETM_TRACE_CLEANUP_COMMAND \
+	_IOW(GXP_IOCTL_BASE, 9, __u16)
+
+#define GXP_TRACE_HEADER_SIZE 256
+#define GXP_TRACE_RAM_SIZE 4096
+struct gxp_etm_get_trace_info_ioctl {
+	/*
+	 * Input:
+	 * The virtual core to fetch a response from.
+	 */
+	__u16 virtual_core_id;
+	/*
+	 * Input:
+	 * The type of data to retrieve.
+	 * 0: Trace Header only
+	 * 1: Trace Header + Trace Data in Trace RAM
+	 */
+	__u8 type;
+	/*
+	 * Input:
+	 * Trace header user space address to contain trace header information
+	 * that is used for decoding the trace.
+	 */
+	__u64 trace_header_addr;
+        /*
+         * Input:
+	 * Trace data user space address to contain Trace RAM data.
+	 * Note: trace_data field will be empty if type == 0
+	 */
+        __u64 trace_data_addr;
+};
+
+/* Retrieves trace header and/or trace data for decoding purposes. */
+#define GXP_ETM_GET_TRACE_INFO_COMMAND \
+	_IOWR(GXP_IOCTL_BASE, 10, struct gxp_etm_get_trace_info_ioctl)
+
+#define GXP_TELEMETRY_TYPE_LOGGING	(0)
+#define GXP_TELEMETRY_TYPE_TRACING	(1)
+
+/*
+ * Enable either logging or software tracing for all cores.
+ * Accepts either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ * to specify whether logging or software tracing is to be enabled.
+ *
+ * Buffers for logging or tracing must have already been mapped via an `mmap()`
+ * call with the respective offset and initialized by the client, prior to
+ * calling this ioctl.
+ *
+ * If firmware is already running on any cores, they will be signaled to begin
+ * logging/tracing to their buffers. Any cores booting after this call will
+ * begin logging/tracing as soon as their firmware is able to.
+ */
+#define GXP_ENABLE_TELEMETRY _IOWR(GXP_IOCTL_BASE, 11, __u8)
+
+/*
+ * Disable either logging or software tracing for all cores.
+ * Accepts either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ * to specify whether logging or software tracing is to be disabled.
+ *
+ * This call will block until any running cores have been notified and ACKed
+ * that they have disabled the specified telemetry type.
+ */
+#define GXP_DISABLE_TELEMETRY _IOWR(GXP_IOCTL_BASE, 12, __u8)
+
+struct gxp_tpu_mbx_queue_ioctl {
+	__u32 tpu_fd; /* TPU virtual device group fd */
+	/*
+	 * Bitfield indicating which virtual cores to allocate and map the
+	 * buffers for.
+	 * To map for virtual core X, set bit X in this field, i.e. `1 << X`.
+	 *
+	 * This field is not used by the unmap IOCTL, which always unmaps the
+	 * buffers for all cores it had been mapped for.
+	 */
+	__u32 virtual_core_list;
+	/*
+	 * The user address of an edgetpu_mailbox_attr struct, containing
+	 * cmd/rsp queue size, mailbox priority and other relevant info.
+	 * This structure is defined in edgetpu.h in the TPU driver.
+	 */
+	__u64 attr_ptr;
+};
+
+/*
+ * Map TPU-DSP mailbox cmd/rsp queue buffers.
+ */
+#define GXP_MAP_TPU_MBX_QUEUE \
+	_IOW(GXP_IOCTL_BASE, 13, struct gxp_tpu_mbx_queue_ioctl)
+
+/*
+ * Un-map TPU-DSP mailbox cmd/rsp queue buffers previously mapped by
+ * GXP_MAP_TPU_MBX_QUEUE.
+ *
+ * Only the @tpu_fd field will be used. Other fields will be fetched
+ * from the kernel's internal records. It is recommended to use the argument
+ * that was passed in GXP_MAP_TPU_MBX_QUEUE to un-map the buffers.
+ */
+#define GXP_UNMAP_TPU_MBX_QUEUE \
+	_IOW(GXP_IOCTL_BASE, 14, struct gxp_tpu_mbx_queue_ioctl)
 
 #endif /* __GXP_H__ */

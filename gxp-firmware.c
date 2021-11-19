@@ -346,7 +346,7 @@ int gxp_fw_init(struct gxp_dev *gxp)
 		gxp->fwbufs[core].paddr =
 			r.start + (core * gxp->fwbufs[core].size);
 		/*
-		 * Firmware buffers are not mapped into kernal VA space until
+		 * Firmware buffers are not mapped into kernel VA space until
 		 * firmware is ready to be loaded.
 		 */
 	}

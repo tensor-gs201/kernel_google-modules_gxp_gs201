@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
+#include "gxp-dma.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
 #include "gxp-internal.h"
@@ -198,6 +199,7 @@ struct gxp_client *gxp_client_create(struct gxp_dev *gxp)
 	client->gxp = gxp;
 	client->vd_allocated = false;
 	client->app = NULL;
+	client->tpu_mbx_allocated = false;
 	return client;
 }
 
@@ -206,7 +208,17 @@ void gxp_client_destroy(struct gxp_client *client)
 	struct gxp_dev *gxp = client->gxp;
 
 	mutex_lock(&gxp->vd_lock);
+
+#ifdef CONFIG_ANDROID
+	/*
+	 * Unmap TPU buffers, if the mapping is already removed, this
+	 * is a no-op.
+	 */
+	gxp_dma_unmap_tpu_buffer(gxp, client->mbx_desc);
+#endif  // CONFIG_ANDROID
 	gxp_vd_release(client);
+
 	mutex_unlock(&gxp->vd_lock);
+
 	kfree(client);
 }

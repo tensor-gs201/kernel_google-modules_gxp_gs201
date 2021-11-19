@@ -21,11 +21,19 @@
 #include "gxp-config.h"
 #include "gxp-tmp.h"
 
+/* Holds Client's TPU mailboxes info used during mapping */
+struct gxp_tpu_mbx_desc {
+	uint phys_core_list;
+	size_t cmdq_size, respq_size;
+};
+
 /* Holds state belonging to a client */
 struct gxp_client {
 	struct gxp_dev *gxp;
 	void *app;
 	bool vd_allocated;
+	bool tpu_mbx_allocated;
+	struct gxp_tpu_mbx_desc mbx_desc;
 };
 
 /* ioremapped resource */
@@ -43,6 +51,7 @@ struct mailbox_resp_list {
 
 /* Structure to hold TPU device info */
 struct gxp_tpu_dev {
+	struct device *dev;
 	phys_addr_t mbx_paddr;
 };
 
@@ -52,6 +61,8 @@ struct gxp_debug_dump_manager;
 struct gxp_mapping_root;
 struct gxp_dma_manager;
 struct gxp_fw_data_manager;
+struct gxp_power_manager;
+struct gxp_telemetry_manager;
 
 struct gxp_dev {
 	struct device *dev;		 /* platform bus device */
@@ -63,6 +74,7 @@ struct gxp_dev {
 	struct gxp_mapped_resource fwdatabuf; /* Shared FW data carveout */
 	struct gxp_mapped_resource coredumpbuf; /* core dump carveout */
 	struct gxp_mailbox_manager *mailbox_mgr;
+	struct gxp_power_manager *power_mgr;
 	/*
 	 * TODO(b/182416287): This should be a rb_tree of lists keyed by
 	 * virtual device. For now, keep an array of one list per physical core
@@ -79,6 +91,7 @@ struct gxp_dev {
 	struct gxp_dma_manager *dma_mgr;
 	struct gxp_fw_data_manager *data_mgr;
 	struct gxp_tpu_dev tpu_dev;
+	struct gxp_telemetry_manager *telemetry_mgr;
 };
 
 /* GXP device IO functions */

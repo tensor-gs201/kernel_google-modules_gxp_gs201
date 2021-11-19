@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * GXP power management interface.
+ * GXP local power management interface.
+ * Controlling Local Power Manager hardware.
  *
  * Copyright (C) 2020 Google LLC
  */
@@ -41,8 +42,6 @@ enum lpm_state {
 #define AUR_DVFS_DEBUG_REQ (1 << 31)
 #define AUR_DEBUG_CORE_FREQ (AUR_DVFS_DEBUG_REQ | (3 << 27))
 
-#define AUR_DVFS_MIN_STATE 178000
-
 /*
  * Initializes the power manager for the first time after block power up.
  * The function needs to be called once after a block power up event.
@@ -62,14 +61,10 @@ int gxp_lpm_up(struct gxp_dev *gxp, uint core);
  */
 void gxp_lpm_down(struct gxp_dev *gxp, uint core);
 /*
- * Sets the block-level DVFS state. This function can be called at any point
- * after block power on.
+ * Return whether the specified PSM is initialized.
+ * PSM0-PSM3 are for core0-core3, PSM4 is the TOP LPM.
  */
-int gxp_blk_set_state(struct gxp_dev *gxp, unsigned long state);
-/*
- * Returns the current DVFS state of the Aurora block.
- */
-int gxp_blk_get_state(struct gxp_dev *gxp);
+bool gxp_lpm_is_initialized(struct gxp_dev *gxp, uint psm);
 
 static inline u32 lpm_read_32(struct gxp_dev *gxp, uint reg_offset)
 {

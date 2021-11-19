@@ -549,7 +549,7 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 
 	if (!mailbox) {
 		dev_err(mgr->gxp->dev,
-			"Attempt to release nonexistant mailbox\n");
+			"Attempt to release nonexistent mailbox\n");
 		return;
 	}
 

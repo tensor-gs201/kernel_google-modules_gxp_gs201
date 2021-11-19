@@ -17,6 +17,14 @@
 #define NUM_CORES 4
 #define NUM_SYSTEM_SEMAPHORES 64
 
+/* Bit masks for the status fields in the telemetry structures. */
+/* The telemetry buffers have been setup by the host. */
+#define GXP_TELEMETRY_HOST_STATUS_ENABLED (1 << 0)
+/* The telemetry buffers are being used by the device. */
+#define GXP_TELEMETRY_DEVICE_STATUS_ENABLED (1 << 0)
+/* There was an attempt to use the buffers but their content was invalid. */
+#define GXP_TELEMETRY_DEVICE_STATUS_SANITY_CHECK_FAILED (1 << 1)
+
 /* A structure describing the state of the doorbells on the system. */
 struct gxp_doorbells_descriptor {
 	/* The app this descriptor belongs to. */
@@ -77,15 +85,26 @@ struct gxp_watchdog_descriptor {
 	uint32_t tripped;
 };
 
-/* A structure describing the logging and tracing parameters and buffers. */
-struct gxp_logging_tracing_descriptor {
-	/* A struct for describing the parameters for log and trace buffers  */
-	struct log_trace_descriptor {
+/*
+ * A structure describing the telemetry (loggging and tracing) parameters and
+ * buffers.
+ */
+struct gxp_telemetry_descriptor {
+	/* A struct for describing the parameters for telemetry buffers  */
+	struct telemetry_descriptor {
 		/*
-		 * The device address for the buffer used for storing events. A
-		 * value of 0 indicates the corresponding buffer hasn't been
-		 * allocated, or has been deallocated.
-		 * The head and tail indeces are described inside the data
+		 * The telemetry status from the host's point of view. See the
+		 * top of the file for the appropriate flags.
+		 */
+		uint32_t host_status;
+		/*
+		 * The telemetry status from the device point of view. See the
+		 * top of the file for the appropriate flags.
+		 */
+		uint32_t device_status;
+		/*
+		 * The device address for the buffer used for storing events.
+		 * The head and tail indices are described inside the data
 		 * pointed to by `buffer_addr`.
 		 */
 		uint32_t buffer_addr;
@@ -200,8 +219,8 @@ struct gxp_system_descriptor {
 	uint32_t app_descriptor_dev_addr[NUM_CORES];
 	/* A device address for the watchdog descriptor. */
 	uint32_t watchdog_dev_addr;
-	/* A device address for the logging/tracing descriptor */
-	uint32_t logging_tracing_dev_addr;
+	/* A device address for the telemetry descriptor */
+	uint32_t telemetry_dev_addr;
 };
 
 /* A structure describing the metadata belonging to a specific application. */
