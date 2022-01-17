@@ -31,10 +31,15 @@ static int gxp_pm_blkpwr_up(struct gxp_dev *gxp)
 {
 	int ret = 0;
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
-	ret = pm_runtime_get_sync(gxp->dev);
+#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
+	/*
+	 * This function is equivalent to pm_runtime_get_sync, but will prevent
+	 * the pm_runtime refcount from increasing if the call fails. It also
+	 * only returns either 0 for success or an errno on failure.
+	 */
+	ret = pm_runtime_resume_and_get(gxp->dev);
 	if (ret)
-		dev_err(gxp->dev, "%s: pm_runtime_get_sync returned %d\n",
+		dev_err(gxp->dev, "%s: pm_runtime_resume_and_get returned %d\n",
 			__func__, ret);
 #endif
 	return ret;
@@ -44,7 +49,7 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 {
 	int ret = 0;
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
+#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	/*
 	 * Need to put TOP LPM into active state before blk off
 	 * b/189396709
@@ -53,6 +58,12 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 	lpm_write_32_psm(gxp, LPM_TOP_PSM, LPM_REG_ENABLE_STATE_2, 0x0);
 	ret = pm_runtime_put_sync(gxp->dev);
 	if (ret)
+		/*
+		 * pm_runtime_put_sync() returns the device's usage counter.
+		 * Negative values indicate an error, while any positive values
+		 * indicate the device is still in use somewhere. The only
+		 * expected value here is 0, indicating no remaining users.
+		 */
 		dev_err(gxp->dev, "%s: pm_runtime_put_sync returned %d\n",
 			__func__, ret);
 #endif
@@ -63,7 +74,7 @@ int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state)
 {
 	int ret = 0;
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
+#if defined(CONFIG_GXP_CLOUDRIPPER)
 	ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, state);
 	dev_dbg(gxp->dev, "%s: state %lu, ret %d\n", __func__, state, ret);
 #endif
@@ -74,7 +85,7 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp)
 {
 	int ret = 0;
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
+#if defined(CONFIG_GXP_CLOUDRIPPER)
 	ret = exynos_acpm_get_rate(AUR_DVFS_DOMAIN, AUR_DEBUG_CORE_FREQ);
 	dev_dbg(gxp->dev, "%s: state %d\n", __func__, ret);
 #endif
@@ -96,6 +107,10 @@ int gxp_pm_blk_on(struct gxp_dev *gxp)
 		gxp_pm_blk_set_state_acpm(gxp, AUR_INIT_DVFS_STATE);
 		gxp->power_mgr->curr_state = AUR_INIT_DVFS_STATE;
 	}
+
+	/* Startup TOP's PSM */
+	gxp_lpm_init(gxp);
+
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 
 	return ret;
@@ -115,6 +130,9 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 		mutex_unlock(&gxp->power_mgr->pm_lock);
 		return -EBUSY;
 	}
+
+	/* Shutdown TOP's PSM */
+	gxp_lpm_destroy(gxp);
 
 	ret = gxp_pm_blkpwr_down(gxp);
 	if (!ret)
@@ -270,12 +288,21 @@ int gxp_pm_init(struct gxp_dev *gxp)
 		mgr->pwr_state_req[i] = AUR_OFF;
 	mgr->ops = &gxp_aur_ops;
 	gxp->power_mgr = mgr;
+
+#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
+	pm_runtime_enable(gxp->dev);
+#endif
+
 	return 0;
 }
 
 int gxp_pm_destroy(struct gxp_dev *gxp)
 {
 	struct gxp_power_manager *mgr;
+
+#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
+	pm_runtime_disable(gxp->dev);
+#endif
 
 	mgr = gxp->power_mgr;
 	mutex_destroy(&mgr->pm_lock);

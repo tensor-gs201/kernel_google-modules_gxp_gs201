@@ -30,7 +30,11 @@ enum lpm_state {
 
 #define LPM_INSTRUCTION_OFFSET 0x00000944
 #define LPM_INSTRUCTION_MASK 0x03000000
-#define LPM_TOP_PSM 4
+/*
+ * The TOP PSM comes immediately after the last PSM of core, so define its PSM
+ * number in terms of the number of cores.
+ */
+#define LPM_TOP_PSM GXP_NUM_CORES
 #define LPM_HW_MODE 0
 #define LPM_SW_PSM_MODE 1
 

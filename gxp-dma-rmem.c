@@ -108,6 +108,12 @@ static void bounce_buffer_remove(struct gxp_dma_rmem_manager *mgr,
 
 /* gxp-dma.h Interface */
 
+int gxp_dma_ssmt_program(struct gxp_dev *gxp)
+{
+	/* NO-OP when using reserved memory with no IOMMU */
+	return 0;
+}
+
 int gxp_dma_init(struct gxp_dev *gxp)
 {
 	struct gxp_dma_rmem_manager *mgr;
@@ -181,7 +187,7 @@ void gxp_dma_unmap_resources(struct gxp_dev *gxp)
 	/* no mappings to undo */
 }
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
 			   struct edgetpu_ext_mailbox_info *mbx_info)
 {
@@ -193,7 +199,7 @@ void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 {
 	/* no mappings to undo */
 }
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
 void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 			     dma_addr_t *dma_handle, gfp_t flag,

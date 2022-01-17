@@ -21,32 +21,42 @@ int gxp_vd_init(struct gxp_dev *gxp)
 	uint core;
 	int ret;
 
-	mutex_init(&gxp->vd_lock);
-	mutex_lock(&gxp->vd_lock);
+	init_rwsem(&gxp->vd_semaphore);
 
-	/* Mark all cores as free */
+	/* All cores start as free */
 	for (core = 0; core < GXP_NUM_CORES; core++)
 		gxp->core_to_client[core] = NULL;
 
 	ret = gxp_fw_init(gxp);
-	mutex_unlock(&gxp->vd_lock);
+
 	return ret;
 }
 
 void gxp_vd_destroy(struct gxp_dev *gxp)
 {
-	mutex_lock(&gxp->vd_lock);
+	down_write(&gxp->vd_semaphore);
 
 	gxp_fw_destroy(gxp);
 
-	mutex_unlock(&gxp->vd_lock);
+	up_write(&gxp->vd_semaphore);
 }
 
-/* Caller must hold gxp->vd_lock */
+/* Caller must hold gxp->vd_semaphore for writing */
 static void gxp_vd_release(struct gxp_client *client)
 {
 	uint core;
 	struct gxp_dev *gxp = client->gxp;
+
+	/*
+	 * Put all cores in the VD into reset so they can not wake each other up
+	 */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_client[core] == client) {
+			gxp_write_32_core(
+				gxp, core, GXP_REG_ETM_PWRCTL,
+				1 << GXP_REG_ETM_PWRCTL_CORE_RESET_SHIFT);
+		}
+       }
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp->core_to_client[core] == client) {
@@ -60,7 +70,7 @@ static void gxp_vd_release(struct gxp_client *client)
 	}
 }
 
-/* Caller must hold gxp->vd_lock */
+/* Caller must hold gxp->vd_semaphore for writing */
 int gxp_vd_allocate(struct gxp_client *client, u16 requested_cores)
 {
 	struct gxp_dev *gxp = client->gxp;
@@ -133,10 +143,10 @@ int gxp_vd_virt_core_to_phys_core(struct gxp_client *client, u16 virt_core)
 	uint phys_core;
 	uint virt_core_index = 0;
 
-	mutex_lock(&gxp->vd_lock);
+	down_read(&gxp->vd_semaphore);
 
 	if (!client->vd_allocated) {
-		mutex_unlock(&gxp->vd_lock);
+		up_read(&gxp->vd_semaphore);
 		dev_dbg(gxp->dev, "Client has not allocated a virtual device\n");
 		return -EINVAL;
 	}
@@ -145,7 +155,7 @@ int gxp_vd_virt_core_to_phys_core(struct gxp_client *client, u16 virt_core)
 		if (gxp->core_to_client[phys_core] == client) {
 			if (virt_core_index == virt_core) {
 				/* Found virtual core */
-				mutex_unlock(&gxp->vd_lock);
+				up_read(&gxp->vd_semaphore);
 				return phys_core;
 			}
 
@@ -153,7 +163,7 @@ int gxp_vd_virt_core_to_phys_core(struct gxp_client *client, u16 virt_core)
 		}
 	}
 
-	mutex_unlock(&gxp->vd_lock);
+	up_read(&gxp->vd_semaphore);
 	dev_dbg(gxp->dev, "No mapping for virtual core %u\n", virt_core);
 	return -EINVAL;
 }
@@ -207,18 +217,18 @@ void gxp_client_destroy(struct gxp_client *client)
 {
 	struct gxp_dev *gxp = client->gxp;
 
-	mutex_lock(&gxp->vd_lock);
+	down_write(&gxp->vd_semaphore);
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 	/*
 	 * Unmap TPU buffers, if the mapping is already removed, this
 	 * is a no-op.
 	 */
 	gxp_dma_unmap_tpu_buffer(gxp, client->mbx_desc);
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 	gxp_vd_release(client);
 
-	mutex_unlock(&gxp->vd_lock);
+	up_write(&gxp->vd_semaphore);
 
 	kfree(client);
 }

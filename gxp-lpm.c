@@ -152,32 +152,6 @@ static int psm_enable(struct gxp_dev *gxp, uint psm)
 
 void gxp_lpm_init(struct gxp_dev *gxp)
 {
-	u32 val;
-
-	/*
-	 * Some LPM signals are not looped back in the current FPGA
-	 * implementation, causing the PSM to time out waiting for a handshake
-	 * signal from the host.
-	 * TODO: This is to be fixed in the next version of FPGA build
-	 * WORKAROUND: Patch LPM instruction to bypass the timeout for now
-	 * FIXME: The patch is only for ML2.5 build, and is incompatible to
-	 * other builds
-	 */
-	val = lpm_read_32(gxp, LPM_INSTRUCTION_OFFSET);
-	val &= (~LPM_INSTRUCTION_MASK);
-	lpm_write_32(gxp, LPM_INSTRUCTION_OFFSET, val);
-
-	/* Local Access Path should not be enabled */
-#if 0
-	/*
-	 * Enable CNOC to DNOC path in Provino for direct TOP access from Q7
-	 * cores.
-	 */
-	val = gxp_read_32(gxp, PROVINO_IXBAR1_ARL_CTRL);
-	val |= PROVINO_IXBAR1_ARL_EN;
-	gxp_write_32(gxp, PROVINO_IXBAR1_ARL_CTRL, val);
-#endif
-
 	/* Enable Top PSM */
 	dev_notice(gxp->dev, "Enabling Top PSM...\n");
 	if (psm_enable(gxp, LPM_TOP_PSM)) {
@@ -237,8 +211,12 @@ void gxp_lpm_down(struct gxp_dev *gxp, uint core)
 	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL);
 	msleep(25 * GXP_TIME_DELAY_FACTOR);
 
-	/* Reset doorbell mask */
+	/*
+	 * Clear the core's interrupt mask and the wakeup doorbell to ensure
+	 * the core will not wake unexpectedly.
+	 */
 	gxp_write_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0, 0);
+	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL);
 
 	/* Ensure core is in PS2 */
 	set_state(gxp, core, LPM_PG_W_RET_STATE);

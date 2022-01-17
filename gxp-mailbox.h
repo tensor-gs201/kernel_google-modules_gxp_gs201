@@ -102,6 +102,8 @@ struct gxp_mailbox_descriptor {
 	u32 resp_queue_size;
 };
 
+#define GXP_MAILBOX_INT_BIT_COUNT 16
+
 struct gxp_mailbox {
 	uint core_id;
 	struct gxp_dev *gxp;
@@ -109,9 +111,11 @@ struct gxp_mailbox {
 	void __iomem *data_reg_base;
 
 	void (*handle_irq)(struct gxp_mailbox *mailbox);
-	void (*handle_debug_dump_irq)(struct gxp_mailbox *mailbox);
+	struct work_struct *interrupt_handlers[GXP_MAILBOX_INT_BIT_COUNT];
 	unsigned int interrupt_virq;
-	u32 debug_dump_int_mask;
+	struct task_struct *to_host_poll_task;
+	/* Protects to_host_poll_task while it holds a sync barrier */
+	struct mutex polling_lock;
 
 	u64 cur_seq;
 
@@ -137,8 +141,6 @@ struct gxp_mailbox {
 	wait_queue_head_t wait_list_waitq;
 	struct workqueue_struct *response_wq;
 	struct work_struct response_work;
-	struct work_struct debug_dump_work;
-	struct task_struct *to_host_poll_task;
 };
 
 typedef void __iomem *(*get_mailbox_base_t)(struct gxp_dev *gxp, uint index);
@@ -146,7 +148,6 @@ typedef void __iomem *(*get_mailbox_base_t)(struct gxp_dev *gxp, uint index);
 struct gxp_mailbox_manager {
 	struct gxp_dev *gxp;
 	u8 num_cores;
-	rwlock_t mailboxes_lock;
 	struct gxp_mailbox **mailboxes;
 	get_mailbox_base_t get_mailbox_csr_base;
 	get_mailbox_base_t get_mailbox_data_base;
@@ -156,6 +157,11 @@ struct gxp_mailbox_manager {
 
 struct gxp_mailbox_manager *gxp_mailbox_create_manager(struct gxp_dev *gxp,
 						       uint num_cores);
+
+/*
+ * The following functions all require their caller have locked
+ * gxp->vd_semaphore for reading.
+ */
 
 struct gxp_mailbox *gxp_mailbox_alloc(struct gxp_mailbox_manager *mgr,
 				      u8 core_id);
@@ -173,9 +179,11 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  spinlock_t *queue_lock,
 				  wait_queue_head_t *queue_waitq);
 
-void gxp_mailbox_register_debug_handler(struct gxp_mailbox *mailbox,
-					void (*debug_dump_process)
-					(struct work_struct *work),
-					u32 debug_dump_int_mask);
+int gxp_mailbox_register_interrupt_handler(struct gxp_mailbox *mailbox,
+					   u32 int_bit,
+					   struct work_struct *handler);
+
+int gxp_mailbox_unregister_interrupt_handler(struct gxp_mailbox *mailbox,
+					   u32 int_bit);
 
 #endif /* __GXP_MAILBOX_H__ */

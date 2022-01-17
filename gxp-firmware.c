@@ -21,6 +21,9 @@
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
 #include "gxp-mailbox.h"
+#include "gxp-notification.h"
+#include "gxp-pm.h"
+#include "gxp-telemetry.h"
 #include "gxp-tmp.h"
 
 /* TODO (b/176984045): Clean up gxp-firmware.c */
@@ -125,6 +128,9 @@ static int elf_load_segments(struct gxp_dev *gxp, const struct firmware *fw,
 	return ret;
 }
 
+/* Forward declaration for usage inside gxp_firmware_load(..). */
+static void gxp_firmware_unload(struct gxp_dev *gxp, uint core);
+
 static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 {
 	u32 reset_vec, offset;
@@ -163,14 +169,15 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 					   gxp->fwbufs[core].size, MEMREMAP_WC);
 	if (!(gxp->fwbufs[core].vaddr)) {
 		dev_err(gxp->dev, "FW buf memremap failed\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out_firmware_unload;
 	}
 
 	/* Load firmware to System RAM */
 	ret = elf_load_segments(gxp, fw[core], core);
 	if (ret) {
 		dev_err(gxp->dev, "Unable to load elf file\n");
-		return ret;
+		goto out_firmware_unload;
 	}
 
 	memset(gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF, 0,
@@ -203,6 +210,10 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 	gxp_bpm_configure(gxp, core, DATA_BPM_OFFSET, BPM_EVENT_WRITE_XFER);
 
 	return 0;
+
+out_firmware_unload:
+	gxp_firmware_unload(gxp, core);
+	return ret;
 }
 
 static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
@@ -270,6 +281,7 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 		dev_notice(gxp->dev, "Core %u is alive!\n", core);
 	}
 
+#ifndef CONFIG_GXP_GEM5
 	/*
 	 * Currently, the hello_world FW reads the INT_MASK0 register
 	 * (written by the driver) to validate TOP access. The value
@@ -277,6 +289,9 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	 * the scratchpad space, which must be compared to the value
 	 * written in the INT_MASK0 register by the driver for
 	 * confirmation.
+	 * On Gem5, FW will start early when lpm is up. This behavior will
+	 * affect the order of reading/writing INT_MASK0, so ignore this
+	 * handshaking in Gem5.
 	 */
 	/* TODO (b/182528386): Fix handshake for verifying TOP access */
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_TOP_ACCESS_OK);
@@ -291,6 +306,7 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 		dev_notice(gxp->dev, "TOP access from core %u successful!\n",
 			   core);
 	}
+#endif  // !CONFIG_GXP_GEM5
 
 	/* Stop bus performance monitors */
 	gxp_bpm_stop(gxp, core);
@@ -324,6 +340,9 @@ int gxp_fw_init(struct gxp_dev *gxp)
 
 	aurora_base = gxp->regs.vaddr;
 
+	/* Power on BLK_AUR to read the revision and processor ID registers */
+	gxp_pm_blk_on(gxp);
+
 	ver = gxp_read_32(gxp, GXP_REG_AURORA_REVISION);
 	dev_notice(gxp->dev, "Aurora version: 0x%x\n", ver);
 
@@ -332,6 +351,9 @@ int gxp_fw_init(struct gxp_dev *gxp)
 		dev_notice(gxp->dev, "Aurora core %u processor ID: 0x%x\n",
 			   core, proc_id);
 	}
+
+	/* Shut BLK_AUR down again to avoid interfering with power management */
+	gxp_pm_blk_off(gxp);
 
 	ret = gxp_acquire_rmem_resource(gxp, &r, "gxp-fw-region");
 	if (ret) {
@@ -365,18 +387,23 @@ int gxp_fw_init(struct gxp_dev *gxp)
 	 */
 
 	gxp->firmware_running = 0;
-	gxp_lpm_init(gxp);
 	return 0;
 }
 
 void gxp_fw_destroy(struct gxp_dev *gxp)
 {
-	gxp_lpm_destroy(gxp);
+	/* NO-OP for now. */
+	/*
+	 * TODO(b/214124218): Revisit if the firmware subsystem still needs a
+	 * "destroy" method now that power management is decoupled from the
+	 * firmware subsystem's lifecycle.
+	 */
 }
 
 int gxp_firmware_run(struct gxp_dev *gxp, uint core)
 {
 	int ret = 0;
+	struct work_struct *work;
 
 	if (gxp->firmware_running & BIT(core)) {
 		dev_err(gxp->dev, "Firmware is already running on core %u\n",
@@ -390,7 +417,8 @@ int gxp_firmware_run(struct gxp_dev *gxp, uint core)
 		return ret;
 	}
 
-	ret = gxp_lpm_up(gxp, core);
+	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
+	ret = gxp_pm_core_on(gxp, core);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to power up core %u\n", core);
 		goto out_firmware_unload;
@@ -400,7 +428,7 @@ int gxp_firmware_run(struct gxp_dev *gxp, uint core)
 	if (ret) {
 		dev_err(gxp->dev, "Firmware handshake failed on core %u\n",
 			core);
-		/* TODO (b/176984045): Undo gxp_lpm_up() */
+		gxp_pm_core_off(gxp, core);
 		goto out_firmware_unload;
 	}
 
@@ -420,15 +448,16 @@ int gxp_firmware_run(struct gxp_dev *gxp, uint core)
 		goto out_firmware_unload;
 	}
 
-	gxp_mailbox_register_debug_handler(gxp->mailbox_mgr->mailboxes[core],
-					   gxp_debug_dump_process_dump,
-					   GXP_DEBUG_DUMP_INT_MASK);
+	work = gxp_debug_dump_get_notification_handler(gxp, core);
+	if (work)
+		gxp_notification_register_handler(
+			gxp, core, HOST_NOTIF_DEBUG_DUMP_READY, work);
 
-	/*
-	 * Wait until the FW consumes the new mailbox register values before
-	 * allowing messages to be sent thus manipulating the mailbox pointers.
-	 */
-	msleep(25 * GXP_TIME_DELAY_FACTOR);
+	work = gxp_telemetry_get_notification_handler(gxp, core);
+	if (work)
+		gxp_notification_register_handler(
+			gxp, core, HOST_NOTIF_TELEMETRY_STATUS, work);
+
 	gxp->firmware_running |= BIT(core);
 
 	return ret;
@@ -445,10 +474,15 @@ void gxp_firmware_stop(struct gxp_dev *gxp, uint core)
 
 	gxp->firmware_running &= ~BIT(core);
 
+	gxp_notification_unregister_handler(gxp, core,
+					    HOST_NOTIF_DEBUG_DUMP_READY);
+	gxp_notification_unregister_handler(gxp, core,
+					    HOST_NOTIF_TELEMETRY_STATUS);
+
 	gxp_mailbox_release(gxp->mailbox_mgr,
 			    gxp->mailbox_mgr->mailboxes[core]);
 	dev_notice(gxp->dev, "Mailbox %u released\n", core);
 
-	gxp_lpm_down(gxp, core);
+	gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);
 }

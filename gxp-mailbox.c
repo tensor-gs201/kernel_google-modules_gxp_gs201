@@ -187,8 +187,6 @@ struct gxp_mailbox_manager *gxp_mailbox_create_manager(struct gxp_dev *gxp,
 	if (!mgr->mailboxes)
 		return ERR_PTR(-ENOMEM);
 
-	rwlock_init(&mgr->mailboxes_lock);
-
 	return mgr;
 }
 
@@ -384,12 +382,6 @@ static inline void gxp_mailbox_handle_irq(struct gxp_mailbox *mailbox)
 	queue_work(mailbox->response_wq, &mailbox->response_work);
 }
 
-static inline void
-gxp_mailbox_handle_debug_dump_irq(struct gxp_mailbox *mailbox)
-{
-	schedule_work(&mailbox->debug_dump_work);
-}
-
 #define _RESPONSE_WORKQUEUE_NAME(_x_) "gxp_responses_" #_x_
 #define RESPONSE_WORKQUEUE_NAME(_x_) _RESPONSE_WORKQUEUE_NAME(_x_)
 static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
@@ -500,52 +492,20 @@ struct gxp_mailbox *gxp_mailbox_alloc(struct gxp_mailbox_manager *mgr,
 				      u8 core_id)
 {
 	struct gxp_mailbox *mailbox;
-	unsigned long flags;
 
-	/* Allocate a mailbox before locking */
 	mailbox = create_mailbox(mgr, core_id);
 	if (IS_ERR(mailbox))
 		return mailbox;
 
-	write_lock_irqsave(&mgr->mailboxes_lock, flags);
-
-	if (mgr->mailboxes[core_id])
-		goto busy;
-	else
-		mgr->mailboxes[core_id] = mailbox;
-
-	write_unlock_irqrestore(&mgr->mailboxes_lock, flags);
-
-	/* Once we've confirmed the mailbox will be used, enable it */
 	enable_mailbox(mailbox);
 
 	return mailbox;
-
-busy:
-	write_unlock_irqrestore(&mgr->mailboxes_lock, flags);
-
-	gxp_dma_free_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
-		sizeof(struct gxp_command) * mailbox->cmd_queue_size,
-		mailbox->cmd_queue, mailbox->cmd_queue_device_addr);
-	gxp_dma_free_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
-		sizeof(struct gxp_response) * mailbox->resp_queue_size,
-		mailbox->resp_queue, mailbox->resp_queue_device_addr);
-	gxp_dma_free_coherent(mailbox->gxp, BIT(mailbox->core_id),
-			      sizeof(struct gxp_mailbox_descriptor),
-			      mailbox->descriptor,
-			      mailbox->descriptor_device_addr);
-	destroy_workqueue(mailbox->response_wq);
-	kfree(mailbox);
-
-	return ERR_PTR(-EBUSY);
 }
 
 void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 			struct gxp_mailbox *mailbox)
 {
-	unsigned long flags;
+	int i;
 
 	if (!mailbox) {
 		dev_err(mgr->gxp->dev,
@@ -553,21 +513,31 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 		return;
 	}
 
-	/* Halt the mailbox driver */
+	/*
+	 * Halt the mailbox driver.
+	 * This must happen before the mailbox itself is cleaned-up/released
+	 * to make sure the mailbox does not disappear out from under the
+	 * mailbox driver. This also halts all incoming responses/interrupts.
+	 */
 	gxp_mailbox_driver_exit(mailbox);
-
-	/* TODO(b/189018271) Mailbox locking is broken */
-	write_lock_irqsave(&mgr->mailboxes_lock, flags);
 
 	/* Halt and flush any traffic */
 	cancel_work_sync(&mailbox->response_work);
-	cancel_work_sync(&mailbox->debug_dump_work);
+	for (i = 0; i < GXP_MAILBOX_INT_BIT_COUNT; i++) {
+		if (mailbox->interrupt_handlers[i])
+			cancel_work_sync(mailbox->interrupt_handlers[i]);
+	}
 
 	/* Reset the mailbox HW */
 	gxp_mailbox_reset_hw(mailbox);
-	mgr->mailboxes[mailbox->core_id] = NULL;
 
-	write_unlock_irqrestore(&mgr->mailboxes_lock, flags);
+	/*
+	 * At this point all users of the mailbox have been halted or are
+	 * waiting on gxp->vd_semaphore, which this function's caller has
+	 * locked for writing.
+	 * It is now safe to clear the manager's mailbox pointer.
+	 */
+	mgr->mailboxes[mailbox->core_id] = NULL;
 
 	/* Clean up resources */
 	gxp_dma_free_coherent(
@@ -756,6 +726,7 @@ static void async_cmd_timeout_work(struct work_struct *work)
 	 */
 	spin_lock_irqsave(async_resp->dest_queue_lock, flags);
 	if (async_resp->dest_queue) {
+		async_resp->resp.status = GXP_RESP_CANCELLED;
 		list_add_tail(&async_resp->list_entry, async_resp->dest_queue);
 		spin_unlock_irqrestore(async_resp->dest_queue_lock, flags);
 		wake_up(async_resp->dest_queue_waitq);
@@ -799,13 +770,27 @@ err_free_resp:
 	return ret;
 }
 
-void gxp_mailbox_register_debug_handler(struct gxp_mailbox *mailbox,
-					void (*debug_dump_process)
-					(struct work_struct *work),
-					u32 debug_dump_int_mask)
+int gxp_mailbox_register_interrupt_handler(struct gxp_mailbox *mailbox,
+					   u32 int_bit,
+					   struct work_struct *handler)
 {
-	mailbox->handle_debug_dump_irq = gxp_mailbox_handle_debug_dump_irq;
-	mailbox->debug_dump_int_mask = debug_dump_int_mask;
+	/* Bit 0 is reserved for incoming mailbox responses */
+	if (int_bit == 0 || int_bit >= GXP_MAILBOX_INT_BIT_COUNT)
+		return -EINVAL;
 
-	INIT_WORK(&mailbox->debug_dump_work, debug_dump_process);
+	mailbox->interrupt_handlers[int_bit] = handler;
+
+	return 0;
+}
+
+int gxp_mailbox_unregister_interrupt_handler(struct gxp_mailbox *mailbox,
+					   u32 int_bit)
+{
+	/* Bit 0 is reserved for incoming mailbox responses */
+	if (int_bit == 0 || int_bit >= GXP_MAILBOX_INT_BIT_COUNT)
+		return -EINVAL;
+
+	mailbox->interrupt_handlers[int_bit] = NULL;
+
+	return 0;
 }

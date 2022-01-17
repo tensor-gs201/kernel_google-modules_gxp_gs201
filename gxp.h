@@ -390,4 +390,32 @@ struct gxp_tpu_mbx_queue_ioctl {
 #define GXP_UNMAP_TPU_MBX_QUEUE \
 	_IOW(GXP_IOCTL_BASE, 14, struct gxp_tpu_mbx_queue_ioctl)
 
+struct gxp_register_telemetry_eventfd_ioctl {
+	/*
+	 * File-descriptor obtained via eventfd().
+	 *
+	 * Not used during the unregister step; the driver will unregister
+	 * whichever eventfd it has currently registered for @type, if any.
+	 */
+	__u32 eventfd;
+	/*
+	 * Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`.
+	 * The driver will signal @eventfd whenever any core signals a
+	 * telemetry state change while this type of telemetry is active.
+	 */
+	__u8 type;
+};
+
+#define GXP_REGISTER_TELEMETRY_EVENTFD                                         \
+	_IOW(GXP_IOCTL_BASE, 15, struct gxp_register_telemetry_eventfd_ioctl)
+
+#define GXP_UNREGISTER_TELEMETRY_EVENTFD                                       \
+	_IOW(GXP_IOCTL_BASE, 16, struct gxp_register_telemetry_eventfd_ioctl)
+
+/*
+ * Reads the 2 global counter registers in AURORA_TOP and combines them to
+ * return the full 64-bit value of the counter.
+ */
+#define GXP_READ_GLOBAL_COUNTER _IOR(GXP_IOCTL_BASE, 17, __u64)
+
 #endif /* __GXP_H__ */

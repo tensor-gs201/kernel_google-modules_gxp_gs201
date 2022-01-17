@@ -58,18 +58,38 @@ void gxp_fw_data_destroy(struct gxp_dev *gxp);
  *                                           for firmware to write to.
  * @gxp: The GXP device to set buffer descriptors for
  * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ * @host_status:  Bitfield describing the host's telemetry status. See the
+ *                bit definitions in gxp-host-device-structs.h.
  * @buffer_addrs: An array containing the IOVA each physical core can access
  *                its logging or tracing buffer at
  * @per_buffer_size: The size of each core's logging or tracing buffer in bytes
  *
  * `gxp_fw_data_init()` must have been called before this function.
  *
+ * Caller must hold gxp->telemetry_mgr's lock.
+ *
  * Return:
  * 0       - Success
- * -EINVAL - Invalid @type provided
+ * -EINVAL - Invalid @type provided or @buffer_addrs are not addressable by @gxp
  */
 int gxp_fw_data_set_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
-					  u32 *buffer_addrs,
+					  u32 host_status,
+					  dma_addr_t *buffer_addrs,
 					  u32 per_buffer_size);
+
+/**
+ * gxp_fw_data_get_telemetry_device_status() - Returns a bitfield describing a
+ *                                             core's telemetry status.
+ * @gxp: The GXP device to get device telemetry status for
+ * @core: The core in @gxp to get the device telemetry status for
+ * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ *
+ * Caller must hold gxp->telemetry_mgr's lock.
+ *
+ * Return: The bitfield describing @core's telemetry status. If @core or @type
+ *         are invalid, the result will always be 0.
+ */
+u32 gxp_fw_data_get_telemetry_device_status(struct gxp_dev *gxp, uint core,
+					    u8 type);
 
 #endif /* __GXP_FIRMWARE_DATA_H__ */

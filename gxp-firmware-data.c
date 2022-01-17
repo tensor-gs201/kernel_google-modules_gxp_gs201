@@ -710,13 +710,14 @@ void gxp_fw_data_destroy(struct gxp_dev *gxp)
 }
 
 int gxp_fw_data_set_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
-					  u32 *buffer_addrs,
+					  u32 host_status,
+					  dma_addr_t *buffer_addrs,
 					  u32 per_buffer_size)
 {
 	struct gxp_telemetry_descriptor *descriptor =
 		gxp->data_mgr->telemetry_mem.host_addr;
 	struct telemetry_descriptor *core_descriptors;
-	int i;
+	uint core;
 
 	if (type == GXP_TELEMETRY_TYPE_LOGGING)
 		core_descriptors = descriptor->per_core_loggers;
@@ -725,10 +726,36 @@ int gxp_fw_data_set_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
 	else
 		return -EINVAL;
 
-	for (i = 0; i < NUM_CORES; i++) {
-		core_descriptors[i].buffer_addr = buffer_addrs[i];
-		core_descriptors[i].buffer_size = per_buffer_size;
+	/* Validate that the provided IOVAs are addressable (i.e. 32-bit) */
+	for (core = 0; core < NUM_CORES; core++) {
+		if (buffer_addrs[core] > U32_MAX)
+			return -EINVAL;
+	}
+
+	for (core = 0; core < NUM_CORES; core++) {
+		core_descriptors[core].host_status = host_status;
+		core_descriptors[core].buffer_addr = (u32)buffer_addrs[core];
+		core_descriptors[core].buffer_size = per_buffer_size;
 	}
 
 	return 0;
+}
+
+u32 gxp_fw_data_get_telemetry_device_status(struct gxp_dev *gxp, uint core,
+					    u8 type)
+{
+	struct gxp_telemetry_descriptor *descriptor =
+		gxp->data_mgr->telemetry_mem.host_addr;
+
+	if (core >= GXP_NUM_CORES)
+		return 0;
+
+	switch (type) {
+	case GXP_TELEMETRY_TYPE_LOGGING:
+		return descriptor->per_core_loggers[core].device_status;
+	case GXP_TELEMETRY_TYPE_TRACING:
+		return descriptor->per_core_tracers[core].device_status;
+	default:
+		return 0;
+	}
 }

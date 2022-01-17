@@ -45,6 +45,8 @@ static irqreturn_t mailbox_irq_handler(int irq, void *arg)
 {
 	u32 masked_status;
 	struct gxp_mailbox *mailbox = (struct gxp_mailbox *) arg;
+	struct work_struct **handlers = mailbox->interrupt_handlers;
+	u32 next_int;
 
 	/* Contains only the non-masked, pending interrupt bits */
 	masked_status = gxp_mailbox_get_host_mask_status(mailbox);
@@ -57,15 +59,17 @@ static irqreturn_t mailbox_irq_handler(int irq, void *arg)
 		masked_status &= ~MBOX_DEVICE_TO_HOST_RESPONSE_IRQ_MASK;
 	}
 
-	if (masked_status & mailbox->debug_dump_int_mask) {
-		mailbox->handle_debug_dump_irq(mailbox);
-		masked_status &= ~mailbox->debug_dump_int_mask;
-	}
+	while ((next_int = ffs(masked_status))) {
+		next_int--; /* ffs returns 1-based indices */
+		masked_status &= ~BIT(next_int);
 
-	if (masked_status)
-		pr_err_ratelimited(
-			"mailbox%d: received unknown interrupt bits 0x%x\n",
-			mailbox->core_id, masked_status);
+		if (handlers[next_int])
+			schedule_work(handlers[next_int]);
+		else
+			pr_err_ratelimited(
+				"mailbox%d: received unknown interrupt bit 0x%X\n",
+				mailbox->core_id, next_int);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -109,13 +113,11 @@ static void unregister_irq(struct gxp_mailbox *mailbox)
 void gxp_mailbox_driver_init(struct gxp_mailbox *mailbox)
 {
 	register_irq(mailbox);
-	return;
 }
 
 void gxp_mailbox_driver_exit(struct gxp_mailbox *mailbox)
 {
 	unregister_irq(mailbox);
-	return;
 }
 
 void __iomem *gxp_mailbox_get_csr_base(struct gxp_dev *gxp, uint index)

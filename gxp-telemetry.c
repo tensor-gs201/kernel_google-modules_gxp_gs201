@@ -6,21 +6,68 @@
  */
 
 #include <linux/slab.h>
+#include <linux/wait.h>
 
 #include "gxp-config.h"
 #include "gxp-dma.h"
+#include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
+#include "gxp-host-device-structs.h"
+#include "gxp-notification.h"
 #include "gxp-telemetry.h"
+
+static inline bool is_core_telemetry_enabled(struct gxp_dev *gxp, uint core,
+					     u8 type)
+{
+	u32 device_status =
+		gxp_fw_data_get_telemetry_device_status(gxp, core, type);
+
+	return device_status & GXP_TELEMETRY_DEVICE_STATUS_ENABLED;
+}
+
+static void telemetry_status_notification_work(struct work_struct *work)
+{
+	struct gxp_telemetry_work *telem_work =
+		container_of(work, struct gxp_telemetry_work, work);
+	struct gxp_dev *gxp = telem_work->gxp;
+	uint core = telem_work->core;
+	struct gxp_telemetry_manager *mgr = telem_work->gxp->telemetry_mgr;
+
+	/* Wake any threads waiting on an telemetry disable ACK */
+	wake_up(&mgr->waitq);
+
+	/* Signal the appropriate eventfd for any active telemetry types */
+	mutex_lock(&mgr->lock);
+
+	if (is_core_telemetry_enabled(gxp, core, GXP_TELEMETRY_TYPE_LOGGING) &&
+	    mgr->logging_efd)
+		eventfd_signal(mgr->logging_efd, 1);
+
+	if (is_core_telemetry_enabled(gxp, core, GXP_TELEMETRY_TYPE_TRACING) &&
+	    mgr->tracing_efd)
+		eventfd_signal(mgr->tracing_efd, 1);
+
+	mutex_unlock(&mgr->lock);
+}
 
 int gxp_telemetry_init(struct gxp_dev *gxp)
 {
 	struct gxp_telemetry_manager *mgr;
+	uint i;
 
 	mgr = devm_kzalloc(gxp->dev, sizeof(*mgr), GFP_KERNEL);
 	if (!mgr)
 		return -ENOMEM;
 
 	mutex_init(&mgr->lock);
+	for (i = 0; i < GXP_NUM_CORES; i++) {
+		INIT_WORK(&mgr->notification_works[i].work,
+			  telemetry_status_notification_work);
+		mgr->notification_works[i].gxp = gxp;
+		mgr->notification_works[i].core = i;
+
+	}
+	init_waitqueue_head(&mgr->waitq);
 
 	gxp->telemetry_mgr = mgr;
 
@@ -49,6 +96,13 @@ static void gxp_telemetry_vma_open(struct vm_area_struct *vma)
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 }
 
+/*
+ * Forward declaration of telemetry_disable_locked() so that
+ * gxp_telemetry_vma_close() can invoke the locked version without having to
+ * release `telemetry_mgr->lock` and calling gxp_telemetry_disable().
+ */
+static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type);
+
 static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 {
 	struct gxp_dev *gxp;
@@ -63,8 +117,8 @@ static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 	mutex_lock(&gxp->telemetry_mgr->lock);
 
 	if (refcount_dec_and_test(&data->ref_count)) {
-		if (data->enabled)
-			gxp_telemetry_disable(gxp, type);
+		if (data->host_status & GXP_TELEMETRY_HOST_STATUS_ENABLED)
+			telemetry_disable_locked(gxp, type);
 
 		for (i = 0; i < GXP_NUM_CORES; i++)
 			gxp_dma_free_coherent(gxp, BIT(i), data->size,
@@ -156,7 +210,6 @@ static struct buffer_data *allocate_telemetry_buffers(struct gxp_dev *gxp,
 	}
 	data->size = size;
 	refcount_set(&data->ref_count, 1);
-	data->enabled = false;
 
 	return data;
 
@@ -304,6 +357,7 @@ int gxp_telemetry_enable(struct gxp_dev *gxp, u8 type)
 {
 	struct buffer_data *data;
 	int ret = 0;
+	uint core;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
 
@@ -325,13 +379,18 @@ int gxp_telemetry_enable(struct gxp_dev *gxp, u8 type)
 	}
 
 	/* Populate the buffer fields in firmware-data */
-	gxp_fw_data_set_telemetry_descriptors(
-		gxp, type, (u32 *)data->buffer_daddrs, data->size);
+	data->host_status |= GXP_TELEMETRY_HOST_STATUS_ENABLED;
+	gxp_fw_data_set_telemetry_descriptors(gxp, type, data->host_status,
+					      data->buffer_daddrs, data->size);
 
-	/* TODO(b/202937192) To be done in a future CL */
 	/* Notify any running cores that firmware-data was updated */
-
-	data->enabled = true;
+	down_read(&gxp->vd_semaphore);
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp_is_fw_running(gxp, core))
+			gxp_notification_send(gxp, core,
+					      CORE_NOTIF_TELEMETRY_STATUS);
+	}
+	up_read(&gxp->vd_semaphore);
 
 out:
 	mutex_unlock(&gxp->telemetry_mgr->lock);
@@ -339,13 +398,82 @@ out:
 	return ret;
 }
 
-int gxp_telemetry_disable(struct gxp_dev *gxp, u8 type)
+/**
+ * notify_core_and_wait_for_disable() - Notify a core that telemetry state has
+ *                                      been changed by the host and wait for
+ *                                      the core to stop using telemetry.
+ * @gxp: The GXP device telemetry is changing for
+ * @core: The core in @gxp to notify of the telemetry state change
+ * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ *
+ * Caller must hold @gxp's virtual device lock
+ *
+ * Return:
+ * * 0      - Firmware on @core is no longer using telemetry of @type
+ * * -ENXIO - Firmware on @core is unresponsive
+ */
+static int notify_core_and_wait_for_disable(struct gxp_dev *gxp, uint core,
+					    u8 type)
+{
+	uint retries_left = 50;
+
+	gxp_notification_send(gxp, core, CORE_NOTIF_TELEMETRY_STATUS);
+
+	/* Wait for ACK from firmware */
+	while (is_core_telemetry_enabled(gxp, core, type) &&
+	       gxp_is_fw_running(gxp, core) && retries_left) {
+		/* Release vd_semaphore while waiting */
+		up_read(&gxp->vd_semaphore);
+
+		/*
+		 * The VD lock must be held to check if firmware is running, so
+		 * the wait condition is only whether the firmware data has been
+		 * updated to show the core disabling telemetry.
+		 *
+		 * If a core does stop running firmware while this function is
+		 * asleep, it will be seen at the next timeout.
+		 */
+		wait_event_timeout(gxp->telemetry_mgr->waitq,
+				   !is_core_telemetry_enabled(gxp, core, type),
+				   msecs_to_jiffies(10));
+		retries_left--;
+
+		down_read(&gxp->vd_semaphore);
+	}
+
+	/*
+	 * If firmware has stopped running altogether, that is sufficient to be
+	 * considered disabled. If firmware is started on this core again, it
+	 * is responsible for clearing its status.
+	 */
+	if (unlikely(is_core_telemetry_enabled(gxp, core, type) &&
+		     gxp_is_fw_running(gxp, core)))
+		return -ENXIO;
+
+	return 0;
+}
+
+/**
+ * telemetry_disable_locked() - Helper function to break out the actual
+ *                              process of disabling telemetry so that it
+ *                              can be invoked by internal functions that are
+ *                              already holding the telemetry lock.
+ * @gxp: The GXP device to disable either logging or tracing for
+ * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ *
+ * Caller must hold `telemetry_mgr->lock`.
+ *
+ * Return:
+ * * 0       - Success
+ * * -EINVAL - The @type provided is not valid
+ * * -ENXIO  - Buffers for @type have not been created/mapped yet
+ */
+static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type)
 {
 	struct buffer_data *data;
 	int ret = 0;
-	u32 null_daddrs[GXP_NUM_CORES] = {0};
-
-	mutex_lock(&gxp->telemetry_mgr->lock);
+	dma_addr_t null_daddrs[GXP_NUM_CORES] = {0};
+	uint core;
 
 	/* Cleanup telemetry manager's book-keeping */
 	switch (type) {
@@ -356,29 +484,119 @@ int gxp_telemetry_disable(struct gxp_dev *gxp, u8 type)
 		data = gxp->telemetry_mgr->tracing_buff_data;
 		break;
 	default:
+		return -EINVAL;
+	}
+
+	if (!data)
+		return -ENXIO;
+
+	if (!(data->host_status & GXP_TELEMETRY_HOST_STATUS_ENABLED))
+		return 0;
+
+	/* Clear the log buffer fields in firmware-data */
+	data->host_status &= ~GXP_TELEMETRY_HOST_STATUS_ENABLED;
+	gxp_fw_data_set_telemetry_descriptors(gxp, type, data->host_status,
+					      null_daddrs, 0);
+
+	/* Notify any running cores that firmware-data was updated */
+	down_read(&gxp->vd_semaphore);
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp_is_fw_running(gxp, core)) {
+			ret = notify_core_and_wait_for_disable(gxp, core, type);
+			if (ret)
+				dev_warn(
+					gxp->dev,
+					"%s: core%u failed to disable telemetry (type=%u, ret=%d)\n",
+					__func__, core, type, ret);
+		}
+	}
+	up_read(&gxp->vd_semaphore);
+
+	return 0;
+}
+
+int gxp_telemetry_disable(struct gxp_dev *gxp, u8 type)
+{
+	int ret;
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
+	ret = telemetry_disable_locked(gxp, type);
+
+	mutex_unlock(&gxp->telemetry_mgr->lock);
+
+	return ret;
+}
+
+int gxp_telemetry_register_eventfd(struct gxp_dev *gxp, u8 type, int fd)
+{
+	struct eventfd_ctx *new_ctx;
+	struct eventfd_ctx **ctx_to_set = NULL;
+	int ret = 0;
+
+	new_ctx = eventfd_ctx_fdget(fd);
+	if (IS_ERR(new_ctx))
+		return PTR_ERR(new_ctx);
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
+	switch (type) {
+	case GXP_TELEMETRY_TYPE_LOGGING:
+		ctx_to_set = &gxp->telemetry_mgr->logging_efd;
+		break;
+	case GXP_TELEMETRY_TYPE_TRACING:
+		ctx_to_set = &gxp->telemetry_mgr->tracing_efd;
+		break;
+	default:
 		ret = -EINVAL;
 		goto out;
 	}
 
-	if (!data) {
-		ret = -ENXIO;
-		goto out;
+	if (*ctx_to_set) {
+		dev_warn(gxp->dev,
+			 "Replacing existing telemetry eventfd (type=%u)\n",
+			 type);
+		eventfd_ctx_put(*ctx_to_set);
 	}
 
-	if (!data->enabled)
-		goto out;
-
-	/* Clear the log buffer fields in firmware-data */
-	gxp_fw_data_set_telemetry_descriptors(gxp, type, null_daddrs, 0);
-
-	/* TODO(b/202937192) To be done in a future CL */
-	/* Notify any running cores that firmware-data was updated */
-	/* Wait for ACK from firmware */
-
-	data->enabled = false;
+	*ctx_to_set = new_ctx;
 
 out:
 	mutex_unlock(&gxp->telemetry_mgr->lock);
+	return ret;
+}
+
+int gxp_telemetry_unregister_eventfd(struct gxp_dev *gxp, u8 type)
+{
+	int ret = 0;
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
+	switch (type) {
+	case GXP_TELEMETRY_TYPE_LOGGING:
+		eventfd_ctx_put(gxp->telemetry_mgr->logging_efd);
+		gxp->telemetry_mgr->logging_efd = NULL;
+		break;
+	case GXP_TELEMETRY_TYPE_TRACING:
+		eventfd_ctx_put(gxp->telemetry_mgr->tracing_efd);
+		gxp->telemetry_mgr->tracing_efd = NULL;
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	mutex_unlock(&gxp->telemetry_mgr->lock);
 
 	return ret;
+}
+
+struct work_struct *gxp_telemetry_get_notification_handler(struct gxp_dev *gxp,
+							   uint core)
+{
+	struct gxp_telemetry_manager *mgr = gxp->telemetry_mgr;
+
+	if (!mgr || core >= GXP_NUM_CORES)
+		return NULL;
+
+	return &mgr->notification_works[core].work;
 }

@@ -15,6 +15,7 @@
 #include "gxp-mailbox.h"
 #include "gxp-telemetry.h"
 #include "gxp-vd.h"
+#include "gxp-wakelock.h"
 
 static int gxp_debugfs_lpm_test(void *data, u64 val)
 {
@@ -55,7 +56,9 @@ static int gxp_debugfs_mailbox(void *data, u64 val)
 	cmd.buffer_descriptor.size = 0;
 	cmd.buffer_descriptor.flags = 0;
 
+	down_read(&gxp->vd_semaphore);
 	gxp_mailbox_execute_cmd(gxp->mailbox_mgr->mailboxes[core], &cmd, &resp);
+	up_read(&gxp->vd_semaphore);
 
 	dev_info(gxp->dev,
 		"Mailbox Command Sent: cmd.code=%d, resp.status=%d, resp.retval=%d\n",
@@ -93,7 +96,9 @@ static int gxp_debugfs_pingpong(void *data, u64 val)
 	cmd.buffer_descriptor.size = 0;
 	cmd.buffer_descriptor.flags = (u32) val;
 
+	down_read(&gxp->vd_semaphore);
 	gxp_mailbox_execute_cmd(gxp->mailbox_mgr->mailboxes[core], &cmd, &resp);
+	up_read(&gxp->vd_semaphore);
 
 	dev_info(
 		gxp->dev,
@@ -107,13 +112,20 @@ DEFINE_DEBUGFS_ATTRIBUTE(gxp_pingpong_fops, NULL, gxp_debugfs_pingpong,
 static int gxp_firmware_run_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *) data;
+	struct gxp_client *client_to_delete;
 	int ret = 0;
+
+	down_write(&gxp->vd_semaphore);
 
 	if (val) {
 		if (gxp->debugfs_client) {
 			dev_err(gxp->dev, "Firmware already running!\n");
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
+
+		/* Cannot run firmware without a wakelock */
+		gxp_wakelock_acquire(gxp);
 
 		/*
 		 * Cleanup any bad state or corruption the device might've
@@ -127,7 +139,8 @@ static int gxp_firmware_run_set(void *data, u64 val)
 			dev_err(gxp->dev, "Failed to create client\n");
 			ret = PTR_ERR(gxp->debugfs_client);
 			gxp->debugfs_client = NULL;
-			return ret;
+			gxp_wakelock_release(gxp);
+			goto out;
 		}
 
 		ret = gxp_vd_allocate(gxp->debugfs_client, GXP_NUM_CORES);
@@ -135,16 +148,29 @@ static int gxp_firmware_run_set(void *data, u64 val)
 			dev_err(gxp->dev, "Failed to allocate VD\n");
 			gxp_client_destroy(gxp->debugfs_client);
 			gxp->debugfs_client = NULL;
-			return ret;
+			gxp_wakelock_release(gxp);
+			goto out;
 		}
 	} else {
 		if (!gxp->debugfs_client) {
 			dev_err(gxp->dev, "Firmware not running!\n");
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
-		gxp_client_destroy(gxp->debugfs_client);
+		client_to_delete = gxp->debugfs_client;
 		gxp->debugfs_client = NULL;
+
+		up_write(&gxp->vd_semaphore);
+
+		gxp_client_destroy(client_to_delete);
+		gxp_wakelock_release(gxp);
+
+		/* Return here, since vd_semaphore has already been unlocked */
+		return ret;
 	}
+
+out:
+	up_write(&gxp->vd_semaphore);
 
 	return ret;
 }
@@ -160,10 +186,53 @@ static int gxp_firmware_run_get(void *data, u64 *val)
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_firmware_run_fops, gxp_firmware_run_get,
 			 gxp_firmware_run_set, "%llx\n");
 
+static int gxp_wakelock_set(void *data, u64 val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	int ret = 0;
+
+	if (val > 0) {
+		/* Wakelock Acquire */
+		if (gxp->debugfs_wakelock_held) {
+			dev_warn(gxp->dev,
+				 "Debugfs wakelock is already held.\n");
+			return -EBUSY;
+		}
+
+		ret = gxp_wakelock_acquire(gxp);
+		if (ret)
+			dev_err(gxp->dev,
+				"Failed to acquire debugfs wakelock ret=%d\n",
+				ret);
+		else
+			gxp->debugfs_wakelock_held = true;
+	} else {
+		/* Wakelock Release */
+		if (!gxp->debugfs_wakelock_held) {
+			dev_warn(gxp->dev, "Debugfs wakelock not held.\n");
+			return -EIO;
+		}
+
+		gxp_wakelock_release(gxp);
+		gxp->debugfs_wakelock_held = false;
+	}
+
+	return ret;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(gxp_wakelock_fops, NULL, gxp_wakelock_set, "%llx\n");
+
 static int gxp_blk_powerstate_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
 	int ret = 0;
+
+	if (gxp_pm_get_blk_state(gxp) == AUR_OFF) {
+		dev_warn(
+			gxp->dev,
+			"Cannot set block power state when the block is off. Obtain a wakelock to power it on.\n");
+		return -ENODEV;
+	}
 
 	if (val >= AUR_DVFS_MIN_STATE) {
 		ret = gxp_pm_blk_set_state_acpm(gxp, val);
@@ -177,6 +246,13 @@ static int gxp_blk_powerstate_set(void *data, u64 val)
 static int gxp_blk_powerstate_get(void *data, u64 *val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
+
+	if (gxp_pm_get_blk_state(gxp) == AUR_OFF) {
+		dev_warn(
+			gxp->dev,
+			"Cannot get block power state when the block is off.\n");
+		return -ENODEV;
+	}
 
 	*val = gxp_pm_blk_get_state_acpm(gxp);
 	return 0;
@@ -252,11 +328,36 @@ static int gxp_log_buff_get(void *data, u64 *val)
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_log_buff_fops, gxp_log_buff_get, gxp_log_buff_set,
 			 "%llu\n");
 
+static int gxp_log_eventfd_signal_set(void *data, u64 val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	int ret = 0;
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
+	if (!gxp->telemetry_mgr->logging_efd) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	ret = eventfd_signal(gxp->telemetry_mgr->logging_efd, 1);
+
+out:
+	mutex_unlock(&gxp->telemetry_mgr->lock);
+
+	return ret;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(gxp_log_eventfd_signal_fops, NULL,
+			 gxp_log_eventfd_signal_set, "%llu\n");
+
 void gxp_create_debugfs(struct gxp_dev *gxp)
 {
 	gxp->d_entry = debugfs_create_dir("gxp", NULL);
 	if (IS_ERR_OR_NULL(gxp->d_entry))
 		return;
+
+	gxp->debugfs_wakelock_held = false;
 
 	debugfs_create_file("lpm_test", 0200, gxp->d_entry, gxp,
 			    &gxp_lpm_test_fops);
@@ -266,11 +367,15 @@ void gxp_create_debugfs(struct gxp_dev *gxp)
 			    &gxp_pingpong_fops);
 	debugfs_create_file("firmware_run", 0600, gxp->d_entry, gxp,
 			    &gxp_firmware_run_fops);
+	debugfs_create_file("wakelock", 0200, gxp->d_entry, gxp,
+			    &gxp_wakelock_fops);
 	debugfs_create_file("blk_powerstate", 0600, gxp->d_entry, gxp,
 			    &gxp_blk_powerstate_fops);
 	debugfs_create_file("coredump", 0200, gxp->d_entry, gxp,
 			    &gxp_coredump_fops);
 	debugfs_create_file("log", 0600, gxp->d_entry, gxp, &gxp_log_buff_fops);
+	debugfs_create_file("log_eventfd", 0200, gxp->d_entry, gxp,
+			    &gxp_log_eventfd_signal_fops);
 }
 
 void gxp_remove_debugfs(struct gxp_dev *gxp)

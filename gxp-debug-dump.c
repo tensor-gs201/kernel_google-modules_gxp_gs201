@@ -13,7 +13,7 @@
 #include <linux/string.h>
 #include <linux/workqueue.h>
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 #include <linux/platform_data/sscoredump.h>
 #endif
 
@@ -21,7 +21,6 @@
 #include "gxp-doorbell.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
-#include "gxp-mailbox.h"
 #include "gxp-tmp.h"
 
 #define GXP_COREDUMP_PENDING 0xF
@@ -251,7 +250,7 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp,
 	struct gxp_core_dump_header *core_dump_header;
 	struct gxp_core_header *core_header;
 	int i;
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	struct sscd_platform_data *pdata =
 		(struct sscd_platform_data *)gxp->debug_dump_mgr->sscd_pdata;
 	struct sscd_segment *segs;
@@ -289,7 +288,7 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp,
 		data_addr += segs[seg_idx].size;
 		seg_idx++;
 	}
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_SUBSYSTEM_COREDUMP
 
 	/* Core */
 	for (i = 0; i < GXP_NUM_CORES; i++) {
@@ -304,7 +303,7 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp,
 			goto out;
 		}
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 		/* Core Header */
 		segs[seg_idx].addr = core_header;
 		segs[seg_idx].size = sizeof(struct gxp_core_header);
@@ -347,7 +346,7 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp,
 		 */
 		msleep(1000);
 		mutex_unlock(&gxp->debug_dump_mgr->sscd_lock);
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_SUBSYSTEM_COREDUMP
 
 		/* This bit signals that core dump has been processed */
 		core_header->dump_available = 0;
@@ -357,7 +356,7 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp,
 	}
 
 out:
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	kfree(segs);
 #endif
 	return;
@@ -430,10 +429,11 @@ static void gxp_wait_kernel_init_dump_work(struct work_struct *work)
 
 void gxp_debug_dump_process_dump(struct work_struct *work)
 {
-	struct gxp_mailbox *mailbox = container_of(work, struct gxp_mailbox,
-						   debug_dump_work);
-	uint core_id = mailbox->core_id;
-	struct gxp_dev *gxp = mailbox->gxp;
+	struct gxp_debug_dump_work *debug_dump_work =
+		container_of(work, struct gxp_debug_dump_work, work);
+
+	uint core_id = debug_dump_work->core_id;
+	struct gxp_dev *gxp = debug_dump_work->gxp;
 	struct gxp_debug_dump_manager *mgr;
 	struct gxp_core_dump *core_dump;
 	struct gxp_core_dump_header *core_dump_header;
@@ -471,6 +471,17 @@ void gxp_debug_dump_process_dump(struct work_struct *work)
 		mutex_unlock(&mgr->lock);
 		break;
 	}
+}
+
+struct work_struct *gxp_debug_dump_get_notification_handler(struct gxp_dev *gxp,
+							    uint core)
+{
+	struct gxp_debug_dump_manager *mgr = gxp->debug_dump_mgr;
+
+	if (!mgr)
+		return NULL;
+
+	return &mgr->debug_dump_works[core].work;
 }
 
 int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata)
@@ -513,6 +524,11 @@ int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata)
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		core_dump_header = &mgr->core_dump->core_dump_header[core];
 		core_dump_header->core_header.dump_available = 0;
+
+		mgr->debug_dump_works[core].gxp = gxp;
+		mgr->debug_dump_works[core].core_id = core;
+		INIT_WORK(&mgr->debug_dump_works[core].work,
+			  gxp_debug_dump_process_dump);
 	}
 
 	/* No need for a DMA handle since the carveout is coherent */

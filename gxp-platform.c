@@ -5,7 +5,7 @@
  * Copyright (C) 2021 Google LLC
  */
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 #include <linux/platform_data/sscoredump.h>
 #endif
 
@@ -22,7 +22,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/uaccess.h>
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 #include <soc/google/tpu-ext.h>
 #endif
 
@@ -38,9 +38,11 @@
 #include "gxp-mapping.h"
 #include "gxp-pm.h"
 #include "gxp-telemetry.h"
+#include "gxp-thermal.h"
 #include "gxp-vd.h"
+#include "gxp-wakelock.h"
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 static struct sscd_platform_data gxp_sscd_pdata;
 
 static void gxp_sscd_release(struct device *dev)
@@ -57,31 +59,51 @@ static struct platform_device gxp_sscd_dev = {
 		.release = gxp_sscd_release,
 	},
 };
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_SUBSYSTEM_COREDUMP
 
 static int gxp_open(struct inode *inode, struct file *file)
 {
 	struct gxp_client *client;
 	struct gxp_dev *gxp = container_of(file->private_data, struct gxp_dev,
 					   misc_dev);
+	int ret = 0;
 
 	client = gxp_client_create(gxp);
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
 	file->private_data = client;
-	return 0;
+
+	ret = gxp_wakelock_acquire(gxp);
+	if (ret) {
+		gxp_client_destroy(client);
+		file->private_data = NULL;
+	}
+
+	return ret;
 }
 
 static int gxp_release(struct inode *inode, struct file *file)
 {
 	struct gxp_client *client = file->private_data;
+	struct gxp_dev *gxp;
+
+	/*
+	 * If open failed and no client was created then no clean-up is needed.
+	 */
+	if (!client)
+		return 0;
+
+	gxp = client->gxp;
 
 	/*
 	 * TODO (b/184572070): Unmap buffers and drop mailbox responses
 	 * belonging to the client
 	 */
 	gxp_client_destroy(client);
+
+	gxp_wakelock_release(gxp);
+
 	return 0;
 }
 
@@ -263,10 +285,12 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	cmd.priority = 0; /* currently unused */
 	cmd.buffer_descriptor = buffer;
 
+	down_read(&gxp->vd_semaphore);
 	ret = gxp_mailbox_execute_cmd_async(
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
 		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
 		&gxp->mailbox_resp_waitqs[phys_core]);
+	up_read(&gxp->vd_semaphore);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
 			ret);
@@ -411,15 +435,15 @@ static int gxp_allocate_vd(struct gxp_client *client,
 		return -EINVAL;
 	}
 
-	mutex_lock(&gxp->vd_lock);
+	down_write(&gxp->vd_semaphore);
 	if (client->vd_allocated) {
-		mutex_unlock(&gxp->vd_lock);
+		up_write(&gxp->vd_semaphore);
 		dev_err(gxp->dev, "Virtual device was already allocated for client\n");
 		return -EINVAL;
 	}
 
 	ret = gxp_vd_allocate(client, ibuf.core_count);
-	mutex_unlock(&gxp->vd_lock);
+	up_write(&gxp->vd_semaphore);
 
 	return ret;
 }
@@ -607,7 +631,7 @@ static int gxp_disable_telemetry(struct gxp_client *client, __u8 __user *argp)
 static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 				 struct gxp_tpu_mbx_queue_ioctl __user *argp)
 {
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 	struct gxp_dev *gxp = client->gxp;
 	struct edgetpu_ext_mailbox_info *mbx_info;
 	struct gxp_tpu_mbx_queue_ioctl ibuf;
@@ -643,7 +667,7 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	if (!mbx_info)
 		return -ENOMEM;
 
-	mutex_lock(&gxp->vd_lock);
+	down_write(&gxp->vd_semaphore);
 
 	if (client->tpu_mbx_allocated) {
 		dev_err(gxp->dev, "%s: Mappings already exist for TPU mailboxes\n",
@@ -684,7 +708,7 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	client->tpu_mbx_allocated = true;
 
 error:
-	mutex_unlock(&gxp->vd_lock);
+	up_write(&gxp->vd_semaphore);
 
 	kfree(mbx_info);
 	return ret;
@@ -696,7 +720,7 @@ error:
 static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 				   struct gxp_tpu_mbx_queue_ioctl __user *argp)
 {
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 	struct gxp_dev *gxp = client->gxp;
 	struct gxp_tpu_mbx_queue_ioctl ibuf;
 	struct edgetpu_ext_client_info gxp_tpu_info;
@@ -705,7 +729,7 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	mutex_lock(&gxp->vd_lock);
+	down_write(&gxp->vd_semaphore);
 
 	if (!client->tpu_mbx_allocated) {
 		dev_err(gxp->dev, "%s: No mappings exist for TPU mailboxes\n",
@@ -729,12 +753,65 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 	client->tpu_mbx_allocated = false;
 
 out:
-	mutex_unlock(&gxp->vd_lock);
+	up_write(&gxp->vd_semaphore);
 
 	return ret;
 #else
 	return -ENODEV;
 #endif
+}
+
+static int gxp_register_telemetry_eventfd(
+	struct gxp_client *client,
+	struct gxp_register_telemetry_eventfd_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_register_telemetry_eventfd_ioctl ibuf;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	return gxp_telemetry_register_eventfd(gxp, ibuf.type, ibuf.eventfd);
+}
+
+static int gxp_unregister_telemetry_eventfd(
+	struct gxp_client *client,
+	struct gxp_register_telemetry_eventfd_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_register_telemetry_eventfd_ioctl ibuf;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	return gxp_telemetry_unregister_eventfd(gxp, ibuf.type);
+}
+
+static int gxp_read_global_counter(struct gxp_client *client,
+				   __u64 __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	u32 high_first, high_second, low;
+	u64 counter_val;
+
+	high_first = gxp_read_32(gxp, GXP_REG_GLOBAL_COUNTER_HIGH);
+	low = gxp_read_32(gxp, GXP_REG_GLOBAL_COUNTER_LOW);
+
+	/*
+	 * Check if the lower 32 bits could have wrapped in-between reading
+	 * the high and low bit registers by validating the higher 32 bits
+	 * haven't changed.
+	 */
+	high_second = gxp_read_32(gxp, GXP_REG_GLOBAL_COUNTER_HIGH);
+	if (high_first != high_second)
+		low = gxp_read_32(gxp, GXP_REG_GLOBAL_COUNTER_LOW);
+
+	counter_val = ((u64)high_second << 32) | low;
+
+	if (copy_to_user(argp, &counter_val, sizeof(counter_val)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
@@ -789,6 +866,15 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 	case GXP_UNMAP_TPU_MBX_QUEUE:
 		ret = gxp_unmap_tpu_mbx_queue(client, argp);
 		break;
+	case GXP_REGISTER_TELEMETRY_EVENTFD:
+		ret = gxp_register_telemetry_eventfd(client, argp);
+		break;
+	case GXP_UNREGISTER_TELEMETRY_EVENTFD:
+		ret = gxp_unregister_telemetry_eventfd(client, argp);
+		break;
+	case GXP_READ_GLOBAL_COUNTER:
+		ret = gxp_read_global_counter(client, argp);
+		break;
 	default:
 		ret = -ENOTTY; /* unknown command */
 	}
@@ -838,6 +924,8 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	int i __maybe_unused;
 	bool tpu_found __maybe_unused;
 
+	dev_notice(dev, "Probing gxp driver with commit %s\n", GIT_REPO_TAG);
+
 	gxp = devm_kzalloc(dev, sizeof(*gxp), GFP_KERNEL);
 	if (!gxp)
 		return -ENOMEM;
@@ -848,6 +936,8 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	gxp->misc_dev.minor = MISC_DYNAMIC_MINOR;
 	gxp->misc_dev.name = "gxp";
 	gxp->misc_dev.fops = &gxp_fops;
+
+	gxp_wakelock_init(gxp);
 
 	ret = misc_register(&gxp->misc_dev);
 	if (ret) {
@@ -873,14 +963,11 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
-	pm_runtime_enable(dev);
-	ret = pm_runtime_get_sync(dev);
+	ret = gxp_pm_init(gxp);
 	if (ret) {
-		dev_err(dev, "pm_runtime_get_sync returned %d\n", ret);
+		dev_err(dev, "Failed to init power management (ret=%d)\n", ret);
 		goto err;
 	}
-#endif
 
 #ifndef CONFIG_GXP_USE_SW_MAILBOX
 	for (i = 0; i < GXP_NUM_CORES; i++) {
@@ -951,11 +1038,11 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	}
 	spin_lock_init(&gxp->mailbox_resps_lock);
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	ret = gxp_debug_dump_init(gxp, &gxp_sscd_dev, &gxp_sscd_pdata);
 #else
 	ret = gxp_debug_dump_init(gxp, NULL, NULL);
-#endif  // !CONFIG_ANDROID
+#endif  // !CONFIG_SUBSYSTEM_COREDUMP
 	if (ret) {
 		dev_err(dev, "Failed to initialize debug dump\n");
 		gxp_debug_dump_exit(gxp);
@@ -986,6 +1073,9 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	gxp_telemetry_init(gxp);
 	gxp_create_debugfs(gxp);
 	gxp_pm_init(gxp);
+	gxp->thermal_mgr = gxp_thermal_init(gxp);
+	if (!gxp->thermal_mgr)
+		dev_err(dev, "Failed to init thermal driver\n");
 	dev_dbg(dev, "Probe finished\n");
 
 	return 0;
@@ -1022,17 +1112,34 @@ static int gxp_platform_remove(struct platform_device *pdev)
 #endif
 	misc_deregister(&gxp->misc_dev);
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
-	// Request to power off BLK_AUR
-	gxp_pm_blk_off(gxp);
-	pm_runtime_disable(dev);
 	gxp_pm_destroy(gxp);
-#endif
 
 	devm_kfree(dev, (void *)gxp);
 
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_PM_SLEEP)
+
+static int gxp_platform_suspend(struct device *dev)
+{
+	struct gxp_dev *gxp = dev_get_drvdata(dev);
+
+	return gxp_wakelock_suspend(gxp);
+}
+
+static int gxp_platform_resume(struct device *dev)
+{
+	struct gxp_dev *gxp = dev_get_drvdata(dev);
+
+	return gxp_wakelock_resume(gxp);
+}
+
+static const struct dev_pm_ops gxp_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(gxp_platform_suspend, gxp_platform_resume)
+};
+
+#endif /* IS_ENABLED(CONFIG_PM_SLEEP) */
 
 #ifdef CONFIG_OF
 static const struct of_device_id gxp_of_match[] = {
@@ -1057,12 +1164,15 @@ static struct platform_driver gxp_platform_driver = {
 			.name = GXP_DRIVER_NAME,
 			.of_match_table = of_match_ptr(gxp_of_match),
 			.acpi_match_table = ACPI_PTR(gxp_acpi_match),
+#if IS_ENABLED(CONFIG_PM_SLEEP)
+			.pm = &gxp_pm_ops,
+#endif
 		},
 };
 
 static int __init gxp_platform_init(void)
 {
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	/* Registers SSCD platform device */
 	if (platform_device_register(&gxp_sscd_dev))
 		pr_err("Unable to register SSCD platform device\n");
@@ -1073,12 +1183,13 @@ static int __init gxp_platform_init(void)
 static void __exit gxp_platform_exit(void)
 {
 	platform_driver_unregister(&gxp_platform_driver);
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	platform_device_unregister(&gxp_sscd_dev);
 #endif
 }
 
 MODULE_DESCRIPTION("Google GXP platform driver");
 MODULE_LICENSE("GPL v2");
+MODULE_INFO(gitinfo, GIT_REPO_TAG);
 module_init(gxp_platform_init);
 module_exit(gxp_platform_exit);

@@ -10,7 +10,7 @@
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/types.h>
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 #include <soc/google/tpu-ext.h>
 #endif
 
@@ -30,6 +30,27 @@ struct gxp_dma_manager {
 #ifndef DMA_MAPPING_ERROR
 #define DMA_MAPPING_ERROR (~(dma_addr_t)0)
 #endif
+
+/*
+ * TODO(b/214113464) This is a temporary interface to reprogram the SSMT every
+ * time the block is powered up. It should be replaced with a new interface for
+ * assigning a given virtual device's domain to that virtual device's physical
+ * core once VD suspend/resume is implemented.
+ */
+/**
+ * gxp_dma_ssmt_program() - Program the SSMTs to map each core to its page table.
+ * @gxp: The GXP device to program the SSMTs for
+ *
+ * Every time the DSP block is powered on, the SSMTs must be re-programmed to
+ * map traffic from each physical core to be translated via that core's
+ * assigned page table. This API must be called every time the block is powered
+ * on for DSP usage.
+ *
+ * Return:
+ * * 0     - Success
+ * * Other - Reserved
+ */
+int gxp_dma_ssmt_program(struct gxp_dev *gxp);
 
 /**
  * gxp_dma_init() - Initialize the GXP DMA subsystem
@@ -77,7 +98,7 @@ int gxp_dma_map_resources(struct gxp_dev *gxp);
  */
 void gxp_dma_unmap_resources(struct gxp_dev *gxp);
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 /**
  * gxp_dma_map_tpu_buffer() - Map the tpu mbx queue buffers with fixed IOVAs
  * @gxp: The GXP device to setup the mappings for
@@ -98,7 +119,7 @@ int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
  */
 void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 			      struct gxp_tpu_mbx_desc mbx_desc);
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
 /**
  * gxp_dma_alloc_coherent() - Allocate and map a coherent buffer for a GXP core

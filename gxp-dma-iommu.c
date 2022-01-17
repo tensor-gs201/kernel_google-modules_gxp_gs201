@@ -16,6 +16,7 @@
 #include "gxp-dma-iommu.h"
 #include "gxp-iova.h"
 #include "gxp-mapping.h"
+#include "gxp-pm.h"
 
 struct gxp_dma_iommu_manager {
 	struct gxp_dma_manager dma_mgr;
@@ -69,6 +70,30 @@ static inline void ssmt_set_vid_for_sid(void __iomem *ssmt, int vid, u8 sid)
 	/* NS_WRITE_STREAM_VID_<sid> */
 	writel(vid, (ssmt) + 0x1200u + (0x4u * (sid)));
 }
+
+int gxp_dma_ssmt_program(struct gxp_dev *gxp)
+{
+/* SSMT is not supported in unittests */
+#ifndef CONFIG_GXP_TEST
+	struct gxp_dma_iommu_manager *mgr = container_of(
+		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
+	unsigned int core;
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		ssmt_set_vid_for_sid(mgr->idma_ssmt_base, mgr->core_vids[core],
+				     IDMA_SID_FOR_CORE(core));
+		ssmt_set_vid_for_sid(mgr->inst_data_ssmt_base,
+				     mgr->core_vids[core],
+				     INST_SID_FOR_CORE(core));
+		ssmt_set_vid_for_sid(mgr->inst_data_ssmt_base,
+				     mgr->core_vids[core],
+				     DATA_SID_FOR_CORE(core));
+	}
+#endif
+
+	return 0;
+}
+
 
 static inline int ssmt_init(struct gxp_dev *gxp,
 			    struct gxp_dma_iommu_manager *mgr)
@@ -204,22 +229,6 @@ int gxp_dma_init(struct gxp_dev *gxp)
 			iommu_aux_get_pasid(mgr->core_domains[core], gxp->dev);
 		dev_notice(gxp->dev, "SysMMU: core%u assigned vid %d\n", core,
 			   mgr->core_vids[core]);
-/* SSMT is not supported in unittests */
-#ifndef CONFIG_GXP_TEST
-		/*
-		 * TODO(b/194347483) SSMT programming must happen each time
-		 * BLK_AURORA is powered on, but currently BLK_AURORA is
-		 * turned on at probe and left on until removal.
-		 */
-		ssmt_set_vid_for_sid(mgr->idma_ssmt_base, mgr->core_vids[core],
-				     IDMA_SID_FOR_CORE(core));
-		ssmt_set_vid_for_sid(mgr->inst_data_ssmt_base,
-				     mgr->core_vids[core],
-				     INST_SID_FOR_CORE(core));
-		ssmt_set_vid_for_sid(mgr->inst_data_ssmt_base,
-				     mgr->core_vids[core],
-				     DATA_SID_FOR_CORE(core));
-#endif
 	}
 
 	gxp->dma_mgr = &(mgr->dma_mgr);
@@ -247,10 +256,19 @@ void gxp_dma_exit(struct gxp_dev *gxp)
 		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
 	unsigned int core;
 
+	/*
+	 * The SysMMU driver writes registers in the SysMMU during
+	 * `iommu_aux_detach_device()`, to disable that domain's VID and flush
+	 * its TLB. BLK_AUR must be powered on for these writes to succeed.
+	 */
+	gxp_pm_blk_on(gxp);
+
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		iommu_aux_detach_device(mgr->core_domains[core], gxp->dev);
 		iommu_domain_free(mgr->core_domains[core]);
 	}
+
+	gxp_pm_blk_off(gxp);
 
 	if (iommu_unregister_device_fault_handler(gxp->dev))
 		dev_err(gxp->dev,
@@ -445,7 +463,7 @@ alloc_sgt_for_buffer(void *ptr, size_t size,
 	return sgt;
 }
 
-#ifdef CONFIG_ANDROID
+#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
 int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
 			   struct edgetpu_ext_mailbox_info *mbx_info)
 {
@@ -512,7 +530,7 @@ void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 			    mbx_desc.cmdq_size, mbx_desc.respq_size);
 	}
 }
-#endif  // CONFIG_ANDROID
+#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
 void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 			     dma_addr_t *dma_handle, gfp_t flag,

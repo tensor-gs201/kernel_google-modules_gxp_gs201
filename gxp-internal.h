@@ -63,6 +63,8 @@ struct gxp_dma_manager;
 struct gxp_fw_data_manager;
 struct gxp_power_manager;
 struct gxp_telemetry_manager;
+struct gxp_thermal_manager;
+struct gxp_wakelock_manager;
 
 struct gxp_dev {
 	struct device *dev;		 /* platform bus device */
@@ -85,13 +87,30 @@ struct gxp_dev {
 	struct gxp_debug_dump_manager *debug_dump_mgr;
 	struct gxp_mapping_root *mappings;	/* tree of user mappings */
 	u32 firmware_running;		 /* firmware status bitmap */
-	struct mutex vd_lock;		 /* synchronizes vd operations */
+	/*
+	 * Reader/writer lock protecting usage of virtual cores assigned to
+	 * physical cores.
+	 * A writer is any function creating or destroying a virtual core, or
+	 * running or stopping one on a physical core.
+	 * A reader is any function making use of or interacting with a virtual
+	 * core without starting or stopping it on a physical core.
+	 */
+	/*
+	 * TODO(b/216862052) vd_semaphore also currently protects client state.
+	 *                   A separate per-client lock should be introduced
+	 *                   instead, as part of support for creating VDs
+	 *                   without running them on physical cores.
+	 */
+	struct rw_semaphore vd_semaphore;
 	struct gxp_client *core_to_client[GXP_NUM_CORES];
 	struct gxp_client *debugfs_client;
+	bool debugfs_wakelock_held;
+	struct gxp_thermal_manager *thermal_mgr;
 	struct gxp_dma_manager *dma_mgr;
 	struct gxp_fw_data_manager *data_mgr;
 	struct gxp_tpu_dev tpu_dev;
 	struct gxp_telemetry_manager *telemetry_mgr;
+	struct gxp_wakelock_manager *wakelock_mgr;
 };
 
 /* GXP device IO functions */

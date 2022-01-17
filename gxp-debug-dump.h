@@ -141,8 +141,15 @@ struct gxp_core_dump {
 	uint32_t dump_data[];
 };
 
+struct gxp_debug_dump_work {
+	struct work_struct work;
+	struct gxp_dev *gxp;
+	uint core_id;
+};
+
 struct gxp_debug_dump_manager {
 	struct gxp_dev *gxp;
+	struct gxp_debug_dump_work debug_dump_works[GXP_NUM_CORES];
 	struct gxp_core_dump *core_dump; /* start of the core dump */
 	void *sscd_dev;
 	void *sscd_pdata;
@@ -160,5 +167,7 @@ struct gxp_debug_dump_manager {
 int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata);
 void gxp_debug_dump_exit(struct gxp_dev *gxp);
 void gxp_debug_dump_process_dump(struct work_struct *work);
+struct work_struct *gxp_debug_dump_get_notification_handler(struct gxp_dev *gxp,
+							    uint core);
 
 #endif /* __GXP_DEBUG_DUMP_H__ */

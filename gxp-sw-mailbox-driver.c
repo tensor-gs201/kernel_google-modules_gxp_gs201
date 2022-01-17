@@ -5,6 +5,7 @@
  * Copyright (C) 2020 Google LLC
  */
 
+#include <linux/bitops.h>
 #include <linux/kthread.h>
 
 #include "gxp-tmp.h"
@@ -291,12 +292,17 @@ static void data_write(struct gxp_mailbox *mailbox, uint reg_offset, u32 value)
 
 /* IRQ Handling */
 
+#define MBOX_DEVICE_TO_HOST_RESPONSE_IRQ_MASK	BIT(0)
+
 static int poll_int_thread(void *data)
 {
-	u32 status_value, mask_value, masked_status_value;
+	u32 status_value, mask_value, masked_status_value, next_int;
 	struct gxp_mailbox *mailbox = (struct gxp_mailbox *)data;
+	struct work_struct **handlers = mailbox->interrupt_handlers;
 
 	while (!kthread_should_stop()) {
+		mutex_lock(&mailbox->polling_lock);
+
 		gxp_acquire_sync_barrier(mailbox->gxp,
 					 MBOX_ACCESS_SYNC_BARRIER);
 		status_value =
@@ -306,16 +312,30 @@ static int poll_int_thread(void *data)
 					 MBOX_ACCESS_SYNC_BARRIER);
 
 		masked_status_value = status_value & mask_value;
-		if (masked_status_value) {
-			if (masked_status_value & ~mailbox->debug_dump_int_mask)
-				mailbox->handle_irq(mailbox);
 
-			if (masked_status_value & mailbox->debug_dump_int_mask)
-				mailbox->handle_debug_dump_irq(mailbox);
-
-			gxp_mailbox_clear_host_interrupt(
-				mailbox, status_value & mask_value);
+		if (masked_status_value &
+		    MBOX_DEVICE_TO_HOST_RESPONSE_IRQ_MASK) {
+			mailbox->handle_irq(mailbox);
+			masked_status_value &=
+				~MBOX_DEVICE_TO_HOST_RESPONSE_IRQ_MASK;
 		}
+
+		while ((next_int = ffs(masked_status_value))) {
+			next_int--; /* ffs returns 1-based indices */
+			masked_status_value &= ~BIT(next_int);
+
+			if (handlers[next_int])
+				schedule_work(handlers[next_int]);
+			else
+				pr_err_ratelimited(
+					"mailbox%d: received unknown interrupt bit 0x%X\n",
+					mailbox->core_id, next_int);
+		}
+
+		gxp_mailbox_clear_host_interrupt(mailbox,
+						 status_value & mask_value);
+
+		mutex_unlock(&mailbox->polling_lock);
 
 		/* TODO(b/177701517): Polling frequency is untuned.*/
 		msleep(200);
@@ -336,6 +356,7 @@ void gxp_mailbox_driver_init(struct gxp_mailbox *mailbox)
 	csr_write(mailbox, MBOX_INTMR1_OFFSET, 0x00000000);
 
 	/* Setup a polling thread to check for to-host "interrupts" */
+	mutex_init(&mailbox->polling_lock);
 	mailbox->to_host_poll_task =
 		kthread_run(poll_int_thread, mailbox,
 			    "gxp_poll_mailbox%d_to_host", mailbox->core_id);
@@ -349,8 +370,11 @@ void gxp_mailbox_driver_init(struct gxp_mailbox *mailbox)
 
 void gxp_mailbox_driver_exit(struct gxp_mailbox *mailbox)
 {
-	if (!IS_ERR_OR_NULL(mailbox->to_host_poll_task))
+	if (!IS_ERR_OR_NULL(mailbox->to_host_poll_task)) {
+		mutex_lock(&mailbox->polling_lock);
 		kthread_stop(mailbox->to_host_poll_task);
+		mutex_unlock(&mailbox->polling_lock);
+	}
 }
 
 void __iomem *gxp_mailbox_get_csr_base(struct gxp_dev *gxp, uint index)

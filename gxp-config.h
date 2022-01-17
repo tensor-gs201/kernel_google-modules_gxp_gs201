@@ -9,7 +9,11 @@
 #define __GXP_CONFIG_H__
 
 #define GXP_DRIVER_NAME "gxp_platform"
+#ifndef CONFIG_GXP_GEM5
 #define GXP_NUM_CORES 4
+#else
+#define GXP_NUM_CORES 1
+#endif
 
 #if defined(CONFIG_GXP_ZEBU) || defined(CONFIG_GXP_IP_ZEBU)
 #define GXP_TIME_DELAY_FACTOR 20
