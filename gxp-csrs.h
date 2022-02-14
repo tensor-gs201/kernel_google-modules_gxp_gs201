@@ -10,6 +10,8 @@
 #define GXP_REG_DOORBELLS_SET_WRITEMASK 0x1
 #define GXP_REG_DOORBELLS_CLEAR_WRITEMASK 0x1
 
+#define GXP_CMU_OFFSET 0x200000
+
 enum gxp_csrs {
 	GXP_REG_LPM_VERSION = 0x40000,
 	GXP_REG_LPM_PSM_0 = 0x41000,
@@ -67,6 +69,10 @@ enum gxp_core_csrs {
 #define TIMER_CONTROL_OFFSET	0x4
 #define TIMER_VALUE_OFFSET	0x8
 #define TIMER_COUNT		8
+
+/* CMU offset */
+#define PLL_CON0_PLL_AUR 0x100
+#define PLL_CON0_NOC_USER 0x610
 
 /* LPM Registers */
 #define LPM_VERSION_OFFSET		0x0

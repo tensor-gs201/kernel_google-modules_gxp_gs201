@@ -7,6 +7,7 @@ obj-$(CONFIG_GXP) += gxp.o
 
 gxp-objs +=	\
 		gxp-bpm.o \
+		gxp-client.o \
 		gxp-debug-dump.o \
 		gxp-debugfs.o \
 		gxp-doorbell.o \

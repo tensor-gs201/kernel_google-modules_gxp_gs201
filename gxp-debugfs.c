@@ -5,7 +5,12 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#ifdef CONFIG_GXP_CLOUDRIPPER
+#include <linux/acpm_dvfs.h>
+#endif
+
 #include "gxp.h"
+#include "gxp-client.h"
 #include "gxp-debug-dump.h"
 #include "gxp-debugfs.h"
 #include "gxp-firmware.h"
@@ -14,6 +19,7 @@
 #include "gxp-pm.h"
 #include "gxp-mailbox.h"
 #include "gxp-telemetry.h"
+#include "gxp-lpm.h"
 #include "gxp-vd.h"
 #include "gxp-wakelock.h"
 
@@ -112,10 +118,10 @@ DEFINE_DEBUGFS_ATTRIBUTE(gxp_pingpong_fops, NULL, gxp_debugfs_pingpong,
 static int gxp_firmware_run_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *) data;
-	struct gxp_client *client_to_delete;
+	struct gxp_client *client;
 	int ret = 0;
 
-	down_write(&gxp->vd_semaphore);
+	mutex_lock(&gxp->debugfs_client_lock);
 
 	if (val) {
 		if (gxp->debugfs_client) {
@@ -124,9 +130,6 @@ static int gxp_firmware_run_set(void *data, u64 val)
 			goto out;
 		}
 
-		/* Cannot run firmware without a wakelock */
-		gxp_wakelock_acquire(gxp);
-
 		/*
 		 * Cleanup any bad state or corruption the device might've
 		 * caused
@@ -134,44 +137,60 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		gxp_fw_data_destroy(gxp);
 		gxp_fw_data_init(gxp);
 
-		gxp->debugfs_client = gxp_client_create(gxp);
-		if (IS_ERR(gxp->debugfs_client)) {
+		client = gxp_client_create(gxp);
+		if (IS_ERR(client)) {
 			dev_err(gxp->dev, "Failed to create client\n");
-			ret = PTR_ERR(gxp->debugfs_client);
-			gxp->debugfs_client = NULL;
-			gxp_wakelock_release(gxp);
 			goto out;
+		}
+		gxp->debugfs_client = client;
+
+		gxp->debugfs_client->vd = gxp_vd_allocate(gxp, GXP_NUM_CORES);
+		if (IS_ERR(gxp->debugfs_client->vd)) {
+			dev_err(gxp->dev, "Failed to allocate VD\n");
+			ret = PTR_ERR(gxp->debugfs_client->vd);
+			goto err_start;
 		}
 
-		ret = gxp_vd_allocate(gxp->debugfs_client, GXP_NUM_CORES);
+		ret = gxp_wakelock_acquire(gxp);
 		if (ret) {
-			dev_err(gxp->dev, "Failed to allocate VD\n");
-			gxp_client_destroy(gxp->debugfs_client);
-			gxp->debugfs_client = NULL;
-			gxp_wakelock_release(gxp);
-			goto out;
+			dev_err(gxp->dev, "Failed to acquire BLOCK wakelock\n");
+			goto err_start;
 		}
+		gxp->debugfs_client->has_block_wakelock = true;
+
+		down_write(&gxp->vd_semaphore);
+		ret = gxp_vd_start(gxp->debugfs_client->vd);
+		up_write(&gxp->vd_semaphore);
+		if (ret) {
+			dev_err(gxp->dev, "Failed to start VD\n");
+			goto err_start;
+		}
+		gxp->debugfs_client->has_vd_wakelock = true;
 	} else {
 		if (!gxp->debugfs_client) {
 			dev_err(gxp->dev, "Firmware not running!\n");
 			ret = -EIO;
 			goto out;
 		}
-		client_to_delete = gxp->debugfs_client;
+
+		/*
+		 * Cleaning up the client will stop the VD it owns and release
+		 * the BLOCK wakelock it is holding.
+		 */
+		gxp_client_destroy(gxp->debugfs_client);
 		gxp->debugfs_client = NULL;
-
-		up_write(&gxp->vd_semaphore);
-
-		gxp_client_destroy(client_to_delete);
-		gxp_wakelock_release(gxp);
-
-		/* Return here, since vd_semaphore has already been unlocked */
-		return ret;
 	}
 
 out:
-	up_write(&gxp->vd_semaphore);
+	mutex_unlock(&gxp->debugfs_client_lock);
 
+	return ret;
+
+err_start:
+	/* Destroying a client cleans up any VDss or wakelocks it held. */
+	gxp_client_destroy(gxp->debugfs_client);
+	gxp->debugfs_client = NULL;
+	mutex_unlock(&gxp->debugfs_client_lock);
 	return ret;
 }
 
@@ -351,12 +370,86 @@ out:
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_log_eventfd_signal_fops, NULL,
 			 gxp_log_eventfd_signal_set, "%llu\n");
 
+/* TODO: Remove these mux entry once experiment is done */
+static int gxp_cmu_mux1_set(void *data, u64 val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	void *addr;
+
+	if (val > 1) {
+		dev_err(gxp->dev, "Incorrect val for cmu_mux1, only 0 and 1 allowed\n");
+		return -EINVAL;
+	}
+
+	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
+
+	if (!addr) {
+		dev_err(gxp->dev, "Cannot map CMU1 address\n");
+		return -EIO;
+	}
+
+	writel(val << 4, addr + PLL_CON0_PLL_AUR);
+	iounmap(addr);
+	return 0;
+}
+
+static int gxp_cmu_mux1_get(void *data, u64 *val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	void *addr;
+
+	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
+	*val = readl(addr + PLL_CON0_PLL_AUR);
+	iounmap(addr);
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(gxp_cmu_mux1_fops, gxp_cmu_mux1_get, gxp_cmu_mux1_set,
+			 "%llu\n");
+
+static int gxp_cmu_mux2_set(void *data, u64 val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	void *addr;
+
+	if (val > 1) {
+		dev_err(gxp->dev, "Incorrect val for cmu_mux2, only 0 and 1 allowed\n");
+		return -EINVAL;
+	}
+
+	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
+
+	if (!addr) {
+		dev_err(gxp->dev, "Cannot map CMU2 address\n");
+		return -EIO;
+	}
+
+	writel(val << 4, addr + PLL_CON0_NOC_USER);
+	iounmap(addr);
+	return 0;
+}
+
+static int gxp_cmu_mux2_get(void *data, u64 *val)
+{
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	void *addr;
+
+	addr = ioremap(gxp->regs.paddr - GXP_CMU_OFFSET, 0x1000);
+	*val = readl(addr + 0x610);
+	iounmap(addr);
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(gxp_cmu_mux2_fops, gxp_cmu_mux2_get, gxp_cmu_mux2_set,
+			 "%llu\n");
+
 void gxp_create_debugfs(struct gxp_dev *gxp)
 {
 	gxp->d_entry = debugfs_create_dir("gxp", NULL);
 	if (IS_ERR_OR_NULL(gxp->d_entry))
 		return;
 
+	mutex_init(&gxp->debugfs_client_lock);
 	gxp->debugfs_wakelock_held = false;
 
 	debugfs_create_file("lpm_test", 0200, gxp->d_entry, gxp,
@@ -376,12 +469,21 @@ void gxp_create_debugfs(struct gxp_dev *gxp)
 	debugfs_create_file("log", 0600, gxp->d_entry, gxp, &gxp_log_buff_fops);
 	debugfs_create_file("log_eventfd", 0200, gxp->d_entry, gxp,
 			    &gxp_log_eventfd_signal_fops);
+	debugfs_create_file("cmumux1", 0600, gxp->d_entry, gxp,
+			    &gxp_cmu_mux1_fops);
+	debugfs_create_file("cmumux2", 0600, gxp->d_entry, gxp,
+			    &gxp_cmu_mux2_fops);
 }
 
 void gxp_remove_debugfs(struct gxp_dev *gxp)
 {
+	debugfs_remove_recursive(gxp->d_entry);
+
+	/*
+	 * Now that debugfs is torn down, and no other calls to
+	 * `gxp_firmware_run_set()` can occur, destroy any client that may have
+	 * been left running.
+	 */
 	if (gxp->debugfs_client)
 		gxp_client_destroy(gxp->debugfs_client);
-
-	debugfs_remove_recursive(gxp->d_entry);
 }

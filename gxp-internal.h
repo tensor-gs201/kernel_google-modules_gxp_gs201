@@ -16,6 +16,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/rwsem.h>
 #include <linux/spinlock.h>
 
 #include "gxp-config.h"
@@ -25,15 +26,6 @@
 struct gxp_tpu_mbx_desc {
 	uint phys_core_list;
 	size_t cmdq_size, respq_size;
-};
-
-/* Holds state belonging to a client */
-struct gxp_client {
-	struct gxp_dev *gxp;
-	void *app;
-	bool vd_allocated;
-	bool tpu_mbx_allocated;
-	struct gxp_tpu_mbx_desc mbx_desc;
 };
 
 /* ioremapped resource */
@@ -56,6 +48,7 @@ struct gxp_tpu_dev {
 };
 
 /* Forward declarations from submodules */
+struct gxp_client;
 struct gxp_mailbox_manager;
 struct gxp_debug_dump_manager;
 struct gxp_mapping_root;
@@ -102,8 +95,9 @@ struct gxp_dev {
 	 *                   without running them on physical cores.
 	 */
 	struct rw_semaphore vd_semaphore;
-	struct gxp_client *core_to_client[GXP_NUM_CORES];
+	struct gxp_virtual_device *core_to_vd[GXP_NUM_CORES];
 	struct gxp_client *debugfs_client;
+	struct mutex debugfs_client_lock;
 	bool debugfs_wakelock_held;
 	struct gxp_thermal_manager *thermal_mgr;
 	struct gxp_dma_manager *dma_mgr;

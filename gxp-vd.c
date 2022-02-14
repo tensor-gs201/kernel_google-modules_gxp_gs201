@@ -10,7 +10,6 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
-#include "gxp-dma.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
 #include "gxp-internal.h"
@@ -25,7 +24,7 @@ int gxp_vd_init(struct gxp_dev *gxp)
 
 	/* All cores start as free */
 	for (core = 0; core < GXP_NUM_CORES; core++)
-		gxp->core_to_client[core] = NULL;
+		gxp->core_to_vd[core] = NULL;
 
 	ret = gxp_fw_init(gxp);
 
@@ -41,65 +40,64 @@ void gxp_vd_destroy(struct gxp_dev *gxp)
 	up_write(&gxp->vd_semaphore);
 }
 
-/* Caller must hold gxp->vd_semaphore for writing */
-static void gxp_vd_release(struct gxp_client *client)
+struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp, u16 requested_cores)
 {
-	uint core;
-	struct gxp_dev *gxp = client->gxp;
+	struct gxp_virtual_device *vd;
+
+	/* Assumes 0 < requested_cores <= GXP_NUM_CORES */
+	if (requested_cores == 0 || requested_cores > GXP_NUM_CORES)
+		return ERR_PTR(-EINVAL);
+
+	vd = kzalloc(sizeof(*vd), GFP_KERNEL);
+	if (!vd)
+		return ERR_PTR(-ENOMEM);
+
+	vd->gxp = gxp;
+	vd->num_cores = requested_cores;
 
 	/*
-	 * Put all cores in the VD into reset so they can not wake each other up
+	 * TODO(b/209083969) Initialize VD aux domain here to support VD
+	 * suspend/resume and mapping without a VIRTUAL_DEVICE wakelock.
 	 */
-	for (core = 0; core < GXP_NUM_CORES; core++) {
-		if (gxp->core_to_client[core] == client) {
-			gxp_write_32_core(
-				gxp, core, GXP_REG_ETM_PWRCTL,
-				1 << GXP_REG_ETM_PWRCTL_CORE_RESET_SHIFT);
-		}
-       }
 
-	for (core = 0; core < GXP_NUM_CORES; core++) {
-		if (gxp->core_to_client[core] == client) {
-			gxp->core_to_client[core] = NULL;
-			gxp_firmware_stop(gxp, core);
-		}
-	}
-	if (client->app) {
-		gxp_fw_data_destroy_app(gxp, client->app);
-		client->app = NULL;
-	}
+	return vd;
+}
+
+void gxp_vd_release(struct gxp_virtual_device *vd)
+{
+	/*
+	 * TODO(b/209083969) Cleanup VD aux domain once it's created in
+	 * gxp_vd_allocate().
+	 */
+
+	kfree(vd);
 }
 
 /* Caller must hold gxp->vd_semaphore for writing */
-int gxp_vd_allocate(struct gxp_client *client, u16 requested_cores)
+int gxp_vd_start(struct gxp_virtual_device *vd)
 {
-	struct gxp_dev *gxp = client->gxp;
+	struct gxp_dev *gxp = vd->gxp;
 	uint core;
-	int available_cores = 0;
-	int cores_remaining = requested_cores;
+	uint available_cores = 0;
+	uint cores_remaining = vd->num_cores;
 	uint core_list = 0;
 	int ret = 0;
 
-	/* Assumes 0 < requested_cores <= GXP_NUM_CORES */
-	WARN_ON(requested_cores == 0 || requested_cores > GXP_NUM_CORES);
-	/* Assumes client has not called gxp_vd_allocate */
-	WARN_ON(client->vd_allocated);
-
 	for (core = 0; core < GXP_NUM_CORES; core++) {
-		if (gxp->core_to_client[core] == NULL) {
-			if (available_cores < requested_cores)
+		if (gxp->core_to_vd[core] == NULL) {
+			if (available_cores < vd->num_cores)
 				core_list |= BIT(core);
 			available_cores++;
 		}
 	}
 
-	if (available_cores < requested_cores) {
-		dev_err(gxp->dev, "Insufficient available cores. Available: %d. Requested: %u\n",
-			available_cores, requested_cores);
+	if (available_cores < vd->num_cores) {
+		dev_err(gxp->dev, "Insufficient available cores. Available: %u. Requested: %u\n",
+			available_cores, vd->num_cores);
 		return -EBUSY;
 	}
 
-	client->app = gxp_fw_data_create_app(gxp, core_list);
+	vd->fw_app = gxp_fw_data_create_app(gxp, core_list);
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (cores_remaining == 0)
@@ -110,52 +108,81 @@ int gxp_vd_allocate(struct gxp_client *client, u16 requested_cores)
 			if (ret) {
 				dev_err(gxp->dev, "Failed to run firmware on core %u\n",
 					core);
-				goto out_vd_release;
+				goto out_vd_stop;
 			}
-			gxp->core_to_client[core] = client;
+			gxp->core_to_vd[core] = vd;
 			cores_remaining--;
 		}
 	}
 
 	if (cores_remaining != 0) {
-		dev_err(gxp->dev, "Internal error: Failed to allocate %u requested cores. %d cores remaining\n",
-			requested_cores, cores_remaining);
+		dev_err(gxp->dev,
+			"Internal error: Failed to start %u requested cores. %u cores remaining\n",
+			vd->num_cores, cores_remaining);
 		/*
 		 * Should never reach here. Previously verified that enough
 		 * cores are available.
 		 */
 		WARN_ON(true);
 		ret = -EIO;
-		goto out_vd_release;
+		goto out_vd_stop;
 	}
 
-	client->vd_allocated = true;
 	return ret;
 
-out_vd_release:
-	gxp_vd_release(client);
+out_vd_stop:
+	gxp_vd_stop(vd);
 	return ret;
+
 }
 
-int gxp_vd_virt_core_to_phys_core(struct gxp_client *client, u16 virt_core)
+/* Caller must hold gxp->vd_semaphore for writing */
+void gxp_vd_stop(struct gxp_virtual_device *vd)
 {
-	struct gxp_dev *gxp = client->gxp;
+	struct gxp_dev *gxp = vd->gxp;
+	uint core;
+
+	/*
+	 * Put all cores in the VD into reset so they can not wake each other up
+	 */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_vd[core] == vd) {
+			gxp_write_32_core(
+				gxp, core, GXP_REG_ETM_PWRCTL,
+				1 << GXP_REG_ETM_PWRCTL_CORE_RESET_SHIFT);
+		}
+       }
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_vd[core] == vd) {
+			gxp->core_to_vd[core] = NULL;
+			gxp_firmware_stop(gxp, core);
+		}
+	}
+
+	if (vd->fw_app) {
+		gxp_fw_data_destroy_app(gxp, vd->fw_app);
+		vd->fw_app = NULL;
+	}
+}
+
+/*
+ * Helper function for use in both `gxp_vd_virt_core_to_phys_core()` and
+ * `gxp_vd_virt_core_list_to_phys_core_list()`.
+ *
+ * Caller must have locked `gxp->vd_semaphore` for reading.
+ */
+static int virt_core_to_phys_core_locked(struct gxp_virtual_device *vd,
+					 u16 virt_core)
+{
+	struct gxp_dev *gxp = vd->gxp;
 	uint phys_core;
 	uint virt_core_index = 0;
 
-	down_read(&gxp->vd_semaphore);
-
-	if (!client->vd_allocated) {
-		up_read(&gxp->vd_semaphore);
-		dev_dbg(gxp->dev, "Client has not allocated a virtual device\n");
-		return -EINVAL;
-	}
-
 	for (phys_core = 0; phys_core < GXP_NUM_CORES; phys_core++) {
-		if (gxp->core_to_client[phys_core] == client) {
+		if (gxp->core_to_vd[phys_core] == vd) {
 			if (virt_core_index == virt_core) {
 				/* Found virtual core */
-				up_read(&gxp->vd_semaphore);
 				return phys_core;
 			}
 
@@ -163,17 +190,31 @@ int gxp_vd_virt_core_to_phys_core(struct gxp_client *client, u16 virt_core)
 		}
 	}
 
-	up_read(&gxp->vd_semaphore);
 	dev_dbg(gxp->dev, "No mapping for virtual core %u\n", virt_core);
 	return -EINVAL;
 }
 
-uint gxp_vd_virt_core_list_to_phys_core_list(struct gxp_client *client,
+int gxp_vd_virt_core_to_phys_core(struct gxp_virtual_device *vd, u16 virt_core)
+{
+	struct gxp_dev *gxp = vd->gxp;
+	int ret;
+
+	down_read(&gxp->vd_semaphore);
+	ret = virt_core_to_phys_core_locked(vd, virt_core);
+	up_read(&gxp->vd_semaphore);
+
+	return ret;
+}
+
+uint gxp_vd_virt_core_list_to_phys_core_list(struct gxp_virtual_device *vd,
 					     u16 virt_core_list)
 {
+	struct gxp_dev *gxp = vd->gxp;
 	uint phys_core_list = 0;
 	uint virt_core = 0;
 	int phys_core;
+
+	down_read(&gxp->vd_semaphore);
 
 	while (virt_core_list) {
 		/*
@@ -187,48 +228,18 @@ uint gxp_vd_virt_core_list_to_phys_core_list(struct gxp_client *client,
 		virt_core = ffs(virt_core_list) - 1;
 
 		/* Any invalid virt cores invalidate the whole list */
-		phys_core = gxp_vd_virt_core_to_phys_core(client, virt_core);
-		if (phys_core < 0)
-			return 0;
+		phys_core = virt_core_to_phys_core_locked(vd, virt_core);
+		if (phys_core < 0) {
+			phys_core_list = 0;
+			goto out;
+		}
 
 		phys_core_list |= BIT(phys_core);
 		virt_core_list &= ~BIT(virt_core);
 	}
 
+out:
+	up_read(&gxp->vd_semaphore);
+
 	return phys_core_list;
-}
-
-struct gxp_client *gxp_client_create(struct gxp_dev *gxp)
-{
-	struct gxp_client *client;
-
-	client = kmalloc(sizeof(*client), GFP_KERNEL);
-	if (!client)
-		return ERR_PTR(-ENOMEM);
-
-	client->gxp = gxp;
-	client->vd_allocated = false;
-	client->app = NULL;
-	client->tpu_mbx_allocated = false;
-	return client;
-}
-
-void gxp_client_destroy(struct gxp_client *client)
-{
-	struct gxp_dev *gxp = client->gxp;
-
-	down_write(&gxp->vd_semaphore);
-
-#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
-	/*
-	 * Unmap TPU buffers, if the mapping is already removed, this
-	 * is a no-op.
-	 */
-	gxp_dma_unmap_tpu_buffer(gxp, client->mbx_desc);
-#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
-	gxp_vd_release(client);
-
-	up_write(&gxp->vd_semaphore);
-
-	kfree(client);
 }

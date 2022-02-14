@@ -30,6 +30,15 @@
 #define GXP_MAP_DMA_TO_DEVICE		1
 #define GXP_MAP_DMA_FROM_DEVICE		2
 
+/*
+ * TODO(b/209083969) The following IOCTLs will no longer require the caller
+ * to hold a virtual device wakelock to call them once virtual device
+ * suspend/resume is implemented:
+ * - GXP_MAP_BUFFER
+ * - GXP_UNMAP_BUFFER
+ * - GXP_SYNC_BUFFER
+ */
+
 struct gxp_map_ioctl {
 	/*
 	 * Bitfield indicating which virtual cores to map the buffer for.
@@ -58,7 +67,11 @@ struct gxp_map_ioctl {
 	__u64 device_address;	/* returned device address */
 };
 
-/* Map host buffer. */
+/*
+ * Map host buffer.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
 #define GXP_MAP_BUFFER \
 	_IOWR(GXP_IOCTL_BASE, 0, struct gxp_map_ioctl)
 
@@ -68,6 +81,8 @@ struct gxp_map_ioctl {
  * Only the @device_address field will be used. Other fields will be fetched
  * from the kernel's internal records. It is recommended to use the argument
  * that was passed in GXP_MAP_BUFFER to un-map the buffer.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
  */
 #define GXP_UNMAP_BUFFER \
 	_IOW(GXP_IOCTL_BASE, 1, struct gxp_map_ioctl)
@@ -104,6 +119,8 @@ struct gxp_sync_ioctl {
 
 /*
  * Sync buffer previously mapped by GXP_MAP_BUFFER.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
  *
  * EINVAL: If a mapping for @device_address is not found.
  * EINVAL: If @size equals 0.
@@ -143,7 +160,11 @@ struct gxp_mailbox_command_ioctl {
 	__u32 flags;
 };
 
-/* Push element to the mailbox commmand queue. */
+/*
+ * Push element to the mailbox commmand queue.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
 #define GXP_MAILBOX_COMMAND \
 	_IOW(GXP_IOCTL_BASE, 3, struct gxp_mailbox_command_ioctl)
 
@@ -182,6 +203,8 @@ struct gxp_mailbox_response_ioctl {
 /*
  * Pop element from the mailbox response queue. Blocks until mailbox response
  * is available.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
  */
 #define GXP_MAILBOX_RESPONSE \
 	_IOWR(GXP_IOCTL_BASE, 4, struct gxp_mailbox_response_ioctl)
@@ -417,5 +440,120 @@ struct gxp_register_telemetry_eventfd_ioctl {
  * return the full 64-bit value of the counter.
  */
 #define GXP_READ_GLOBAL_COUNTER _IOR(GXP_IOCTL_BASE, 17, __u64)
+
+/*
+ * Components for which a client may hold a wakelock.
+ * Acquired by passing these values as `components_to_wake` in
+ * `struct gxp_acquire_wakelock_ioctl` to GXP_ACQUIRE_WAKELOCK and released by
+ * passing these values directly as the argument to GXP_RELEASE_WAKELOCK.
+ *
+ * Multiple wakelocks can be acquired or released at once by passing multiple
+ * components, ORed together.
+ */
+#define WAKELOCK_BLOCK		(1 << 0)
+#define WAKELOCK_VIRTUAL_DEVICE	(1 << 1)
+
+/*
+ * DSP subsystem Power state values for use as `gxp_power_state` in
+ * `struct gxp_acquire_wakelock_ioctl`
+ */
+#define GXP_POWER_STATE_OFF	0
+#define GXP_POWER_STATE_UUD	1
+#define GXP_POWER_STATE_SUD	2
+#define GXP_POWER_STATE_UD	3
+#define GXP_POWER_STATE_NOM	4
+
+/*
+ * Memory interface power state values for use as `memory_power_state` in
+ * `struct gxp_acquire_wakelock_ioctl`.
+ */
+#define MEMORY_POWER_STATE_UNDEFINED	0
+#define MEMORY_POWER_STATE_MIN		1
+#define MEMORY_POWER_STATE_VERY_LOW	2
+#define MEMORY_POWER_STATE_LOW		3
+#define MEMORY_POWER_STATE_HIGH		4
+#define MEMORY_POWER_STATE_VERY_HIGH	5
+#define MEMORY_POWER_STATE_MAX		6
+
+struct gxp_acquire_wakelock_ioctl {
+	/*
+	 * The components for which a wakelock will be acquired.
+	 * Should be one of WAKELOCK_BLOCK or WAKELOCK_VIRTUAL_DEVICE, or a
+	 * bitwise OR of both.
+	 *
+	 * A VIRTUAL_DEVICE wakelock cannot be acquired until the client has
+	 * allocated a virtual device. To acquire a VIRTUAL_DEVICE wakelock, a
+	 * client must already have acquired a BLOCK wakelock or acquire both
+	 * in the same call.
+	 */
+	__u32 components_to_wake;
+	/*
+	 * Minimum power state to operate the entire DSP subsystem at until
+	 * the wakelock is released. One of the GXP_POWER_STATE_* defines
+	 * from above.
+	 *
+	 * `GXP_POWER_STATE_OFF` is not a valid value when acquiring a
+	 * wakelock.
+	 */
+	__u32 gxp_power_state;
+	/*
+	 * Memory interface power state to request from the system so long as
+	 * the wakelock is held. One of the MEMORY_POWER_STATE* defines from
+	 * above.
+	 *
+	 * If `MEMORY_POWER_STATE_UNDEFINED` is passed, no request to change
+	 * the memory interface power state will be made.
+	 */
+	__u32 memory_power_state;
+	/*
+	 * How long to wait, in microseconds, before returning if insufficient
+	 * physical cores are available when attempting to acquire a
+	 * VIRTUAL_DEVICE wakelock. A value of 0 indicates that the IOCTL
+	 * should not wait at all if cores are not available.
+	 */
+	__u32 vd_timeout_us;
+};
+
+/*
+ * Acquire a wakelock and request minimum power states for the DSP subsystem
+ * and the memory interface.
+ *
+ * Upon a successful return, the specified components will be powered on and if
+ * they were not already running at the specified or higher power states,
+ * requests will have been sent to transition both the DSP subsystem and
+ * memory interface to the specified states.
+ *
+ * If the same client invokes this IOCTL for the same component more than once
+ * without a corresponding call to `GXP_RELEASE_WAKE_LOCK` in between, the
+ * second call will update requested power states, but have no other effects.
+ * No additional call to `GXP_RELEASE_WAKE_LOCK` will be required.
+ *
+ * If a client attempts to acquire a VIRTUAL_DEVICE wakelock and there are
+ * insufficient physical cores available, the driver will wait up to
+ * `vd_timeout_us` microseconds, then return -EBUSY if sufficient cores were
+ * never made available. In this case, if both BLOCK and VIRTUAL_DEVICE
+ * wakelocks were being requested, neither will have been acquired.
+ */
+#define GXP_ACQUIRE_WAKE_LOCK                                                  \
+	_IOW(GXP_IOCTL_BASE, 18, struct gxp_acquire_wakelock_ioctl)
+
+/*
+ * Release a wakelock acquired via `GXP_ACQUIRE_WAKE_LOCK`.
+ *
+ * The argument should be one of WAKELOCK_BLOCK or WAKELOCK_VIRTUAL_DEVICE, or a
+ * bitwise OR of both.
+ *
+ * Upon releasing a VIRTUAL_DEVICE wakelock, a client's virtual device will be
+ * removed from physical cores. At that point the cores may be reallocated to
+ * another client or powered down.
+ *
+ * If no clients hold a BLOCK wakelock, the entire DSP subsytem may be powered
+ * down. If a client attempts to release a BLOCK wakelock while still holding
+ * a VIRTUAL_DEVICE wakelock, this IOCTL will return -EBUSY.
+ *
+ * If a client attempts to release a wakelock it does not hold, this IOCTL will
+ * return -ENODEV.
+ */
+#define GXP_RELEASE_WAKE_LOCK _IOW(GXP_IOCTL_BASE, 19, __u32)
 
 #endif /* __GXP_H__ */

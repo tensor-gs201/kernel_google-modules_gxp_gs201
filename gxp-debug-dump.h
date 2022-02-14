@@ -11,10 +11,18 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
+#include <linux/platform_data/sscoredump.h>
+#endif
+
 #include "gxp-internal.h"
 
 #define GXP_NUM_COMMON_SEGMENTS 2
-#define GXP_NUM_CORE_SEGMENTS 7
+#define GXP_NUM_CORE_SEGMENTS 8
+#define GXP_CORE_DRAM_SEGMENT_IDX 7
+#define GXP_DEBUG_DUMP_CORE_SEGMENT_IDX_START GXP_NUM_COMMON_SEGMENTS + 1
+#define GXP_DEBUG_DUMP_DRAM_SEGMENT_IDX GXP_DEBUG_DUMP_CORE_SEGMENT_IDX_START \
+					+ GXP_CORE_DRAM_SEGMENT_IDX
 #define GXP_SEG_HEADER_NAME_LENGTH 32
 
 #define GXP_Q7_ICACHE_SIZE 131072 /* I-cache size in bytes */
@@ -151,6 +159,7 @@ struct gxp_debug_dump_manager {
 	struct gxp_dev *gxp;
 	struct gxp_debug_dump_work debug_dump_works[GXP_NUM_CORES];
 	struct gxp_core_dump *core_dump; /* start of the core dump */
+	struct gxp_common_dump *common_dump;
 	void *sscd_dev;
 	void *sscd_pdata;
 	dma_addr_t debug_dump_dma_handle; /* dma handle for debug dump */
@@ -160,8 +169,14 @@ struct gxp_debug_dump_manager {
 	int kernel_init_dump_pending;
 	wait_queue_head_t kernel_init_dump_waitq;
 	struct work_struct wait_kernel_init_dump_work;
-	/* SSCD lock to ensure SSCD is only processing one report at a time */
-	struct mutex sscd_lock;
+	/*
+	 * Debug dump lock to ensure only one debug dump is being processed at a
+	 * time
+	 */
+	struct mutex debug_dump_lock;
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
+	struct sscd_segment *segs[GXP_NUM_CORES];
+#endif
 };
 
 int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata);
