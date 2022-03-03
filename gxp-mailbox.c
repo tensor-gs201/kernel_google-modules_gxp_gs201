@@ -554,8 +554,6 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 			      mailbox->descriptor_device_addr);
 	destroy_workqueue(mailbox->response_wq);
 	kfree(mailbox);
-
-	return;
 }
 
 void gxp_mailbox_reset(struct gxp_mailbox *mailbox)

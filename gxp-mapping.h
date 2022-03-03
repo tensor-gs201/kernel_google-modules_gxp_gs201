@@ -22,6 +22,11 @@ struct gxp_mapping_root {
 
 struct gxp_mapping {
 	struct rb_node node;
+	/*
+	 * User-space address of the mapped buffer.
+	 * If this value is 0, it indicates this mapping is for a dma-buf and
+	 * should not be used if a regular buffer mapping was expected.
+	 */
 	u64 host_address;
 	uint core_list;
 	/*

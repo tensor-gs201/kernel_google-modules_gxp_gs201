@@ -86,7 +86,7 @@ struct gxp_watchdog_descriptor {
 };
 
 /*
- * A structure describing the telemetry (loggging and tracing) parameters and
+ * A structure describing the telemetry (logging and tracing) parameters and
  * buffers.
  */
 struct gxp_telemetry_descriptor {

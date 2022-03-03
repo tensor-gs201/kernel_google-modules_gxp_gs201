@@ -151,7 +151,7 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 				gxp, core, GXP_REG_ETM_PWRCTL,
 				1 << GXP_REG_ETM_PWRCTL_CORE_RESET_SHIFT);
 		}
-       }
+	}
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp->core_to_vd[core] == vd) {

@@ -7,6 +7,7 @@
 #ifndef __GXP_DMA_H__
 #define __GXP_DMA_H__
 
+#include <linux/dma-buf.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/types.h>
@@ -307,5 +308,36 @@ void gxp_dma_sync_sg_for_cpu(struct gxp_dev *gxp, struct scatterlist *sg,
  */
 void gxp_dma_sync_sg_for_device(struct gxp_dev *gxp, struct scatterlist *sg,
 				int nents, enum dma_data_direction direction);
+
+/**
+ * gxp_dma_map_dmabuf_attachment() - Create a mapping for a dma-buf
+ * @gxp: The GXP device to map the dma-buf for
+ * @core_list: A bitfield enumerating the physical cores the mapping is for
+ * @attachment: An attachment, representing the dma-buf, obtained from
+ *              `dma_buf_attach()`
+ * @direction: DMA direction
+ *
+ * Return: A scatter-gather table describing the mapping of the dma-buf
+ *         into the default IOMMU domain. Returns ERR_PTR on failure.
+ */
+struct sg_table *
+gxp_dma_map_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+			      struct dma_buf_attachment *attachment,
+			      enum dma_data_direction direction);
+
+/**
+ * gxp_dma_unmap_dmabuf_attachment() - Unmap a dma-buf
+ * @gxp: The GXP device the dma-buf was mapped for
+ * @core_list: A bitfield enumerating the physical cores the mapping is for
+ * @attachment: The attachment, representing the dma-buf, that was passed to
+ *              `gxp_dma_map_dmabuf_attachment()` to create the mapping
+ * @sgt: The scatter-gather table returned by `gxp_dma_map_dmabuf_attachment()`
+ *       when mapping this dma-buf
+ * @direction: DMA direction
+ */
+void gxp_dma_unmap_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+				     struct dma_buf_attachment *attachment,
+				     struct sg_table *sgt,
+				     enum dma_data_direction direction);
 
 #endif /* __GXP_DMA_H__ */

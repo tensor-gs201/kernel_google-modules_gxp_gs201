@@ -15,7 +15,7 @@
 #define AURORA_SCRATCHPAD_LEN 0x00100000 /* 1M */
 
 #else /* CONFIG_GXP_TEST */
-/* Firmware memory is shrinked in unit tests. */
+/* Firmware memory is shrunk in unit tests. */
 #define AURORA_SCRATCHPAD_OFF 0x000F0000
 #define AURORA_SCRATCHPAD_LEN 0x00010000
 

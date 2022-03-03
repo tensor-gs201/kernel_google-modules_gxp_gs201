@@ -105,6 +105,11 @@ struct gxp_dev {
 	struct gxp_tpu_dev tpu_dev;
 	struct gxp_telemetry_manager *telemetry_mgr;
 	struct gxp_wakelock_manager *wakelock_mgr;
+	/*
+	 * Pointer to GSA device for firmware authentication.
+	 * May be NULL if the chip does not support firmware authentication
+	 */
+	struct device *gsa_dev;
 };
 
 /* GXP device IO functions */

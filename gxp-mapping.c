@@ -324,6 +324,12 @@ struct gxp_mapping *gxp_mapping_get_host(struct gxp_dev *gxp, u64 host_address)
 
 	mutex_lock(&gxp->mappings->lock);
 
+	if (!host_address) {
+		dev_warn(gxp->dev,
+			 "Unable to get dma-buf mapping by host address\n");
+		return NULL;
+	}
+
 	/* Iterate through the elements in the rbtree */
 	for (node = rb_first(&gxp->mappings->rb); node; node = rb_next(node)) {
 		this = rb_entry(node, struct gxp_mapping, node);
@@ -340,5 +346,9 @@ struct gxp_mapping *gxp_mapping_get_host(struct gxp_dev *gxp, u64 host_address)
 
 void gxp_mapping_remove(struct gxp_dev *gxp, struct gxp_mapping *map)
 {
+	mutex_lock(&gxp->mappings->lock);
+
 	rb_erase(&map->node, &gxp->mappings->rb);
+
+	mutex_unlock(&gxp->mappings->lock);
 }

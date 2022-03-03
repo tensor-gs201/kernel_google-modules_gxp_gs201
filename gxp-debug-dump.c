@@ -247,8 +247,8 @@ static void gxp_get_common_dump(struct gxp_dev *gxp)
 
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 static void gxp_send_to_sscd(struct gxp_dev *gxp, void *segs, int seg_cnt,
-			     const char *info) {
-
+			     const char *info)
+{
 	struct gxp_debug_dump_manager *mgr = gxp->debug_dump_mgr;
 	struct sscd_platform_data *pdata =
 		(struct sscd_platform_data *)mgr->sscd_pdata;
@@ -337,11 +337,10 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp, uint32_t core_id)
 
 	for (i = 0; i < GXP_NUM_CORE_SEGMENTS; i++)
 		core_dump_header->seg_header[i].valid = 0;
-
-	return;
 }
 
-static void gxp_free_segments(struct gxp_dev *gxp) {
+static void gxp_free_segments(struct gxp_dev *gxp)
+{
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	int core_id;
 
@@ -351,7 +350,8 @@ static void gxp_free_segments(struct gxp_dev *gxp) {
 	kfree(gxp->debug_dump_mgr->common_dump);
 }
 
-static int gxp_init_segments(struct gxp_dev *gxp) {
+static int gxp_init_segments(struct gxp_dev *gxp)
+{
 #if !IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	return 0;
 #else
@@ -384,7 +384,8 @@ err_out:
 #endif
 }
 
-static void gxp_handle_dram_dump(struct gxp_dev *gxp, uint32_t core_id) {
+static void gxp_handle_dram_dump(struct gxp_dev *gxp, uint32_t core_id)
+{
 	struct gxp_debug_dump_manager *mgr = gxp->debug_dump_mgr;
 	struct gxp_core_dump_header *core_dump_header =
 		&mgr->core_dump->core_dump_header[core_id];
@@ -407,7 +408,8 @@ static void gxp_handle_dram_dump(struct gxp_dev *gxp, uint32_t core_id) {
 }
 
 static bool gxp_is_segment_valid(struct gxp_dev *gxp, uint32_t core_id,
-				 int seg_idx) {
+				 int seg_idx)
+{
 	struct gxp_core_dump *core_dump;
 	struct gxp_core_dump_header *core_dump_header;
 	struct gxp_seg_header *seg_header;

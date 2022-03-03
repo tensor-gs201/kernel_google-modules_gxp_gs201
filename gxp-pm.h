@@ -9,6 +9,7 @@
 
 #include "gxp-internal.h"
 #include <linux/refcount.h>
+#include <soc/google/exynos_pm_qos.h>
 
 #define AUR_DVFS_MIN_STATE 178000
 
@@ -20,8 +21,23 @@ enum aur_power_state {
 	AUR_NOM = 1160000,
 };
 
-#define AUR_INIT_DVFS_STATE AUR_NOM
+enum aur_memory_power_state {
+	AUR_MEM_UNDEFINED = 0,
+	AUR_MEM_MIN = 1,
+	AUR_MEM_VERY_LOW = 2,
+	AUR_MEM_LOW = 3,
+	AUR_MEM_HIGH = 4,
+	AUR_MEM_VERY_HIGH = 5,
+	AUR_MEM_MAX = 6,
+};
+
+#define AUR_NUM_POWER_STATE 5
+#define AUR_NUM_MEMORY_POWER_STATE (AUR_MAX_ALLOW_MEMORY_STATE + 1)
+
+#define AUR_INIT_DVFS_STATE AUR_UUD
 #define AUR_MAX_ALLOW_STATE AUR_NOM
+
+#define AUR_MAX_ALLOW_MEMORY_STATE AUR_MEM_MAX
 
 struct gxp_pm_device_ops {
 	int (*pre_blk_powerup)(struct gxp_dev *gxp);
@@ -30,13 +46,26 @@ struct gxp_pm_device_ops {
 	int (*post_blk_poweroff)(struct gxp_dev *gxp);
 };
 
+struct gxp_set_acpm_state_work {
+	struct work_struct work;
+	struct gxp_dev *gxp;
+	unsigned long state;
+};
+
 struct gxp_power_manager {
 	struct gxp_dev *gxp;
 	struct mutex pm_lock;
-	int pwr_state_req[GXP_NUM_CORES];
+	int pwr_state_req_count[AUR_NUM_POWER_STATE];
+	uint mem_pwr_state_req_count[AUR_NUM_MEMORY_POWER_STATE];
 	int curr_state;
+	int curr_memory_state;
 	refcount_t blk_wake_ref;
 	struct gxp_pm_device_ops *ops;
+	struct gxp_set_acpm_state_work set_acpm_rate_work;
+	struct workqueue_struct *wq;
+	/* INT/MIF requests for memory bandwidth */
+	struct exynos_pm_qos_request int_min;
+	struct exynos_pm_qos_request mif_min;
 };
 
 /**
@@ -91,16 +120,6 @@ int gxp_pm_core_on(struct gxp_dev *gxp, uint core);
 int gxp_pm_core_off(struct gxp_dev *gxp, uint core);
 
 /**
- * gxp_pm_get_core_state() - Get the core power state
- * @gxp: The GXP device to operate
- * @core: The core ID to get the state of
- *
- * Return:
- * * state   - Frequency number in kHz the core requested
- */
-int gxp_pm_get_core_state(struct gxp_dev *gxp, uint core);
-
-/**
  * gxp_pm_acquire_blk_wakelock() - Acquire blk wakelock
  * to make sure block won't shutdown.
  *
@@ -129,17 +148,15 @@ int gxp_pm_acquire_blk_wakelock(struct gxp_dev *gxp);
 int gxp_pm_release_blk_wakelock(struct gxp_dev *gxp);
 
 /**
- * gxp_pm_req_state() - API for a GXP core to vote for a
- * desired power state.
+ * gxp_pm_req_state() - API to request a desired power state.
  * @gxp: The GXP device to operate
- * @core: Voting core ID
- * @state: State the core voting for
+ * @state: The requested state
  *
  * Return:
  * * 0       - Voting registered
- * * -EINVAL - Invalid core num
+ * * -EINVAL - Invalid requested state
  */
-int gxp_pm_req_state(struct gxp_dev *gxp, uint core, enum aur_power_state state);
+int gxp_pm_req_state(struct gxp_dev *gxp, enum aur_power_state state);
 
 /**
  * gxp_pm_init() - API for initialize PM
@@ -187,4 +204,37 @@ int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state);
  * * State   - State number in Khz from ACPM
  */
 int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
+
+/**
+ * gxp_pm_update_requested_power_state() - API for a GXP client to vote for a
+ * requested state.
+ * @gxp: The GXP device to operate.
+ * @origin_state: An existing old requested state, will be cleared. If this is
+ * the first vote, pass AUR_OFF.
+ * @requested_state: The new requested state.
+ *
+ * Return:
+ * * 0       - Voting registered
+ * * -EINVAL - Invalid original state or requested state
+ */
+int gxp_pm_update_requested_power_state(struct gxp_dev *gxp,
+					enum aur_power_state origin_state,
+					enum aur_power_state requested_state);
+
+/**
+ * gxp_pm_update_requested_memory_power_state() - API for a GXP client to vote for a
+ * requested memory power state.
+ * @gxp: The GXP device to operate.
+ * @origin_state: An existing old requested state, will be cleared. If this is
+ * the first vote, pass AUR_MEM_UNDEFINED.
+ * @requested_state: The new requested state.
+ *
+ * Return:
+ * * 0       - Voting registered
+ * * -EINVAL - Invalid original state or requested state
+ */
+int gxp_pm_update_requested_memory_power_state(
+	struct gxp_dev *gxp, enum aur_memory_power_state origin_state,
+	enum aur_memory_power_state requested_state);
+
 #endif /* __GXP_PM_H__ */

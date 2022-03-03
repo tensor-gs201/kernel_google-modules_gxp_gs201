@@ -15,25 +15,25 @@
 
 /* Holds state belonging to a client */
 struct gxp_client {
-        struct gxp_dev *gxp;
+	struct gxp_dev *gxp;
 
 	/*
 	 * Protects all state of this client instance.
 	 * Any operation that requires a client hold a particular wakelock must
 	 * lock this semaphore for reading for the duration of that operation.
 	 */
-        struct rw_semaphore semaphore;
+	struct rw_semaphore semaphore;
 
-        bool has_block_wakelock;
-        bool has_vd_wakelock;
+	bool has_block_wakelock;
+	bool has_vd_wakelock;
 	/* Value is one of the GXP_POWER_STATE_* values from gxp.h. */
-        uint requested_power_state;
+	uint requested_power_state;
 	/* Value is one of the MEMORY_POWER_STATE_* values from gxp.h. */
-        uint requested_memory_power_state;
+	uint requested_memory_power_state;
 
-        struct gxp_virtual_device *vd;
-        bool tpu_mbx_allocated;
-        struct gxp_tpu_mbx_desc mbx_desc;
+	struct gxp_virtual_device *vd;
+	bool tpu_mbx_allocated;
+	struct gxp_tpu_mbx_desc mbx_desc;
 };
 
 /*

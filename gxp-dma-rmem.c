@@ -594,3 +594,22 @@ void gxp_dma_sync_sg_for_device(struct gxp_dev *gxp, struct scatterlist *sg,
 		kunmap(sg_page(s));
 	}
 }
+
+struct sg_table *
+gxp_dma_map_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+			      struct dma_buf_attachment *attachment,
+			      enum dma_data_direction direction)
+{
+	dev_warn(gxp->dev, "%s not supported on systems without an IOMMU\n",
+		 __func__);
+	return ERR_PTR(-ENOSYS);
+}
+
+void gxp_dma_unmap_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+				     struct dma_buf_attachment *attachment,
+				     struct sg_table *sgt,
+				     enum dma_data_direction direction)
+{
+	dev_warn(gxp->dev, "%s not supported on systems without an IOMMU\n",
+		 __func__);
+}

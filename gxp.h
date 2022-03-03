@@ -37,6 +37,8 @@
  * - GXP_MAP_BUFFER
  * - GXP_UNMAP_BUFFER
  * - GXP_SYNC_BUFFER
+ * - GXP_MAP_DMABUF
+ * - GXP_UNMAP_DMABUF
  */
 
 struct gxp_map_ioctl {
@@ -337,12 +339,12 @@ struct gxp_etm_get_trace_info_ioctl {
 	 * that is used for decoding the trace.
 	 */
 	__u64 trace_header_addr;
-        /*
-         * Input:
+	/*
+	 * Input:
 	 * Trace data user space address to contain Trace RAM data.
 	 * Note: trace_data field will be empty if type == 0
 	 */
-        __u64 trace_data_addr;
+	__u64 trace_data_addr;
 };
 
 /* Retrieves trace header and/or trace data for decoding purposes. */
@@ -489,8 +491,9 @@ struct gxp_acquire_wakelock_ioctl {
 	__u32 components_to_wake;
 	/*
 	 * Minimum power state to operate the entire DSP subsystem at until
-	 * the wakelock is released. One of the GXP_POWER_STATE_* defines
-	 * from above.
+	 * the BLOCK wakelock is released. One of the GXP_POWER_STATE_* defines
+	 * from above. Note that the requested power state will not be cleared
+	 * if only the VIRTUAL_DEVICE wakelock is released.
 	 *
 	 * `GXP_POWER_STATE_OFF` is not a valid value when acquiring a
 	 * wakelock.
@@ -498,8 +501,9 @@ struct gxp_acquire_wakelock_ioctl {
 	__u32 gxp_power_state;
 	/*
 	 * Memory interface power state to request from the system so long as
-	 * the wakelock is held. One of the MEMORY_POWER_STATE* defines from
-	 * above.
+	 * the BLOCK wakelock is held. One of the MEMORY_POWER_STATE* defines
+	 * from above. The requested memory power state will not be cleared if
+	 * only the VIRTUAL_DEVICE wakelock is released.
 	 *
 	 * If `MEMORY_POWER_STATE_UNDEFINED` is passed, no request to change
 	 * the memory interface power state will be made.
@@ -555,5 +559,57 @@ struct gxp_acquire_wakelock_ioctl {
  * return -ENODEV.
  */
 #define GXP_RELEASE_WAKE_LOCK _IOW(GXP_IOCTL_BASE, 19, __u32)
+
+struct gxp_map_dmabuf_ioctl {
+	/*
+	 * Bitfield indicating which virtual cores to map the dma-buf for.
+	 * To map for virtual core X, set bit X in this field, i.e. `1 << X`.
+	 *
+	 * This field is not used by the unmap dma-buf IOCTL, which always
+	 * unmaps a dma-buf for all cores it had been mapped for.
+	 */
+	__u16 virtual_core_list;
+	__s32 dmabuf_fd;	/* File descriptor of the dma-buf to map. */
+	/*
+	 * Flags indicating mapping attribute requests from the runtime.
+	 * Set RESERVED bits to 0 to ensure backwards compatibility.
+	 *
+	 * Bitfields:
+	 *   [1:0]   - DMA_DIRECTION:
+	 *               00 = DMA_BIDIRECTIONAL (host/device can write buffer)
+	 *               01 = DMA_TO_DEVICE     (host can write buffer)
+	 *               10 = DMA_FROM_DEVICE   (device can write buffer)
+	 *             Note: DMA_DIRECTION is the direction in which data moves
+	 *             from the host's perspective.
+	 *   [31:2]  - RESERVED
+	 */
+	__u32 flags;
+	/*
+	 * Device address the dmabuf is mapped to.
+	 * - GXP_MAP_DMABUF uses this field to return the address the dma-buf
+	 *   can be accessed from by the device.
+	 * - GXP_UNMAP_DMABUF expects this field to contain the value from the
+	 *   mapping call, and uses it to determine which dma-buf to unmap.
+	 */
+	__u64 device_address;
+};
+
+/*
+ * Map host buffer via its dma-buf FD.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_MAP_DMABUF _IOWR(GXP_IOCTL_BASE, 20, struct gxp_map_dmabuf_ioctl)
+
+/*
+ * Un-map host buffer previously mapped by GXP_MAP_DMABUF.
+ *
+ * Only the @device_address field is used. Other fields are fetched from the
+ * kernel's internal records. It is recommended to use the argument that was
+ * passed in GXP_MAP_DMABUF to un-map the dma-buf.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_UNMAP_DMABUF _IOW(GXP_IOCTL_BASE, 21, struct gxp_map_dmabuf_ioctl)
 
 #endif /* __GXP_H__ */

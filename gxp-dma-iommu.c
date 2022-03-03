@@ -542,7 +542,7 @@ void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 	struct sg_table *sgt;
 	dma_addr_t daddr;
 	int core;
-	int ret;
+	ssize_t size_mapped;
 
 	size = size < PAGE_SIZE ? PAGE_SIZE : size;
 
@@ -566,9 +566,16 @@ void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 		if (!(core_list & BIT(core)))
 			continue;
 
-		ret = iommu_map_sg(mgr->core_domains[core], daddr, sgt->sgl,
-				   sgt->nents, IOMMU_READ | IOMMU_WRITE);
-		if (ret != size)
+		/*
+		 * In Linux 5.15 and beyond, `iommu_map_sg()` returns a
+		 * `ssize_t` to encode errors that earlier versions throw out.
+		 * Explicitly cast here for backwards compatibility.
+		 */
+		size_mapped =
+			(ssize_t)iommu_map_sg(mgr->core_domains[core], daddr,
+					      sgt->sgl, sgt->orig_nents,
+					      IOMMU_READ | IOMMU_WRITE);
+		if (size_mapped != size)
 			goto err;
 	}
 
@@ -789,6 +796,7 @@ int gxp_dma_map_sg(struct gxp_dev *gxp, uint core_list, struct scatterlist *sg,
 	dma_addr_t daddr;
 	int prot = dma_info_to_prot(direction, 0, attrs);
 	int core;
+	ssize_t size_mapped;
 	/* Variables needed to cleanup if an error occurs */
 	struct scatterlist *s;
 	int i;
@@ -804,8 +812,14 @@ int gxp_dma_map_sg(struct gxp_dev *gxp, uint core_list, struct scatterlist *sg,
 		if (!(core_list & BIT(core)))
 			continue;
 
-		if (!iommu_map_sg(mgr->core_domains[core], daddr, sg, nents,
-				  prot))
+		/*
+		 * In Linux 5.15 and beyond, `iommu_map_sg()` returns a
+		 * `ssize_t` to encode errors that earlier versions throw out.
+		 * Explicitly cast here for backwards compatibility.
+		 */
+		size_mapped = (ssize_t)iommu_map_sg(mgr->core_domains[core],
+						    daddr, sg, nents, prot);
+		if (size_mapped <= 0)
 			goto err;
 	}
 
@@ -911,3 +925,104 @@ struct iommu_domain *gxp_dma_iommu_get_core_domain(struct gxp_dev *gxp,
 	return mgr->core_domains[core];
 }
 #endif  // CONFIG_GXP_TEST
+
+struct sg_table *
+gxp_dma_map_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+			      struct dma_buf_attachment *attachment,
+			      enum dma_data_direction direction)
+{
+	struct gxp_dma_iommu_manager *mgr = container_of(
+		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
+	struct sg_table *sgt;
+	int core;
+	int prot = dma_info_to_prot(direction, /*coherent=*/0, /*attrs=*/0);
+	ssize_t size_mapped;
+	int ret;
+	/* Variables needed to cleanup if an error occurs */
+	struct scatterlist *s;
+	int i;
+	size_t size = 0;
+
+	/* Map the attachment into the default domain */
+	sgt = dma_buf_map_attachment(attachment, direction);
+	if (IS_ERR(sgt)) {
+		dev_err(gxp->dev,
+			"DMA: dma_buf_map_attachment failed (ret=%ld)\n",
+			PTR_ERR(sgt));
+		return sgt;
+	}
+
+	/* Map the sgt into the aux domain of all specified cores */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (!(core_list & BIT(core)))
+			continue;
+
+		/*
+		 * In Linux 5.15 and beyond, `iommu_map_sg()` returns a
+		 * `ssize_t` to encode errors that earlier versions throw out.
+		 * Explicitly cast here for backwards compatibility.
+		 */
+		size_mapped =
+			(ssize_t)iommu_map_sg(mgr->core_domains[core],
+					      sg_dma_address(sgt->sgl),
+					      sgt->sgl, sgt->orig_nents, prot);
+		if (size_mapped <= 0) {
+			dev_err(gxp->dev,
+				"Failed to map dma-buf to core %d (ret=%ld)\n",
+				core, size_mapped);
+			/*
+			 * Prior to Linux 5.15, `iommu_map_sg()` returns 0 for
+			 * any failure. Return a generic IO error in this case.
+			 */
+			ret = size_mapped == 0 ? -EIO : (int)size_mapped;
+			goto err;
+		}
+	}
+
+	return sgt;
+
+err:
+	for_each_sg(sgt->sgl, s, sgt->nents, i)
+		size += sg_dma_len(s);
+
+	for (core -= 1; core >= 0; core--)
+		iommu_unmap(mgr->core_domains[core], sg_dma_address(sgt->sgl),
+			    size);
+	dma_buf_unmap_attachment(attachment, sgt, direction);
+
+	return ERR_PTR(ret);
+
+}
+
+void gxp_dma_unmap_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+				     struct dma_buf_attachment *attachment,
+				     struct sg_table *sgt,
+				     enum dma_data_direction direction)
+{
+	struct gxp_dma_iommu_manager *mgr = container_of(
+		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
+	struct scatterlist *s;
+	int i;
+	size_t size = 0;
+	int core;
+
+	/* Find the size of the mapping in IOVA-space */
+	for_each_sg(sgt->sgl, s, sgt->nents, i)
+		size += sg_dma_len(s);
+
+	/* Unmap the dma-buf from the aux domain of all specified cores */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (!(core_list & BIT(core)))
+			continue;
+
+		if (!iommu_unmap(mgr->core_domains[core],
+				 sg_dma_address(sgt->sgl), size))
+			dev_warn(
+				gxp->dev,
+				"Failed to unmap dma-buf from core %d\n",
+				core);
+	}
+
+	/* Unmap the attachment from the default domain */
+	dma_buf_unmap_attachment(attachment, sgt, direction);
+}

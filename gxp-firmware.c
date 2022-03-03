@@ -7,8 +7,10 @@
 
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/elf.h>
 #include <linux/firmware.h>
+#include <linux/gsa/gsa_image_auth.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -34,19 +36,22 @@
 #define Q7_ELF_FILE2	"gxp_fw_core2"
 #define Q7_ELF_FILE3	"gxp_fw_core3"
 
+#define FW_HEADER_SIZE		(0x1000)
+#define FW_IMAGE_TYPE_OFFSET	(0x400)
+
 static const struct firmware *fw[GXP_NUM_CORES];
 static void __iomem *aurora_base;
 
 static char *fw_elf[] = {Q7_ELF_FILE0, Q7_ELF_FILE1, Q7_ELF_FILE2,
 			 Q7_ELF_FILE3};
 
-static int elf_load_segments(struct gxp_dev *gxp, const struct firmware *fw,
-			     u8 core)
+static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
+			     size_t size,
+			     const struct gxp_mapped_resource *buffer)
 {
 	struct elf32_hdr *ehdr;
 	struct elf32_phdr *phdr;
 	int i, ret = 0;
-	const u8 *elf_data = fw->data;
 
 	ehdr = (struct elf32_hdr *)elf_data;
 	phdr = (struct elf32_phdr *)(elf_data + ehdr->e_phoff);
@@ -76,9 +81,9 @@ static int elf_load_segments(struct gxp_dev *gxp, const struct firmware *fw,
 		if (!memsz)
 			continue;
 
-		if (!((da >= (u32)gxp->fwbufs[core].daddr) &&
-		   ((da + memsz) <= ((u32)gxp->fwbufs[core].daddr +
-				     (u32)gxp->fwbufs[core].size - 1)))) {
+		if (!((da >= (u32)buffer->daddr) &&
+		   ((da + memsz) <= ((u32)buffer->daddr +
+				     (u32)buffer->size - 1)))) {
 			/*
 			 * Some BSS data may be referenced from TCM, and can be
 			 * skipped while loading
@@ -98,15 +103,15 @@ static int elf_load_segments(struct gxp_dev *gxp, const struct firmware *fw,
 			break;
 		}
 
-		if (offset + filesz > fw->size) {
+		if (offset + filesz > size) {
 			dev_err(gxp->dev, "Truncated fw: need 0x%x avail 0x%zx\n",
-				offset + filesz, fw->size);
+				offset + filesz, size);
 			ret = -EINVAL;
 			break;
 		}
 
 		/* grab the kernel address for this device address */
-		ptr = gxp->fwbufs[core].vaddr + (da - gxp->fwbufs[core].daddr);
+		ptr = buffer->vaddr + (da - buffer->daddr);
 		if (!ptr) {
 			dev_err(gxp->dev, "Bad phdr: da 0x%llx mem 0x%x\n",
 				da, memsz);
@@ -124,6 +129,86 @@ static int elf_load_segments(struct gxp_dev *gxp, const struct firmware *fw,
 		if (memsz > filesz)
 			memset(ptr + filesz, 0, memsz - filesz);
 	}
+
+	return ret;
+}
+
+/* TODO (b/220246540): remove after unsigned firmware support is phased out */
+static bool gxp_firmware_image_is_signed(const u8 *data)
+{
+	return data[FW_IMAGE_TYPE_OFFSET + 0] == 'D' &&
+	       data[FW_IMAGE_TYPE_OFFSET + 1] == 'S' &&
+	       data[FW_IMAGE_TYPE_OFFSET + 2] == 'P' &&
+	       data[FW_IMAGE_TYPE_OFFSET + 3] == 'F';
+}
+
+static int
+gxp_firmware_load_authenticated(struct gxp_dev *gxp, const struct firmware *fw,
+				const struct gxp_mapped_resource *buffer)
+{
+	const u8 *data = fw->data;
+	size_t size = fw->size;
+	void *header_vaddr;
+	dma_addr_t header_dma_addr;
+	int ret;
+
+	/* TODO (b/220246540): remove after unsigned firmware support is phased out */
+	if (!gxp_firmware_image_is_signed(data)) {
+		dev_info(gxp->dev, "Loading unsigned firmware\n");
+		return elf_load_segments(gxp, data, size, buffer);
+	}
+
+	if (!gxp->gsa_dev) {
+		dev_warn(
+			gxp->dev,
+			"No GSA device available, skipping firmware authentication\n");
+		return elf_load_segments(gxp, data + FW_HEADER_SIZE,
+					 size - FW_HEADER_SIZE, buffer);
+	}
+
+	if ((size - FW_HEADER_SIZE) > buffer->size) {
+		dev_err(gxp->dev, "Firmware image does not fit (%zu > %llu)\n",
+			size - FW_HEADER_SIZE, buffer->size);
+		return -EINVAL;
+	}
+
+	dev_dbg(gxp->dev, "Authenticating firmware\n");
+
+	/* Allocate coherent memory for the image header */
+	header_vaddr = dma_alloc_coherent(gxp->gsa_dev, FW_HEADER_SIZE,
+					  &header_dma_addr, GFP_KERNEL);
+	if (!header_vaddr) {
+		dev_err(gxp->dev,
+			"Failed to allocate coherent memory for header\n");
+		return -ENOMEM;
+	}
+
+	/* Copy the header to GSA coherent memory */
+	memcpy(header_vaddr, data, FW_HEADER_SIZE);
+
+	/* Copy the firmware image to the carveout location, skipping the header */
+	memcpy_toio(buffer->vaddr, data + FW_HEADER_SIZE,
+		    size - FW_HEADER_SIZE);
+
+	dev_dbg(gxp->dev,
+		"Requesting GSA authentication. meta = %pad payload = %pap",
+		&header_dma_addr, &buffer->paddr);
+
+	ret = gsa_authenticate_image(gxp->gsa_dev, header_dma_addr,
+				     buffer->paddr);
+	if (ret) {
+		dev_err(gxp->dev, "GSA authentication failed: %d\n", ret);
+	} else {
+		dev_dbg(gxp->dev,
+			"Authentication succeeded, loading ELF segments\n");
+		ret = elf_load_segments(gxp, data + FW_HEADER_SIZE,
+					size - FW_HEADER_SIZE, buffer);
+		if (ret)
+			dev_err(gxp->dev, "ELF parsing failed (%d)\n", ret);
+	}
+
+	dma_free_coherent(gxp->gsa_dev, FW_HEADER_SIZE, header_vaddr,
+			  header_dma_addr);
 
 	return ret;
 }
@@ -173,8 +258,8 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 		goto out_firmware_unload;
 	}
 
-	/* Load firmware to System RAM */
-	ret = elf_load_segments(gxp, fw[core], core);
+	/* Authenticate and load firmware to System RAM */
+	ret = gxp_firmware_load_authenticated(gxp, fw[core], &gxp->fwbufs[core]);
 	if (ret) {
 		dev_err(gxp->dev, "Unable to load elf file\n");
 		goto out_firmware_unload;
@@ -277,9 +362,8 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	if (readl(core_scratchpad_base + offset) != Q7_ALIVE_MAGIC) {
 		dev_err(gxp->dev, "Core %u did not respond!\n", core);
 		return -EIO;
-	} else {
-		dev_notice(gxp->dev, "Core %u is alive!\n", core);
 	}
+	dev_notice(gxp->dev, "Core %u is alive!\n", core);
 
 #ifndef CONFIG_GXP_GEM5
 	/*
@@ -302,10 +386,8 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	if (readl(core_scratchpad_base + offset) != expected_top_value) {
 		dev_err(gxp->dev, "TOP access from core %u failed!\n", core);
 		return -EIO;
-	} else {
-		dev_notice(gxp->dev, "TOP access from core %u successful!\n",
-			   core);
 	}
+	dev_notice(gxp->dev, "TOP access from core %u successful!\n", core);
 #endif  // !CONFIG_GXP_GEM5
 
 	/* Stop bus performance monitors */

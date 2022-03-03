@@ -31,6 +31,7 @@
 #include "gxp-debug-dump.h"
 #include "gxp-debugfs.h"
 #include "gxp-dma.h"
+#include "gxp-dmabuf.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
 #include "gxp-internal.h"
@@ -61,6 +62,16 @@ static struct platform_device gxp_sscd_dev = {
 	},
 };
 #endif  // CONFIG_SUBSYSTEM_COREDUMP
+
+/* Mapping from GXP_POWER_STATE_* to enum aur_power_state in gxp-pm.h */
+static const uint aur_state_array[GXP_POWER_STATE_NOM + 1] = { AUR_OFF, AUR_UUD,
+							       AUR_SUD, AUR_UD,
+							       AUR_NOM };
+/* Mapping from MEMORY_POWER_STATE_* to enum aur_memory_power_state in gxp-pm.h */
+static const uint aur_memory_state_array[MEMORY_POWER_STATE_MAX + 1] = {
+	AUR_MEM_UNDEFINED, AUR_MEM_MIN,	      AUR_MEM_VERY_LOW, AUR_MEM_LOW,
+	AUR_MEM_HIGH,	   AUR_MEM_VERY_HIGH, AUR_MEM_MAX
+};
 
 static int gxp_open(struct inode *inode, struct file *file)
 {
@@ -227,6 +238,10 @@ static int gxp_unmap_buffer(struct gxp_client *client,
 
 	map = gxp_mapping_get(gxp, ibuf.device_address);
 	if (!map) {
+		ret = -EINVAL;
+		goto out;
+	} else if (!map->host_address) {
+		dev_err(gxp->dev, "dma-bufs must be unmapped via GXP_UNMAP_DMABUF\n");
 		ret = -EINVAL;
 		goto out;
 	}
@@ -561,7 +576,8 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	if (ibuf.pc_match_mask_length > ETM_TRACE_PC_MATCH_MASK_LEN_MAX)
 		return -EINVAL;
 
-	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
+	phys_core =
+		gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
 	if (phys_core < 0) {
 		dev_err(gxp->dev, "Trace start failed: Invalid virtual core id (%u)\n",
 			ibuf.virtual_core_id);
@@ -912,6 +928,25 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
+	if (ibuf.gxp_power_state == GXP_POWER_STATE_OFF) {
+		dev_err(gxp->dev,
+			"GXP_POWER_STATE_OFF is not a valid value when acquiring a wakelock\n");
+		return -EINVAL;
+	}
+	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
+	    ibuf.gxp_power_state > GXP_POWER_STATE_NOM) {
+		dev_err(gxp->dev, "Requested power state is invalid\n");
+		return -EINVAL;
+	}
+	if ((ibuf.memory_power_state < MEMORY_POWER_STATE_MIN ||
+	     ibuf.memory_power_state > MEMORY_POWER_STATE_MAX) &&
+	    ibuf.memory_power_state != MEMORY_POWER_STATE_UNDEFINED) {
+		dev_err(gxp->dev,
+			"Requested memory power state %d is invalid\n",
+			ibuf.memory_power_state);
+		return -EINVAL;
+	}
+
 	down_write(&client->semaphore);
 
 	/* Acquire a BLOCK wakelock if requested */
@@ -957,6 +992,15 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 		client->has_vd_wakelock = true;
 	}
 
+	gxp_pm_update_requested_power_state(
+		gxp, client->requested_power_state,
+		aur_state_array[ibuf.gxp_power_state]);
+	client->requested_power_state = aur_state_array[ibuf.gxp_power_state];
+	gxp_pm_update_requested_memory_power_state(
+		gxp, client->requested_memory_power_state,
+		aur_memory_state_array[ibuf.memory_power_state]);
+	client->requested_memory_power_state =
+		aur_memory_state_array[ibuf.memory_power_state];
 out:
 	up_write(&client->semaphore);
 
@@ -1022,12 +1066,103 @@ static int gxp_release_wake_lock(struct gxp_client *client, __u32 __user *argp)
 		}
 
 		gxp_wakelock_release(gxp);
+		/*
+		 * Other clients may still be using the BLK_AUR, check if we need
+		 * to change the power state.
+		 */
+		gxp_pm_update_requested_power_state(
+			gxp, client->requested_power_state, AUR_OFF);
+		client->requested_power_state = AUR_OFF;
+		gxp_pm_update_requested_memory_power_state(
+			gxp, client->requested_memory_power_state,
+			AUR_MEM_UNDEFINED);
+		client->requested_memory_power_state = AUR_MEM_UNDEFINED;
 
 		client->has_block_wakelock = false;
 	}
 
 out:
 	up_write(&client->semaphore);
+
+	return ret;
+}
+
+static int gxp_map_dmabuf(struct gxp_client *client,
+			  struct gxp_map_dmabuf_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_map_dmabuf_ioctl ibuf;
+	struct gxp_mapping *mapping;
+	int ret = 0;
+	uint phys_core_list;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_MAP_DMABUF requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
+	phys_core_list = gxp_vd_virt_core_list_to_phys_core_list(
+		client->vd, ibuf.virtual_core_list);
+	if (phys_core_list == 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	mapping = gxp_dmabuf_map(gxp, phys_core_list, ibuf.dmabuf_fd,
+				 /*gxp_dma_flags=*/0,
+				 mapping_flags_to_dma_dir(ibuf.flags));
+	if (IS_ERR(mapping)) {
+		ret = PTR_ERR(mapping);
+		dev_err(gxp->dev, "Failed to map dma-buf (ret=%d)\n", ret);
+		goto out;
+	}
+
+	ibuf.device_address = mapping->device_address;
+
+	if (copy_to_user(argp, &ibuf, sizeof(ibuf))) {
+		/* If the IOCTL fails, the dma-buf must be unmapped */
+		gxp_dmabuf_unmap(gxp, ibuf.device_address);
+		ret = -EFAULT;
+	}
+
+out:
+	up_read(&client->semaphore);
+
+	return ret;
+}
+
+static int gxp_unmap_dmabuf(struct gxp_client *client,
+			    struct gxp_map_dmabuf_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_map_dmabuf_ioctl ibuf;
+	int ret = 0;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_UNMAP_DMABUF requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
+	gxp_dmabuf_unmap(gxp, ibuf.device_address);
+
+out:
+	up_read(&client->semaphore);
 
 	return ret;
 }
@@ -1099,6 +1234,12 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 	case GXP_RELEASE_WAKE_LOCK:
 		ret = gxp_release_wake_lock(client, argp);
 		break;
+	case GXP_MAP_DMABUF:
+		ret = gxp_map_dmabuf(client, argp);
+		break;
+	case GXP_UNMAP_DMABUF:
+		ret = gxp_unmap_dmabuf(client, argp);
+		break;
 	default:
 		ret = -ENOTTY; /* unknown command */
 	}
@@ -1144,9 +1285,10 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	phys_addr_t offset, base_addr;
 	struct device_node *np;
 	struct platform_device *tpu_pdev;
+	struct platform_device *gsa_pdev;
 	int ret;
-	int i __maybe_unused;
-	bool tpu_found __maybe_unused;
+	int  __maybe_unused i;
+	bool __maybe_unused tpu_found;
 
 	dev_notice(dev, "Probing gxp driver with commit %s\n", GIT_REPO_TAG);
 
@@ -1293,10 +1435,30 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		goto err_vd_destroy;
 	}
 
+	/* Get GSA device from device tree */
+	np = of_parse_phandle(dev->of_node, "gsa-device", 0);
+	if (!np) {
+		dev_warn(
+			dev,
+			"No gsa-device in device tree. Firmware authentication not available\n");
+	} else {
+		gsa_pdev = of_find_device_by_node(np);
+		if (!gsa_pdev) {
+			dev_err(dev, "GSA device not found\n");
+			of_node_put(np);
+			ret = -ENODEV;
+			goto err_vd_destroy;
+		}
+		gxp->gsa_dev = get_device(&gsa_pdev->dev);
+		of_node_put(np);
+		dev_info(
+			dev,
+			"GSA device found, Firmware authentication available\n");
+	}
+
 	gxp_fw_data_init(gxp);
 	gxp_telemetry_init(gxp);
 	gxp_create_debugfs(gxp);
-	gxp_pm_init(gxp);
 	gxp->thermal_mgr = gxp_thermal_init(gxp);
 	if (!gxp->thermal_mgr)
 		dev_err(dev, "Failed to init thermal driver\n");
@@ -1334,6 +1496,8 @@ static int gxp_platform_remove(struct platform_device *pdev)
 #ifndef CONFIG_GXP_USE_SW_MAILBOX
 	put_device(gxp->tpu_dev.dev);
 #endif
+	if (gxp->gsa_dev)
+		put_device(gxp->gsa_dev);
 	misc_deregister(&gxp->misc_dev);
 
 	gxp_pm_destroy(gxp);

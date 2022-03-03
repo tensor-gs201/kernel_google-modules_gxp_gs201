@@ -119,9 +119,9 @@ int gxp_dma_map_resources(struct gxp_dev *gxp)
 	if (ret)
 		goto err;
 	/*
-		 * Firmware expects to access the sync barriers at a separate
-		 * address, lower than the rest of the AURORA_TOP registers.
-		 */
+	 * Firmware expects to access the sync barriers at a separate
+	 * address, lower than the rest of the AURORA_TOP registers.
+	 */
 	ret = iommu_map(mgr->default_domain, GXP_IOVA_SYNC_BARRIERS,
 			gxp->regs.paddr + SYNC_BARRIERS_TOP_OFFSET,
 			SYNC_BARRIERS_SIZE, IOMMU_READ | IOMMU_WRITE);
@@ -496,4 +496,20 @@ void gxp_dma_sync_sg_for_device(struct gxp_dev *gxp, struct scatterlist *sg,
 {
 	/* Syncing is not domain specific. Just call through to DMA API */
 	dma_sync_sg_for_device(gxp->dev, sg, nents, direction);
+}
+
+struct sg_table *
+gxp_dma_map_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+			      struct dma_buf_attachment *attachment,
+			      enum dma_data_direction direction)
+{
+	return dma_buf_map_attachment(attachment, direction);
+}
+
+void gxp_dma_unmap_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+				     struct dma_buf_attachment *attachment,
+				     struct sg_table *sgt,
+				     enum dma_data_direction direction)
+{
+	dma_buf_unmap_attachment(attachment, sgt, direction);
 }

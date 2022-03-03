@@ -37,7 +37,7 @@ int gxp_notification_unregister_handler(struct gxp_dev *gxp, uint core,
 
 	mailbox = gxp->mailbox_mgr->mailboxes[core];
 	if (!mailbox)
-		return-ENODEV;
+		return -ENODEV;
 
 	return gxp_mailbox_unregister_interrupt_handler(mailbox, type);
 }

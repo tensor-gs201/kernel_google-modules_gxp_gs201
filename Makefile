@@ -10,6 +10,7 @@ gxp-objs +=	\
 		gxp-client.o \
 		gxp-debug-dump.o \
 		gxp-debugfs.o \
+		gxp-dmabuf.o \
 		gxp-doorbell.o \
 		gxp-firmware.o \
 		gxp-firmware-data.o \
@@ -81,7 +82,7 @@ ccflags-y += -DCONFIG_GXP_$(GXP_PLATFORM)
 KBUILD_OPTIONS += CONFIG_GXP=m
 
 ifdef CONFIG_GXP_TEST
-subdir-ccflags-y        += -Wall -Werror
+subdir-ccflags-y        += -Wall -Werror -I$(srctree)/drivers/gxp/include
 obj-y           += unittests/
 include $(srctree)/drivers/gxp/unittests/Makefile.include
 $(call include_test_path, $(gxp-objs))
