@@ -536,9 +536,10 @@ static int gxp_allocate_vd(struct gxp_client *client,
 
 	vd = gxp_vd_allocate(gxp, ibuf.core_count);
 	if (IS_ERR(vd)) {
+		ret = PTR_ERR(vd);
 		dev_err(gxp->dev,
-			"Failed to allocate virtual device for client (%ld)\n",
-			PTR_ERR(vd));
+			"Failed to allocate virtual device for client (%d)\n",
+			ret);
 		goto out;
 	}
 

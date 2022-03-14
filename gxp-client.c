@@ -52,8 +52,14 @@ void gxp_client_destroy(struct gxp_client *client)
 
 	up_write(&gxp->vd_semaphore);
 
-	if (client->has_block_wakelock)
+	if (client->has_block_wakelock) {
 		gxp_wakelock_release(client->gxp);
+		gxp_pm_update_requested_power_state(
+			gxp, client->requested_power_state, AUR_OFF);
+		gxp_pm_update_requested_memory_power_state(
+			gxp, client->requested_memory_power_state,
+			AUR_MEM_UNDEFINED);
+	}
 
 	gxp_vd_release(client->vd);
 

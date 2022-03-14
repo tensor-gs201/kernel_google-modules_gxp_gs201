@@ -52,16 +52,24 @@ struct gxp_set_acpm_state_work {
 	unsigned long state;
 };
 
+struct gxp_req_pm_qos_work {
+	struct work_struct work;
+	struct gxp_dev *gxp;
+	s32 int_val;
+	s32 mif_val;
+};
+
 struct gxp_power_manager {
 	struct gxp_dev *gxp;
 	struct mutex pm_lock;
-	int pwr_state_req_count[AUR_NUM_POWER_STATE];
+	uint pwr_state_req_count[AUR_NUM_POWER_STATE];
 	uint mem_pwr_state_req_count[AUR_NUM_MEMORY_POWER_STATE];
 	int curr_state;
 	int curr_memory_state;
 	refcount_t blk_wake_ref;
 	struct gxp_pm_device_ops *ops;
 	struct gxp_set_acpm_state_work set_acpm_rate_work;
+	struct gxp_req_pm_qos_work req_pm_qos_work;
 	struct workqueue_struct *wq;
 	/* INT/MIF requests for memory bandwidth */
 	struct exynos_pm_qos_request int_min;

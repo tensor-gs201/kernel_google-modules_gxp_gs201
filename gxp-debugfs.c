@@ -148,15 +148,16 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		if (IS_ERR(gxp->debugfs_client->vd)) {
 			dev_err(gxp->dev, "Failed to allocate VD\n");
 			ret = PTR_ERR(gxp->debugfs_client->vd);
-			goto err_start;
+			goto err_wakelock;
 		}
 
 		ret = gxp_wakelock_acquire(gxp);
 		if (ret) {
 			dev_err(gxp->dev, "Failed to acquire BLOCK wakelock\n");
-			goto err_start;
+			goto err_wakelock;
 		}
 		gxp->debugfs_client->has_block_wakelock = true;
+		gxp_pm_update_requested_power_state(gxp, AUR_OFF, AUR_UUD);
 
 		down_write(&gxp->vd_semaphore);
 		ret = gxp_vd_start(gxp->debugfs_client->vd);
@@ -179,6 +180,7 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		 */
 		gxp_client_destroy(gxp->debugfs_client);
 		gxp->debugfs_client = NULL;
+		gxp_pm_update_requested_power_state(gxp, AUR_UUD, AUR_OFF);
 	}
 
 out:
@@ -187,6 +189,9 @@ out:
 	return ret;
 
 err_start:
+	gxp_wakelock_release(gxp);
+	gxp_pm_update_requested_power_state(gxp, AUR_UUD, AUR_OFF);
+err_wakelock:
 	/* Destroying a client cleans up any VDss or wakelocks it held. */
 	gxp_client_destroy(gxp->debugfs_client);
 	gxp->debugfs_client = NULL;
@@ -210,31 +215,41 @@ static int gxp_wakelock_set(void *data, u64 val)
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
 	int ret = 0;
 
+	mutex_lock(&gxp->debugfs_client_lock);
+
 	if (val > 0) {
 		/* Wakelock Acquire */
 		if (gxp->debugfs_wakelock_held) {
 			dev_warn(gxp->dev,
 				 "Debugfs wakelock is already held.\n");
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out;
 		}
 
 		ret = gxp_wakelock_acquire(gxp);
-		if (ret)
+		if (ret) {
 			dev_err(gxp->dev,
 				"Failed to acquire debugfs wakelock ret=%d\n",
 				ret);
-		else
-			gxp->debugfs_wakelock_held = true;
+			goto out;
+		}
+		gxp->debugfs_wakelock_held = true;
+		gxp_pm_update_requested_power_state(gxp, AUR_OFF, AUR_UUD);
 	} else {
 		/* Wakelock Release */
 		if (!gxp->debugfs_wakelock_held) {
 			dev_warn(gxp->dev, "Debugfs wakelock not held.\n");
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 
 		gxp_wakelock_release(gxp);
 		gxp->debugfs_wakelock_held = false;
+		gxp_pm_update_requested_power_state(gxp, AUR_UUD, AUR_OFF);
 	}
+
+out:
+	mutex_unlock(&gxp->debugfs_client_lock);
 
 	return ret;
 }

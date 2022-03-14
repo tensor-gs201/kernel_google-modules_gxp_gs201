@@ -242,7 +242,7 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp, enum aur_power_state sta
 	if (state != gxp->power_mgr->curr_state) {
 		gxp->power_mgr->curr_state = state;
 		if (state == AUR_OFF) {
-			gxp_pm_blk_off(gxp);
+			dev_warn(gxp->dev, "It is not supported to request AUR_OFF\n");
 		} else {
 			gxp->power_mgr->set_acpm_rate_work.gxp = gxp;
 			gxp->power_mgr->set_acpm_rate_work.state = state;
@@ -265,24 +265,23 @@ int gxp_pm_req_state(struct gxp_dev *gxp, enum aur_power_state state)
 }
 
 /* Caller must hold pm_lock */
-static int gxp_pm_revoke_power_state_vote(struct gxp_dev *gxp,
-					  enum aur_power_state revoked_state)
+static void gxp_pm_revoke_power_state_vote(struct gxp_dev *gxp,
+					   enum aur_power_state revoked_state)
 {
 	unsigned int i;
 
 	if (revoked_state == AUR_OFF)
-		return 0;
+		return;
 	for (i = 0; i < AUR_NUM_POWER_STATE; i++) {
 		if (aur_state_array[i] == revoked_state) {
-			if (gxp->power_mgr->pwr_state_req_count[i] <= 0) {
+			if (gxp->power_mgr->pwr_state_req_count[i] == 0)
 				dev_err(gxp->dev, "Invalid state %d\n",
 					revoked_state);
-				return -EINVAL;
-			}
-			gxp->power_mgr->pwr_state_req_count[i]--;
+			else
+				gxp->power_mgr->pwr_state_req_count[i]--;
+			return;
 		}
 	}
-	return 0;
 }
 
 /* Caller must hold pm_lock */
@@ -293,9 +292,12 @@ static void gxp_pm_vote_power_state(struct gxp_dev *gxp,
 
 	if (state == AUR_OFF)
 		return;
-	for (i = 0; i < AUR_NUM_POWER_STATE; i++)
-		if (aur_state_array[i] == state)
+	for (i = 0; i < AUR_NUM_POWER_STATE; i++) {
+		if (aur_state_array[i] == state) {
 			gxp->power_mgr->pwr_state_req_count[i]++;
+			return;
+		}
+	}
 }
 
 /* Caller must hold pm_lock */
@@ -321,13 +323,10 @@ int gxp_pm_update_requested_power_state(struct gxp_dev *gxp,
 	unsigned long max_state;
 
 	mutex_lock(&gxp->power_mgr->pm_lock);
-	ret = gxp_pm_revoke_power_state_vote(gxp, origin_state);
-	if (ret < 0)
-		goto out;
+	gxp_pm_revoke_power_state_vote(gxp, origin_state);
 	gxp_pm_vote_power_state(gxp, requested_state);
 	max_state = gxp_pm_get_max_voted_power_state(gxp);
 	ret = gxp_pm_req_state_locked(gxp, max_state);
-out:
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 	return ret;
 }
@@ -337,6 +336,17 @@ static int gxp_pm_req_pm_qos(struct gxp_dev *gxp, s32 int_val, s32 mif_val)
 	exynos_pm_qos_update_request(&gxp->power_mgr->int_min, int_val);
 	exynos_pm_qos_update_request(&gxp->power_mgr->mif_min, mif_val);
 	return 0;
+}
+
+static void gxp_pm_req_pm_qos_async(struct work_struct *work)
+{
+	struct gxp_req_pm_qos_work *req_pm_qos_work =
+		container_of(work, struct gxp_req_pm_qos_work, work);
+
+	mutex_lock(&req_pm_qos_work->gxp->power_mgr->pm_lock);
+	gxp_pm_req_pm_qos(req_pm_qos_work->gxp, req_pm_qos_work->int_val,
+			  req_pm_qos_work->mif_val);
+	mutex_unlock(&req_pm_qos_work->gxp->power_mgr->pm_lock);
 }
 
 static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_power_state state)
@@ -351,20 +361,25 @@ static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_p
 		gxp->power_mgr->curr_memory_state = state;
 		int_val = aur_memory_state2int_table[state];
 		mif_val = aur_memory_state2mif_table[state];
-		gxp_pm_req_pm_qos(gxp, int_val, mif_val);
+		gxp->power_mgr->req_pm_qos_work.gxp = gxp;
+		gxp->power_mgr->req_pm_qos_work.int_val = int_val;
+		gxp->power_mgr->req_pm_qos_work.mif_val = mif_val;
+		queue_work(gxp->power_mgr->wq,
+			   &gxp->power_mgr->req_pm_qos_work.work);
 	}
 
 	return 0;
 }
 
 /* Caller must hold pm_lock */
-static int gxp_pm_revoke_memory_power_state_vote(struct gxp_dev *gxp,
-					  enum aur_memory_power_state revoked_state)
+static void
+gxp_pm_revoke_memory_power_state_vote(struct gxp_dev *gxp,
+				      enum aur_memory_power_state revoked_state)
 {
 	unsigned int i;
 
 	if (revoked_state == AUR_MEM_UNDEFINED)
-		return 0;
+		return;
 	for (i = 0; i < AUR_NUM_MEMORY_POWER_STATE; i++) {
 		if (aur_memory_state_array[i] == revoked_state) {
 			if (gxp->power_mgr->mem_pwr_state_req_count[i] == 0)
@@ -374,10 +389,9 @@ static int gxp_pm_revoke_memory_power_state_vote(struct gxp_dev *gxp,
 					revoked_state);
 			else
 				gxp->power_mgr->mem_pwr_state_req_count[i]--;
-			return 0;
+			return;
 		}
 	}
-	return 0;
 }
 
 /* Caller must hold pm_lock */
@@ -419,13 +433,10 @@ int gxp_pm_update_requested_memory_power_state(
 	unsigned long max_state;
 
 	mutex_lock(&gxp->power_mgr->pm_lock);
-	ret = gxp_pm_revoke_memory_power_state_vote(gxp, origin_state);
-	if (ret < 0)
-		goto out;
+	gxp_pm_revoke_memory_power_state_vote(gxp, origin_state);
 	gxp_pm_vote_memory_power_state(gxp, requested_state);
 	max_state = gxp_pm_get_max_voted_memory_power_state(gxp);
 	ret = gxp_pm_req_memory_state_locked(gxp, max_state);
-out:
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 	return ret;
 }
@@ -471,6 +482,7 @@ int gxp_pm_init(struct gxp_dev *gxp)
 	mgr->ops = &gxp_aur_ops;
 	gxp->power_mgr = mgr;
 	INIT_WORK(&mgr->set_acpm_rate_work.work, gxp_pm_blk_set_state_acpm_async);
+	INIT_WORK(&mgr->req_pm_qos_work.work, gxp_pm_req_pm_qos_async);
 	gxp->power_mgr->wq =
 		create_singlethread_workqueue("gxp_power_work_queue");
 
