@@ -7,6 +7,7 @@
 #ifndef __GXP_CLIENT_H__
 #define __GXP_CLIENT_H__
 
+#include <linux/eventfd.h>
 #include <linux/rwsem.h>
 #include <linux/types.h>
 
@@ -34,6 +35,8 @@ struct gxp_client {
 	struct gxp_virtual_device *vd;
 	bool tpu_mbx_allocated;
 	struct gxp_tpu_mbx_desc mbx_desc;
+
+	struct eventfd_ctx *mb_eventfds[GXP_NUM_CORES];
 };
 
 /*
@@ -46,5 +49,8 @@ struct gxp_client *gxp_client_create(struct gxp_dev *gxp);
  * TPU mailboxes it holds.
  */
 void gxp_client_destroy(struct gxp_client *client);
+
+void gxp_client_signal_mailbox_eventfd(struct gxp_client *client,
+				       uint phys_core);
 
 #endif /* __GXP_CLIENT_H__ */

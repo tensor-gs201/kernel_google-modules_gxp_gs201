@@ -88,4 +88,6 @@ int gxp_vd_virt_core_to_phys_core(struct gxp_virtual_device *vd, u16 virt_core);
 uint gxp_vd_virt_core_list_to_phys_core_list(struct gxp_virtual_device *vd,
 					     u16 virt_core_list);
 
+int gxp_vd_phys_core_to_virt_core(struct gxp_virtual_device *vd, u16 phys_core);
+
 #endif /* __GXP_VD_H__ */

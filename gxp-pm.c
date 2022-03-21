@@ -22,9 +22,13 @@
 #include "gxp-lpm.h"
 #include "gxp-pm.h"
 
-static const enum aur_power_state aur_state_array[] = { AUR_OFF, AUR_UUD,
-							AUR_SUD, AUR_UD,
-							AUR_NOM };
+/*
+ * The order of this array decides the voting priority, should be increasing in
+ * frequencies.
+ */
+static const enum aur_power_state aur_state_array[] = { AUR_OFF, AUR_READY,
+							AUR_UUD, AUR_SUD,
+							AUR_UD,	 AUR_NOM };
 static const uint aur_memory_state_array[] = {
 	AUR_MEM_UNDEFINED, AUR_MEM_MIN,	      AUR_MEM_VERY_LOW, AUR_MEM_LOW,
 	AUR_MEM_HIGH,	   AUR_MEM_VERY_HIGH, AUR_MEM_MAX
@@ -93,15 +97,26 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 	return ret;
 }
 
-int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state)
+static int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state)
+{
+	return gxp_pm_blk_set_rate_acpm(gxp, aur_power_state2rate[state]);
+}
+
+int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate)
 {
 	int ret = 0;
 
 #if defined(CONFIG_GXP_CLOUDRIPPER)
-	ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, state);
-	dev_dbg(gxp->dev, "%s: state %lu, ret %d\n", __func__, state, ret);
+	ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, rate);
+	dev_dbg(gxp->dev, "%s: rate %lu, ret %d\n", __func__, rate, ret);
 #endif
 	return ret;
+}
+
+static void set_cmu_mux_state(struct gxp_dev *gxp, u32 val)
+{
+	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_PLL_AUR);
+	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_NOC_USER);
 }
 
 static void gxp_pm_blk_set_state_acpm_async(struct work_struct *work)
@@ -110,6 +125,17 @@ static void gxp_pm_blk_set_state_acpm_async(struct work_struct *work)
 		container_of(work, struct gxp_set_acpm_state_work, work);
 
 	mutex_lock(&set_acpm_state_work->gxp->power_mgr->pm_lock);
+	/*
+	 * This prev_state may be out of date with the manager's current state,
+	 * but we don't need curr_state here. curr_state is the last scheduled
+	 * state, while prev_state was the last actually requested state. It's
+	 * true because all request are executed synchronously and executed in
+	 * FIFO order.
+	 */
+	if (set_acpm_state_work->prev_state == AUR_READY)
+		set_cmu_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_NORMAL);
+	else if (set_acpm_state_work->state == AUR_READY)
+		set_cmu_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_LOW);
 	gxp_pm_blk_set_state_acpm(set_acpm_state_work->gxp, set_acpm_state_work->state);
 	mutex_unlock(&set_acpm_state_work->gxp->power_mgr->pm_lock);
 }
@@ -167,6 +193,12 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 		mutex_unlock(&gxp->power_mgr->pm_lock);
 		return ret;
 	}
+	/*
+	 * Before the block is off, CMUMUX cannot be low. Otherwise, powering on
+	 * cores will fail later.
+	 */
+	if (gxp->power_mgr->curr_state == AUR_READY)
+		set_cmu_mux_state(gxp, AUR_CMU_MUX_NORMAL);
 
 	/* Shutdown TOP's PSM */
 	gxp_lpm_destroy(gxp);
@@ -240,15 +272,16 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp, enum aur_power_state sta
 		return -EINVAL;
 	}
 	if (state != gxp->power_mgr->curr_state) {
-		gxp->power_mgr->curr_state = state;
 		if (state == AUR_OFF) {
 			dev_warn(gxp->dev, "It is not supported to request AUR_OFF\n");
 		} else {
-			gxp->power_mgr->set_acpm_rate_work.gxp = gxp;
-			gxp->power_mgr->set_acpm_rate_work.state = state;
+			gxp->power_mgr->set_acpm_state_work.gxp = gxp;
+			gxp->power_mgr->set_acpm_state_work.state = state;
+			gxp->power_mgr->set_acpm_state_work.prev_state = gxp->power_mgr->curr_state;
 			queue_work(gxp->power_mgr->wq,
-				   &gxp->power_mgr->set_acpm_rate_work.work);
+				   &gxp->power_mgr->set_acpm_state_work.work);
 		}
+		gxp->power_mgr->curr_state = state;
 	}
 
 	return 0;
@@ -481,7 +514,7 @@ int gxp_pm_init(struct gxp_dev *gxp)
 	refcount_set(&(mgr->blk_wake_ref), 0);
 	mgr->ops = &gxp_aur_ops;
 	gxp->power_mgr = mgr;
-	INIT_WORK(&mgr->set_acpm_rate_work.work, gxp_pm_blk_set_state_acpm_async);
+	INIT_WORK(&mgr->set_acpm_state_work.work, gxp_pm_blk_set_state_acpm_async);
 	INIT_WORK(&mgr->req_pm_qos_work.work, gxp_pm_req_pm_qos_async);
 	gxp->power_mgr->wq =
 		create_singlethread_workqueue("gxp_power_work_queue");

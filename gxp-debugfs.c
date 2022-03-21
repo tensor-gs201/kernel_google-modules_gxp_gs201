@@ -268,8 +268,8 @@ static int gxp_blk_powerstate_set(void *data, u64 val)
 		return -ENODEV;
 	}
 
-	if (val >= AUR_DVFS_MIN_STATE) {
-		ret = gxp_pm_blk_set_state_acpm(gxp, val);
+	if (val >= AUR_DVFS_MIN_RATE) {
+		ret = gxp_pm_blk_set_rate_acpm(gxp, val);
 	} else {
 		ret = -EINVAL;
 		dev_err(gxp->dev, "Incorrect state %llu\n", val);

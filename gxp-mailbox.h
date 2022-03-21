@@ -7,6 +7,7 @@
 #ifndef __GXP_MAILBOX_H__
 #define __GXP_MAILBOX_H__
 
+#include "gxp-client.h"
 #include "gxp-internal.h"
 
 /* Command/Response Structures */
@@ -80,6 +81,12 @@ struct gxp_async_response {
 	struct list_head *dest_queue;
 	spinlock_t *dest_queue_lock;
 	wait_queue_head_t *dest_queue_waitq;
+	/* Specified power state vote during the command execution */
+	uint gxp_power_state;
+	/* Specified memory power state vote during the command execution */
+	uint memory_power_state;
+	/* gxp_client to signal when the response completes. May be NULL */
+	struct gxp_client *client;
 };
 
 enum gxp_response_status {
@@ -177,7 +184,9 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  struct gxp_command *cmd,
 				  struct list_head *resp_queue,
 				  spinlock_t *queue_lock,
-				  wait_queue_head_t *queue_waitq);
+				  wait_queue_head_t *queue_waitq,
+				  uint gxp_power_state, uint memory_power_state,
+				  struct gxp_client *client);
 
 int gxp_mailbox_register_interrupt_handler(struct gxp_mailbox *mailbox,
 					   u32 int_bit,

@@ -64,9 +64,9 @@ static struct platform_device gxp_sscd_dev = {
 #endif  // CONFIG_SUBSYSTEM_COREDUMP
 
 /* Mapping from GXP_POWER_STATE_* to enum aur_power_state in gxp-pm.h */
-static const uint aur_state_array[GXP_POWER_STATE_NOM + 1] = { AUR_OFF, AUR_UUD,
-							       AUR_SUD, AUR_UD,
-							       AUR_NOM };
+static const uint aur_state_array[GXP_POWER_STATE_READY + 1] = {
+	AUR_OFF, AUR_UUD, AUR_SUD, AUR_UD, AUR_NOM, AUR_READY
+};
 /* Mapping from MEMORY_POWER_STATE_* to enum aur_memory_power_state in gxp-pm.h */
 static const uint aur_memory_state_array[MEMORY_POWER_STATE_MAX + 1] = {
 	AUR_MEM_UNDEFINED, AUR_MEM_MIN,	      AUR_MEM_VERY_LOW, AUR_MEM_LOW,
@@ -295,15 +295,17 @@ out:
 	return ret;
 }
 
-static int gxp_mailbox_command(struct gxp_client *client,
-			       struct gxp_mailbox_command_ioctl __user *argp)
+static int
+gxp_mailbox_command_compat(struct gxp_client *client,
+			   struct gxp_mailbox_command_compat_ioctl __user *argp)
 {
 	struct gxp_dev *gxp = client->gxp;
-	struct gxp_mailbox_command_ioctl ibuf;
+	struct gxp_mailbox_command_compat_ioctl ibuf;
 	struct gxp_command cmd;
 	struct buffer_descriptor buffer;
 	int phys_core;
 	int ret = 0;
+	uint gxp_power_state, memory_power_state;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf))) {
 		dev_err(gxp->dev,
@@ -354,12 +356,119 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	cmd.code = GXP_MBOX_CODE_DISPATCH; /* All IOCTL commands are dispatch */
 	cmd.priority = 0; /* currently unused */
 	cmd.buffer_descriptor = buffer;
+	gxp_power_state = AUR_OFF;
+	memory_power_state = AUR_MEM_UNDEFINED;
 
 	down_read(&gxp->vd_semaphore);
 	ret = gxp_mailbox_execute_cmd_async(
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
 		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
-		&gxp->mailbox_resp_waitqs[phys_core]);
+		&gxp->mailbox_resp_waitqs[phys_core], gxp_power_state,
+		memory_power_state, client);
+	up_read(&gxp->vd_semaphore);
+	if (ret) {
+		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
+			ret);
+		goto out;
+	}
+
+	ibuf.sequence_number = cmd.seq;
+	if (copy_to_user(argp, &ibuf, sizeof(ibuf))) {
+		dev_err(gxp->dev, "Failed to copy back sequence number!\n");
+		ret = -EFAULT;
+		goto out;
+	}
+
+out:
+	up_read(&client->semaphore);
+
+	return ret;
+}
+
+static int gxp_mailbox_command(struct gxp_client *client,
+			       struct gxp_mailbox_command_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_mailbox_command_ioctl ibuf;
+	struct gxp_command cmd;
+	struct buffer_descriptor buffer;
+	int phys_core;
+	int ret = 0;
+	uint gxp_power_state, memory_power_state;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf))) {
+		dev_err(gxp->dev,
+			"Unable to copy ioctl data from user-space\n");
+		return -EFAULT;
+	}
+	if (ibuf.gxp_power_state == GXP_POWER_STATE_OFF) {
+		dev_err(gxp->dev,
+			"GXP_POWER_STATE_OFF is not a valid value when executing a mailbox command\n");
+		return -EINVAL;
+	}
+	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
+	    ibuf.gxp_power_state > GXP_POWER_STATE_NOM) {
+		dev_err(gxp->dev, "Requested power state is invalid\n");
+		return -EINVAL;
+	}
+	if (ibuf.memory_power_state < MEMORY_POWER_STATE_UNDEFINED ||
+	    ibuf.memory_power_state > MEMORY_POWER_STATE_MAX) {
+		dev_err(gxp->dev, "Requested memory power state is invalid\n");
+		return -EINVAL;
+	}
+
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_MAILBOX_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
+	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
+	if (phys_core < 0) {
+		dev_err(gxp->dev,
+			"Mailbox command failed: Invalid virtual core id (%u)\n",
+			ibuf.virtual_core_id);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!gxp_is_fw_running(gxp, phys_core)) {
+		dev_err(gxp->dev,
+			"Cannot process mailbox command for core %d when firmware isn't running\n",
+			phys_core);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (gxp->mailbox_mgr == NULL || gxp->mailbox_mgr->mailboxes == NULL ||
+	    gxp->mailbox_mgr->mailboxes[phys_core] == NULL) {
+		dev_err(gxp->dev, "Mailbox not initialized for core %d\n",
+			phys_core);
+		ret = -EIO;
+		goto out;
+	}
+
+	/* Pack the command structure */
+	buffer.address = ibuf.device_address;
+	buffer.size = ibuf.size;
+	buffer.flags = ibuf.flags;
+	/* cmd.seq is assigned by mailbox implementation */
+	cmd.code = GXP_MBOX_CODE_DISPATCH; /* All IOCTL commands are dispatch */
+	cmd.priority = 0; /* currently unused */
+	cmd.buffer_descriptor = buffer;
+	gxp_power_state = aur_state_array[ibuf.gxp_power_state];
+	memory_power_state = aur_memory_state_array[ibuf.memory_power_state];
+
+	down_read(&gxp->vd_semaphore);
+	ret = gxp_mailbox_execute_cmd_async(
+		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
+		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
+		&gxp->mailbox_resp_waitqs[phys_core], gxp_power_state,
+		memory_power_state, client);
 	up_read(&gxp->vd_semaphore);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
@@ -935,7 +1044,7 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 		return -EINVAL;
 	}
 	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
-	    ibuf.gxp_power_state > GXP_POWER_STATE_NOM) {
+	    ibuf.gxp_power_state > GXP_POWER_STATE_READY) {
 		dev_err(gxp->dev, "Requested power state is invalid\n");
 		return -EINVAL;
 	}
@@ -1168,6 +1277,61 @@ out:
 	return ret;
 }
 
+static int gxp_register_mailbox_eventfd(
+	struct gxp_client *client,
+	struct gxp_register_mailbox_eventfd_ioctl __user *argp)
+{
+	struct gxp_register_mailbox_eventfd_ioctl ibuf;
+	struct eventfd_ctx *new_ctx;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	if (ibuf.virtual_core_id >= client->vd->num_cores)
+		return -EINVAL;
+
+	/* Make sure the provided eventfd is valid */
+	new_ctx = eventfd_ctx_fdget(ibuf.eventfd);
+	if (IS_ERR(new_ctx))
+		return PTR_ERR(new_ctx);
+
+	down_write(&client->semaphore);
+
+	/* Set the new eventfd, replacing any existing one */
+	if (client->mb_eventfds[ibuf.virtual_core_id])
+		eventfd_ctx_put(client->mb_eventfds[ibuf.virtual_core_id]);
+
+	client->mb_eventfds[ibuf.virtual_core_id] = new_ctx;
+
+	up_write(&client->semaphore);
+
+	return 0;
+}
+
+static int gxp_unregister_mailbox_eventfd(
+	struct gxp_client *client,
+	struct gxp_register_mailbox_eventfd_ioctl __user *argp)
+{
+	struct gxp_register_mailbox_eventfd_ioctl ibuf;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	if (ibuf.virtual_core_id >= client->vd->num_cores)
+		return -EINVAL;
+
+	down_write(&client->semaphore);
+
+	if (client->mb_eventfds[ibuf.virtual_core_id])
+		eventfd_ctx_put(client->mb_eventfds[ibuf.virtual_core_id]);
+
+	client->mb_eventfds[ibuf.virtual_core_id] = NULL;
+
+	up_write(&client->semaphore);
+
+	return 0;
+}
+
 static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 {
 	struct gxp_client *client = file->private_data;
@@ -1184,8 +1348,8 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 	case GXP_SYNC_BUFFER:
 		ret = gxp_sync_buffer(client, argp);
 		break;
-	case GXP_MAILBOX_COMMAND:
-		ret = gxp_mailbox_command(client, argp);
+	case GXP_MAILBOX_COMMAND_COMPAT:
+		ret = gxp_mailbox_command_compat(client, argp);
 		break;
 	case GXP_MAILBOX_RESPONSE:
 		ret = gxp_mailbox_response(client, argp);
@@ -1240,6 +1404,15 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 		break;
 	case GXP_UNMAP_DMABUF:
 		ret = gxp_unmap_dmabuf(client, argp);
+		break;
+	case GXP_MAILBOX_COMMAND:
+		ret = gxp_mailbox_command(client, argp);
+		break;
+	case GXP_REGISTER_MAILBOX_EVENTFD:
+		ret = gxp_register_mailbox_eventfd(client, argp);
+		break;
+	case GXP_UNREGISTER_MAILBOX_EVENTFD:
+		ret = gxp_unregister_mailbox_eventfd(client, argp);
 		break;
 	default:
 		ret = -ENOTTY; /* unknown command */
@@ -1328,6 +1501,24 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to map registers\n");
 		ret = -ENODEV;
 		goto err;
+	}
+
+	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cmu");
+	if (!IS_ERR_OR_NULL(r)) {
+		gxp->cmu.paddr = r->start;
+		gxp->cmu.size = resource_size(r);
+		gxp->cmu.vaddr = devm_ioremap_resource(dev, r);
+	}
+	/*
+	 * TODO (b/224685748): Remove this block after CMU CSR is supported
+	 * in device tree config.
+	 */
+	if (IS_ERR_OR_NULL(r) || IS_ERR_OR_NULL(gxp->cmu.vaddr)) {
+		gxp->cmu.paddr = gxp->regs.paddr - GXP_CMU_OFFSET;
+		gxp->cmu.size = GXP_CMU_SIZE;
+		gxp->cmu.vaddr = devm_ioremap(dev, gxp->cmu.paddr, gxp->cmu.size);
+		if (IS_ERR_OR_NULL(gxp->cmu.vaddr))
+			dev_warn(dev, "Failed to map CMU registers\n");
 	}
 
 	ret = gxp_pm_init(gxp);

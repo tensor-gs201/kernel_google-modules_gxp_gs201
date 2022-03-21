@@ -243,3 +243,31 @@ out:
 
 	return phys_core_list;
 }
+
+int gxp_vd_phys_core_to_virt_core(struct gxp_virtual_device *vd, u16 phys_core)
+{
+	struct gxp_dev *gxp = vd->gxp;
+	int virt_core = 0;
+	uint core;
+
+	down_read(&gxp->vd_semaphore);
+
+	if (gxp->core_to_vd[phys_core] != vd) {
+		virt_core = -EINVAL;
+		goto out;
+	}
+
+	/*
+	 * A core's virtual core ID == the number of physical cores in the same
+	 * virtual device with a lower physical core ID than its own.
+	 */
+	for (core = 0; core < phys_core; core++) {
+		if (gxp->core_to_vd[core] == vd)
+			virt_core++;
+	}
+
+out:
+	up_read(&gxp->vd_semaphore);
+
+	return virt_core;
+}

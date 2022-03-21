@@ -11,14 +11,17 @@
 #include <linux/refcount.h>
 #include <soc/google/exynos_pm_qos.h>
 
-#define AUR_DVFS_MIN_STATE 178000
+#define AUR_DVFS_MIN_RATE 178000
+static const uint aur_power_state2rate[] = { 0,	     178000,  373000,
+					     750000, 1160000, 178000 };
 
 enum aur_power_state {
 	AUR_OFF = 0,
-	AUR_UUD = 178000,
-	AUR_SUD = 373000,
-	AUR_UD = 750000,
-	AUR_NOM = 1160000,
+	AUR_UUD = 1,
+	AUR_SUD = 2,
+	AUR_UD = 3,
+	AUR_NOM = 4,
+	AUR_READY = 5,
 };
 
 enum aur_memory_power_state {
@@ -31,12 +34,22 @@ enum aur_memory_power_state {
 	AUR_MEM_MAX = 6,
 };
 
-#define AUR_NUM_POWER_STATE 5
+enum aur_power_cmu_mux_state {
+	AUR_CMU_MUX_LOW = 0,
+	AUR_CMU_MUX_NORMAL = 1,
+};
+
+#define AUR_NUM_POWER_STATE (AUR_MAX_ALLOW_STATE + 1)
 #define AUR_NUM_MEMORY_POWER_STATE (AUR_MAX_ALLOW_MEMORY_STATE + 1)
 
 #define AUR_INIT_DVFS_STATE AUR_UUD
-#define AUR_MAX_ALLOW_STATE AUR_NOM
 
+/*
+ * These macros mean the maximum valid enum value of aur_power_state and
+ * aur_memory_power_state, not necessarily the state with the maximum power
+ * level.
+ */
+#define AUR_MAX_ALLOW_STATE AUR_READY
 #define AUR_MAX_ALLOW_MEMORY_STATE AUR_MEM_MAX
 
 struct gxp_pm_device_ops {
@@ -50,6 +63,7 @@ struct gxp_set_acpm_state_work {
 	struct work_struct work;
 	struct gxp_dev *gxp;
 	unsigned long state;
+	unsigned long prev_state;
 };
 
 struct gxp_req_pm_qos_work {
@@ -68,7 +82,7 @@ struct gxp_power_manager {
 	int curr_memory_state;
 	refcount_t blk_wake_ref;
 	struct gxp_pm_device_ops *ops;
-	struct gxp_set_acpm_state_work set_acpm_rate_work;
+	struct gxp_set_acpm_state_work set_acpm_state_work;
 	struct gxp_req_pm_qos_work req_pm_qos_work;
 	struct workqueue_struct *wq;
 	/* INT/MIF requests for memory bandwidth */
@@ -189,19 +203,19 @@ int gxp_pm_init(struct gxp_dev *gxp);
 int gxp_pm_destroy(struct gxp_dev *gxp);
 
 /**
- * gxp_pm_blk_set_state_acpm() - API for setting the block-level DVFS state.
+ * gxp_pm_blk_set_rate_acpm() - API for setting the block-level DVFS rate.
  * This function can be called at any point after block power on.
  * @gxp: The GXP device to operate
- * @state: State number in khz that need to be set.
- *         Supported state is in enum aur_power_state,
- *         if experiment is needed for unsupported state
+ * @rate: Rate number in khz that need to be set.
+ *         Supported rate is in aur_power_state2rate,
+ *         if experiment is needed for unsupported rate
  *         please refer to Lassen's ECT table.
  *
  * Return:
  * * 0       - Set finished successfully
- * * Other   - Set state encounter issue in exynos_acpm_set_rate
+ * * Other   - Set rate encounter issue in exynos_acpm_set_rate
  */
-int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state);
+int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate);
 
 /**
  * gxp_pm_blk_get_state_acpm() - API for getting

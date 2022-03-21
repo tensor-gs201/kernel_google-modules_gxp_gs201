@@ -131,7 +131,7 @@ struct gxp_sync_ioctl {
 #define GXP_SYNC_BUFFER \
 	_IOW(GXP_IOCTL_BASE, 2, struct gxp_sync_ioctl)
 
-struct gxp_mailbox_command_ioctl {
+struct gxp_mailbox_command_compat_ioctl {
 	/*
 	 * Input:
 	 * The virtual core to dispatch the command to.
@@ -167,8 +167,8 @@ struct gxp_mailbox_command_ioctl {
  *
  * The client must hold a VIRTUAL_DEVICE wakelock.
  */
-#define GXP_MAILBOX_COMMAND \
-	_IOW(GXP_IOCTL_BASE, 3, struct gxp_mailbox_command_ioctl)
+#define GXP_MAILBOX_COMMAND_COMPAT \
+	_IOW(GXP_IOCTL_BASE, 3, struct gxp_mailbox_command_compat_ioctl)
 
 /* GXP mailbox response error code values */
 #define GXP_RESPONSE_ERROR_NONE         (0)
@@ -457,13 +457,17 @@ struct gxp_register_telemetry_eventfd_ioctl {
 
 /*
  * DSP subsystem Power state values for use as `gxp_power_state` in
- * `struct gxp_acquire_wakelock_ioctl`
+ * `struct gxp_acquire_wakelock_ioctl`.
+ * Note: GXP_POWER_STATE_READY is the state to keep the BLOCK idle. By setting
+ * this state, the driver will request UUD frequency and switch the CMUMUX
+ * clocks into 25 MHz to save more power.
  */
 #define GXP_POWER_STATE_OFF	0
 #define GXP_POWER_STATE_UUD	1
 #define GXP_POWER_STATE_SUD	2
 #define GXP_POWER_STATE_UD	3
 #define GXP_POWER_STATE_NOM	4
+#define GXP_POWER_STATE_READY	5
 
 /*
  * Memory interface power state values for use as `memory_power_state` in
@@ -611,5 +615,104 @@ struct gxp_map_dmabuf_ioctl {
  * The client must hold a VIRTUAL_DEVICE wakelock.
  */
 #define GXP_UNMAP_DMABUF _IOW(GXP_IOCTL_BASE, 21, struct gxp_map_dmabuf_ioctl)
+
+struct gxp_mailbox_command_ioctl {
+	/*
+	 * Input:
+	 * The virtual core to dispatch the command to.
+	 */
+	__u16 virtual_core_id;
+	/*
+	 * Output:
+	 * The sequence number assigned to this command. The caller can use
+	 * this value to match responses fetched via `GXP_MAILBOX_RESPONSE`
+	 * with this command.
+	 */
+	__u64 sequence_number;
+	/*
+	 * Input:
+	 * Device address to the buffer containing a GXP command. The user
+	 * should have obtained this address from the GXP_MAP_BUFFER ioctl.
+	 */
+	__u64 device_address;
+	/*
+	 * Input:
+	 * Size of the buffer at `device_address` in bytes.
+	 */
+	__u32 size;
+	/*
+	 * Input:
+	 * Minimum power state to operate the entire DSP subsystem at until
+	 * the mailbox command is finished(executed or timeout). One of the
+	 * GXP_POWER_STATE_* defines from below.
+	 *
+	 * `GXP_POWER_STATE_OFF` is not a valid value when executing a
+	 * mailbox command. The caller should pass GXP_POWER_STATE_UUD if the
+	 * command is expected to run at the power state the wakelock has
+	 * specified.
+	 */
+	__u32 gxp_power_state;
+	/*
+	 * Input:
+	 * Memory interface power state to request from the system so long as
+	 * the mailbox command is executing. One of the MEMORY_POWER_STATE*
+	 * defines from below.
+	 *
+	 * If `MEMORY_POWER_STATE_UNDEFINED` is passed, no request to change
+	 * the memory interface power state will be made.
+	 */
+	__u32 memory_power_state;
+	/*
+	 * Input:
+	 * Flags describing the command, for use by the GXP device.
+	 */
+	__u32 flags;
+	/*
+	 * Input:
+	 * Flags relevant to the power state requests. Currently reserved.
+	 */
+	/* TODO(221320387): Document the flags once support is implemented. */
+	__u32 power_flags;
+};
+
+/*
+ * Push element to the mailbox commmand queue.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_MAILBOX_COMMAND \
+	_IOWR(GXP_IOCTL_BASE, 23, struct gxp_mailbox_command_ioctl)
+
+struct gxp_register_mailbox_eventfd_ioctl {
+	/*
+	 * This eventfd will be signaled whenever a mailbox response arrives
+	 * for the core specified by `virtual_core_id`.
+	 *
+	 * When registering, if an eventfd has already been registered for the
+	 * specified core, the old eventfd will be unregistered and replaced.
+	 *
+	 * Not used during the unregister call, which clears any existing
+	 * eventfd.
+	 */
+	__u32 eventfd;
+	/*
+	 * Reserved.
+	 * Pass 0 for backwards compatibility.
+	 */
+	__u32 flags;
+	/*
+	 * The virtual core to register or unregister an eventfd from.
+	 * While an eventfd is registered, it will be signaled exactly once
+	 * any time a command to this virtual core receives a response or times
+	 * out.
+	 */
+	__u16 virtual_core_id;
+};
+
+#define GXP_REGISTER_MAILBOX_EVENTFD                                           \
+	_IOW(GXP_IOCTL_BASE, 22, struct gxp_register_mailbox_eventfd_ioctl)
+
+#define GXP_UNREGISTER_MAILBOX_EVENTFD                                         \
+	_IOW(GXP_IOCTL_BASE, 24, struct gxp_register_mailbox_eventfd_ioctl)
 
 #endif /* __GXP_H__ */

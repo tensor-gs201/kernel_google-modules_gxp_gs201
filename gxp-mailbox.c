@@ -17,6 +17,7 @@
 #include "gxp-internal.h"
 #include "gxp-mailbox.h"
 #include "gxp-mailbox-driver.h"
+#include "gxp-pm.h"
 #include "gxp-tmp.h"
 
 /* Timeout of 8s by default to account for slower emulation platforms */
@@ -237,6 +238,17 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 						     struct gxp_async_response,
 						     resp);
 				cancel_delayed_work(&async_resp->timeout_work);
+				if (async_resp->memory_power_state !=
+				    AUR_MEM_UNDEFINED)
+					gxp_pm_update_requested_memory_power_state(
+						async_resp->mailbox->gxp,
+						async_resp->memory_power_state,
+						AUR_MEM_UNDEFINED);
+				if (async_resp->gxp_power_state != AUR_OFF)
+					gxp_pm_update_requested_power_state(
+						async_resp->mailbox->gxp,
+						async_resp->gxp_power_state,
+						AUR_OFF);
 				spin_lock_irqsave(async_resp->dest_queue_lock,
 						  flags);
 				list_add_tail(&async_resp->list_entry,
@@ -250,6 +262,11 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 				async_resp->dest_queue = NULL;
 				spin_unlock_irqrestore(
 					async_resp->dest_queue_lock, flags);
+				if (async_resp->client) {
+					gxp_client_signal_mailbox_eventfd(
+						async_resp->client,
+						mailbox->core_id);
+				}
 				wake_up(async_resp->dest_queue_waitq);
 			}
 			kfree(cur);
@@ -727,6 +744,23 @@ static void async_cmd_timeout_work(struct work_struct *work)
 		async_resp->resp.status = GXP_RESP_CANCELLED;
 		list_add_tail(&async_resp->list_entry, async_resp->dest_queue);
 		spin_unlock_irqrestore(async_resp->dest_queue_lock, flags);
+
+		if (async_resp->memory_power_state != AUR_MEM_UNDEFINED)
+			gxp_pm_update_requested_memory_power_state(
+				async_resp->mailbox->gxp,
+				async_resp->memory_power_state,
+				AUR_MEM_UNDEFINED);
+		if (async_resp->gxp_power_state != AUR_OFF)
+			gxp_pm_update_requested_power_state(
+				async_resp->mailbox->gxp,
+				async_resp->gxp_power_state, AUR_OFF);
+
+		if (async_resp->client) {
+			gxp_client_signal_mailbox_eventfd(
+				async_resp->client,
+				async_resp->mailbox->core_id);
+		}
+
 		wake_up(async_resp->dest_queue_waitq);
 	} else {
 		spin_unlock_irqrestore(async_resp->dest_queue_lock, flags);
@@ -737,7 +771,9 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  struct gxp_command *cmd,
 				  struct list_head *resp_queue,
 				  spinlock_t *queue_lock,
-				  wait_queue_head_t *queue_waitq)
+				  wait_queue_head_t *queue_waitq,
+				  uint gxp_power_state, uint memory_power_state,
+				  struct gxp_client *client)
 {
 	struct gxp_async_response *async_resp;
 	int ret;
@@ -750,11 +786,20 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	async_resp->dest_queue = resp_queue;
 	async_resp->dest_queue_lock = queue_lock;
 	async_resp->dest_queue_waitq = queue_waitq;
+	async_resp->gxp_power_state = gxp_power_state;
+	async_resp->memory_power_state = memory_power_state;
+	async_resp->client = client;
 
 	INIT_DELAYED_WORK(&async_resp->timeout_work, async_cmd_timeout_work);
 	schedule_delayed_work(&async_resp->timeout_work,
 			      msecs_to_jiffies(MAILBOX_TIMEOUT));
 
+	if (gxp_power_state != AUR_OFF)
+		gxp_pm_update_requested_power_state(mailbox->gxp, AUR_OFF,
+						    gxp_power_state);
+	if (memory_power_state != AUR_MEM_UNDEFINED)
+		gxp_pm_update_requested_memory_power_state(
+			mailbox->gxp, AUR_MEM_UNDEFINED, memory_power_state);
 	ret = gxp_mailbox_enqueue_cmd(mailbox, cmd, &async_resp->resp,
 				      /* resp_is_async = */ true);
 	if (ret)
@@ -763,6 +808,12 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	return 0;
 
 err_free_resp:
+	if (memory_power_state != AUR_MEM_UNDEFINED)
+		gxp_pm_update_requested_memory_power_state(
+			mailbox->gxp, memory_power_state, AUR_MEM_UNDEFINED);
+	if (gxp_power_state != AUR_OFF)
+		gxp_pm_update_requested_power_state(mailbox->gxp,
+						    gxp_power_state, AUR_OFF);
 	cancel_delayed_work_sync(&async_resp->timeout_work);
 	kfree(async_resp);
 	return ret;

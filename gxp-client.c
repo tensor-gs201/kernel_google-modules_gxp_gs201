@@ -36,6 +36,7 @@ struct gxp_client *gxp_client_create(struct gxp_dev *gxp)
 void gxp_client_destroy(struct gxp_client *client)
 {
 	struct gxp_dev *gxp = client->gxp;
+	int core;
 
 	down_write(&gxp->vd_semaphore);
 
@@ -49,6 +50,11 @@ void gxp_client_destroy(struct gxp_client *client)
 
 	if (client->has_vd_wakelock)
 		gxp_vd_stop(client->vd);
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (client->mb_eventfds[core])
+			eventfd_ctx_put(client->mb_eventfds[core]);
+	}
 
 	up_write(&gxp->vd_semaphore);
 
@@ -64,4 +70,26 @@ void gxp_client_destroy(struct gxp_client *client)
 	gxp_vd_release(client->vd);
 
 	kfree(client);
+}
+
+void gxp_client_signal_mailbox_eventfd(struct gxp_client *client,
+				       uint phys_core)
+{
+	int virtual_core;
+
+	down_read(&client->semaphore);
+
+	virtual_core = gxp_vd_phys_core_to_virt_core(client->vd, phys_core);
+	if (unlikely(virtual_core < 0)) {
+		dev_err(client->gxp->dev,
+			"%s: core %d is not part of client's virtual device.\n",
+			__func__, phys_core);
+		goto out;
+	}
+
+	if (client->mb_eventfds[virtual_core])
+		eventfd_signal(client->mb_eventfds[virtual_core], 1);
+
+out:
+	up_read(&client->semaphore);
 }
