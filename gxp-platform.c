@@ -364,7 +364,7 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
 		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
 		&gxp->mailbox_resp_waitqs[phys_core], gxp_power_state,
-		memory_power_state, client);
+		memory_power_state, true, client);
 	up_read(&gxp->vd_semaphore);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
@@ -395,6 +395,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	int phys_core;
 	int ret = 0;
 	uint gxp_power_state, memory_power_state;
+	bool requested_aggressor = false;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf))) {
 		dev_err(gxp->dev,
@@ -407,7 +408,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 		return -EINVAL;
 	}
 	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
-	    ibuf.gxp_power_state > GXP_POWER_STATE_NOM) {
+	    ibuf.gxp_power_state > GXP_POWER_STATE_READY) {
 		dev_err(gxp->dev, "Requested power state is invalid\n");
 		return -EINVAL;
 	}
@@ -462,13 +463,14 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	cmd.buffer_descriptor = buffer;
 	gxp_power_state = aur_state_array[ibuf.gxp_power_state];
 	memory_power_state = aur_memory_state_array[ibuf.memory_power_state];
+	requested_aggressor = (ibuf.power_flags & GXP_POWER_NON_AGGRESSOR) == 0;
 
 	down_read(&gxp->vd_semaphore);
 	ret = gxp_mailbox_execute_cmd_async(
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
 		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
 		&gxp->mailbox_resp_waitqs[phys_core], gxp_power_state,
-		memory_power_state, client);
+		memory_power_state, requested_aggressor, client);
 	up_read(&gxp->vd_semaphore);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
@@ -607,11 +609,7 @@ static int gxp_get_specs(struct gxp_client *client,
 	struct gxp_specs_ioctl ibuf;
 
 	ibuf.core_count = GXP_NUM_CORES;
-	ibuf.version_major = 0;
-	ibuf.version_minor = 0;
-	ibuf.version_build = 1;
-	ibuf.threads_per_core = 1;
-	ibuf.memory_per_core = 0;
+	ibuf.memory_per_core = client->gxp->memory_per_core;
 
 	if (copy_to_user(argp, &ibuf, sizeof(ibuf)))
 		return -EFAULT;
@@ -667,6 +665,7 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	struct gxp_dev *gxp = client->gxp;
 	struct gxp_etm_trace_start_ioctl ibuf;
 	int phys_core;
+	int ret = 0;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
@@ -686,12 +685,23 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	if (ibuf.pc_match_mask_length > ETM_TRACE_PC_MATCH_MASK_LEN_MAX)
 		return -EINVAL;
 
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_ETM_TRACE_START_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
 	phys_core =
 		gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
 	if (phys_core < 0) {
 		dev_err(gxp->dev, "Trace start failed: Invalid virtual core id (%u)\n",
 			ibuf.virtual_core_id);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	/*
@@ -700,7 +710,10 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	 * (b/185819530).
 	 */
 
-	return 0;
+out:
+	up_read(&client->semaphore);
+
+	return ret;
 }
 
 static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
@@ -709,16 +722,28 @@ static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
 	struct gxp_dev *gxp = client->gxp;
 	u16 virtual_core_id;
 	int phys_core;
+	int ret = 0;
 
 	if (copy_from_user(&virtual_core_id, argp, sizeof(virtual_core_id)))
 		return -EFAULT;
+
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_ETM_TRACE_SW_STOP_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
 
 
 	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virtual_core_id);
 	if (phys_core < 0) {
 		dev_err(gxp->dev, "Trace stop via software trigger failed: Invalid virtual core id (%u)\n",
 			virtual_core_id);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	/*
@@ -727,7 +752,10 @@ static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
 	 * (b/185819530).
 	 */
 
-	return 0;
+out:
+	up_read(&client->semaphore);
+
+	return ret;
 }
 
 static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
@@ -736,15 +764,27 @@ static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
 	struct gxp_dev *gxp = client->gxp;
 	u16 virtual_core_id;
 	int phys_core;
+	int ret = 0;
 
 	if (copy_from_user(&virtual_core_id, argp, sizeof(virtual_core_id)))
 		return -EFAULT;
+
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_ETM_TRACE_CLEANUP_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
 
 	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virtual_core_id);
 	if (phys_core < 0) {
 		dev_err(gxp->dev, "Trace cleanup failed: Invalid virtual core id (%u)\n",
 			virtual_core_id);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	/*
@@ -753,7 +793,10 @@ static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
 	 * (b/185819530).
 	 */
 
-	return 0;
+out:
+	up_read(&client->semaphore);
+
+	return ret;
 }
 
 static int
@@ -773,15 +816,35 @@ gxp_etm_get_trace_info_command(struct gxp_client *client,
 	if (ibuf.type > 1)
 		return -EINVAL;
 
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_ETM_GET_TRACE_INFO_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
 	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
 	if (phys_core < 0) {
 		dev_err(gxp->dev, "Get trace info failed: Invalid virtual core id (%u)\n",
 			ibuf.virtual_core_id);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	trace_header = kzalloc(GXP_TRACE_HEADER_SIZE, GFP_KERNEL);
+	if (!trace_header) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
 	trace_data = kzalloc(GXP_TRACE_RAM_SIZE, GFP_KERNEL);
+	if (!trace_data) {
+		ret = -ENOMEM;
+		goto out_free_header;
+	}
 
 	/*
 	 * TODO (b/185260919): Get trace information from system FW once
@@ -792,20 +855,24 @@ gxp_etm_get_trace_info_command(struct gxp_client *client,
 	if (copy_to_user((void __user *)ibuf.trace_header_addr, trace_header,
 			 GXP_TRACE_HEADER_SIZE)) {
 		ret = -EFAULT;
-		goto out;
+		goto out_free_data;
 	}
 
 	if (ibuf.type == 1) {
 		if (copy_to_user((void __user *)ibuf.trace_data_addr,
 				 trace_data, GXP_TRACE_RAM_SIZE)) {
 			ret = -EFAULT;
-			goto out;
+			goto out_free_data;
 		}
 	}
 
-out:
-	kfree(trace_header);
+out_free_data:
 	kfree(trace_data);
+out_free_header:
+	kfree(trace_header);
+
+out:
+	up_read(&client->semaphore);
 
 	return ret;
 }
@@ -863,6 +930,16 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	down_write(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_MAP_TPU_MBX_QUEUE requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
 	virtual_core_list = ibuf.virtual_core_list;
 	core_count = hweight_long(virtual_core_list);
 	phys_core_list = gxp_vd_virt_core_list_to_phys_core_list(
@@ -870,23 +947,24 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	if (!phys_core_list) {
 		dev_err(gxp->dev, "%s: invalid virtual core list 0x%x\n",
 			__func__, virtual_core_list);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	mbx_info =
 		kmalloc(sizeof(struct edgetpu_ext_mailbox_info) + core_count *
 			sizeof(struct edgetpu_ext_mailbox_descriptor),
 			GFP_KERNEL);
-	if (!mbx_info)
-		return -ENOMEM;
-
-	down_write(&client->semaphore);
+	if (!mbx_info) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	if (client->tpu_mbx_allocated) {
 		dev_err(gxp->dev, "%s: Mappings already exist for TPU mailboxes\n",
 			__func__);
 		ret = -EBUSY;
-		goto error;
+		goto out_free;
 	}
 
 	gxp_tpu_info.tpu_fd = ibuf.tpu_fd;
@@ -899,7 +977,7 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	if (ret) {
 		dev_err(gxp->dev, "%s: Failed to allocate ext tpu mailboxes %d\n",
 			__func__, ret);
-		goto error;
+		goto out_free;
 	}
 	/* Align queue size to page size for iommu map. */
 	mbx_info->cmdq_size = ALIGN(mbx_info->cmdq_size, PAGE_SIZE);
@@ -913,17 +991,19 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 				       EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
 				       FREE_EXTERNAL_MAILBOX, &gxp_tpu_info,
 				       NULL);
-		goto error;
+		goto out_free;
 	}
 	client->mbx_desc.phys_core_list = phys_core_list;
 	client->mbx_desc.cmdq_size = mbx_info->cmdq_size;
 	client->mbx_desc.respq_size = mbx_info->respq_size;
 	client->tpu_mbx_allocated = true;
 
-error:
+out_free:
+	kfree(mbx_info);
+
+out:
 	up_write(&client->semaphore);
 
-	kfree(mbx_info);
 	return ret;
 #else
 	return -ENODEV;
@@ -942,7 +1022,15 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
+	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_write(&client->semaphore);
+
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_UNMAP_TPU_MBX_QUEUE requires the client hold a VIRTUAL_DEVICE wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
 
 	if (!client->tpu_mbx_allocated) {
 		dev_err(gxp->dev, "%s: No mappings exist for TPU mailboxes\n",
@@ -1006,6 +1094,17 @@ static int gxp_read_global_counter(struct gxp_client *client,
 	struct gxp_dev *gxp = client->gxp;
 	u32 high_first, high_second, low;
 	u64 counter_val;
+	int ret = 0;
+
+	/* Caller must hold BLOCK wakelock */
+	down_read(&client->semaphore);
+
+	if (!client->has_block_wakelock) {
+		dev_err(gxp->dev,
+			"GXP_READ_GLOBAL_COUNTER requires the client hold a BLOCK wakelock\n");
+		ret = -ENODEV;
+		goto out;
+	}
 
 	high_first = gxp_read_32(gxp, GXP_REG_GLOBAL_COUNTER_HIGH);
 	low = gxp_read_32(gxp, GXP_REG_GLOBAL_COUNTER_LOW);
@@ -1022,16 +1121,20 @@ static int gxp_read_global_counter(struct gxp_client *client,
 	counter_val = ((u64)high_second << 32) | low;
 
 	if (copy_to_user(argp, &counter_val, sizeof(counter_val)))
-		return -EFAULT;
+		ret = -EFAULT;
 
-	return 0;
+out:
+	up_read(&client->semaphore);
+
+	return ret;
 }
 
-static int gxp_acquire_wake_lock(struct gxp_client *client,
-				 struct gxp_acquire_wakelock_ioctl __user *argp)
+static int gxp_acquire_wake_lock_compat(
+	struct gxp_client *client,
+	struct gxp_acquire_wakelock_compat_ioctl __user *argp)
 {
 	struct gxp_dev *gxp = client->gxp;
-	struct gxp_acquire_wakelock_ioctl ibuf;
+	struct gxp_acquire_wakelock_compat_ioctl ibuf;
 	bool acquired_block_wakelock = false;
 	int ret = 0;
 
@@ -1103,9 +1206,119 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 	}
 
 	gxp_pm_update_requested_power_state(
-		gxp, client->requested_power_state,
-		aur_state_array[ibuf.gxp_power_state]);
+		gxp, client->requested_power_state, client->requested_aggressor,
+		aur_state_array[ibuf.gxp_power_state], true);
 	client->requested_power_state = aur_state_array[ibuf.gxp_power_state];
+	client->requested_aggressor = true;
+	gxp_pm_update_requested_memory_power_state(
+		gxp, client->requested_memory_power_state,
+		aur_memory_state_array[ibuf.memory_power_state]);
+	client->requested_memory_power_state =
+		aur_memory_state_array[ibuf.memory_power_state];
+out:
+	up_write(&client->semaphore);
+
+	return ret;
+
+err_acquiring_vd_wl:
+	/*
+	 * In a single call, if any wakelock acquisition fails, all of them do.
+	 * If the client was acquiring both wakelocks and failed to acquire the
+	 * VIRTUAL_DEVICE wakelock after successfully acquiring the BLOCK
+	 * wakelock, then release it before returning the error code.
+	 */
+	if (acquired_block_wakelock) {
+		gxp_wakelock_release(gxp);
+		client->has_block_wakelock = false;
+	}
+
+	up_write(&client->semaphore);
+
+	return ret;
+}
+
+static int gxp_acquire_wake_lock(struct gxp_client *client,
+				 struct gxp_acquire_wakelock_ioctl __user *argp)
+{
+	struct gxp_dev *gxp = client->gxp;
+	struct gxp_acquire_wakelock_ioctl ibuf;
+	bool acquired_block_wakelock = false;
+	bool requested_aggressor = false;
+	int ret = 0;
+
+	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
+		return -EFAULT;
+
+	if (ibuf.gxp_power_state == GXP_POWER_STATE_OFF) {
+		dev_err(gxp->dev,
+			"GXP_POWER_STATE_OFF is not a valid value when acquiring a wakelock\n");
+		return -EINVAL;
+	}
+	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
+	    ibuf.gxp_power_state > GXP_POWER_STATE_READY) {
+		dev_err(gxp->dev, "Requested power state is invalid\n");
+		return -EINVAL;
+	}
+	if ((ibuf.memory_power_state < MEMORY_POWER_STATE_MIN ||
+	     ibuf.memory_power_state > MEMORY_POWER_STATE_MAX) &&
+	    ibuf.memory_power_state != MEMORY_POWER_STATE_UNDEFINED) {
+		dev_err(gxp->dev,
+			"Requested memory power state %d is invalid\n",
+			ibuf.memory_power_state);
+		return -EINVAL;
+	}
+
+	down_write(&client->semaphore);
+
+	/* Acquire a BLOCK wakelock if requested */
+	if (ibuf.components_to_wake & WAKELOCK_BLOCK) {
+		if (!client->has_block_wakelock) {
+			ret = gxp_wakelock_acquire(gxp);
+			acquired_block_wakelock = true;
+		}
+
+		if (ret) {
+			dev_err(gxp->dev,
+				"Failed to acquire BLOCK wakelock for client (ret=%d)\n",
+				ret);
+			goto out;
+		}
+
+		client->has_block_wakelock = true;
+	}
+
+	/* Acquire a VIRTUAL_DEVICE wakelock if requested */
+	if (ibuf.components_to_wake & WAKELOCK_VIRTUAL_DEVICE) {
+		if (!client->has_block_wakelock) {
+			dev_err(gxp->dev,
+				"Must hold BLOCK wakelock to acquire VIRTUAL_DEVICE wakelock\n");
+			ret = -EINVAL;
+			goto out;
+
+		}
+
+		if (!client->has_vd_wakelock) {
+			down_write(&gxp->vd_semaphore);
+			ret = gxp_vd_start(client->vd);
+			up_write(&gxp->vd_semaphore);
+		}
+
+		if (ret) {
+			dev_err(gxp->dev,
+				"Failed to acquire VIRTUAL_DEVICE wakelock for client (ret=%d)\n",
+				ret);
+			goto err_acquiring_vd_wl;
+		}
+
+		client->has_vd_wakelock = true;
+	}
+	requested_aggressor = (ibuf.flags & GXP_POWER_NON_AGGRESSOR) == 0;
+
+	gxp_pm_update_requested_power_state(
+		gxp, client->requested_power_state, client->requested_aggressor,
+		aur_state_array[ibuf.gxp_power_state], requested_aggressor);
+	client->requested_power_state = aur_state_array[ibuf.gxp_power_state];
+	client->requested_aggressor = requested_aggressor;
 	gxp_pm_update_requested_memory_power_state(
 		gxp, client->requested_memory_power_state,
 		aur_memory_state_array[ibuf.memory_power_state]);
@@ -1181,7 +1394,8 @@ static int gxp_release_wake_lock(struct gxp_client *client, __u32 __user *argp)
 		 * to change the power state.
 		 */
 		gxp_pm_update_requested_power_state(
-			gxp, client->requested_power_state, AUR_OFF);
+			gxp, client->requested_power_state,
+			client->requested_aggressor, AUR_OFF, true);
 		client->requested_power_state = AUR_OFF;
 		gxp_pm_update_requested_memory_power_state(
 			gxp, client->requested_memory_power_state,
@@ -1332,6 +1546,33 @@ static int gxp_unregister_mailbox_eventfd(
 	return 0;
 }
 
+static int
+gxp_get_interface_version(struct gxp_client *client,
+			  struct gxp_interface_version_ioctl __user *argp)
+{
+	struct gxp_interface_version_ioctl ibuf;
+	int ret;
+
+	ibuf.version_major = GXP_INTERFACE_VERSION_MAJOR;
+	ibuf.version_minor = GXP_INTERFACE_VERSION_MINOR;
+	memset(ibuf.version_build, 0, GXP_INTERFACE_VERSION_BUILD_BUFFER_SIZE);
+	ret = snprintf(ibuf.version_build,
+		       GXP_INTERFACE_VERSION_BUILD_BUFFER_SIZE - 1,
+		       GIT_REPO_TAG);
+
+	if (ret < 0 || ret >= GXP_INTERFACE_VERSION_BUILD_BUFFER_SIZE) {
+		dev_warn(
+			client->gxp->dev,
+			"Buffer size insufficient to hold GIT_REPO_TAG (size=%d)\n",
+			ret);
+	}
+
+	if (copy_to_user(argp, &ibuf, sizeof(ibuf)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 {
 	struct gxp_client *client = file->private_data;
@@ -1393,8 +1634,8 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 	case GXP_READ_GLOBAL_COUNTER:
 		ret = gxp_read_global_counter(client, argp);
 		break;
-	case GXP_ACQUIRE_WAKE_LOCK:
-		ret = gxp_acquire_wake_lock(client, argp);
+	case GXP_ACQUIRE_WAKE_LOCK_COMPAT:
+		ret = gxp_acquire_wake_lock_compat(client, argp);
 		break;
 	case GXP_RELEASE_WAKE_LOCK:
 		ret = gxp_release_wake_lock(client, argp);
@@ -1413,6 +1654,12 @@ static long gxp_ioctl(struct file *file, uint cmd, ulong arg)
 		break;
 	case GXP_UNREGISTER_MAILBOX_EVENTFD:
 		ret = gxp_unregister_mailbox_eventfd(client, argp);
+		break;
+	case GXP_ACQUIRE_WAKE_LOCK:
+		ret = gxp_acquire_wake_lock(client, argp);
+		break;
+	case GXP_GET_INTERFACE_VERSION:
+		ret = gxp_get_interface_version(client, argp);
 		break;
 	default:
 		ret = -ENOTTY; /* unknown command */
@@ -1463,6 +1710,7 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	int ret;
 	int  __maybe_unused i;
 	bool __maybe_unused tpu_found;
+	u64 prop;
 
 	dev_notice(dev, "Probing gxp driver with commit %s\n", GIT_REPO_TAG);
 
@@ -1646,6 +1894,15 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		dev_info(
 			dev,
 			"GSA device found, Firmware authentication available\n");
+	}
+
+	ret = of_property_read_u64(dev->of_node, "gxp-memory-per-core",
+				   &prop);
+	if (ret) {
+		dev_err(dev, "Unable to get memory-per-core from device tree\n");
+		gxp->memory_per_core = 0;
+	} else {
+		gxp->memory_per_core = (u32)prop;
 	}
 
 	gxp_fw_data_init(gxp);

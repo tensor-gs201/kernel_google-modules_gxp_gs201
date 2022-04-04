@@ -52,6 +52,13 @@ enum aur_power_cmu_mux_state {
 #define AUR_MAX_ALLOW_STATE AUR_READY
 #define AUR_MAX_ALLOW_MEMORY_STATE AUR_MEM_MAX
 
+/*
+ * The bit to indicate non-aggressor vote for `exynos_acpm_set_rate`.
+ * Lower 3 byte of frequency parameter of `exynos_acpm_set_rate` will still be
+ * the requested rate.
+ */
+#define AUR_NON_AGGRESSOR_BIT 24
+
 struct gxp_pm_device_ops {
 	int (*pre_blk_powerup)(struct gxp_dev *gxp);
 	int (*post_blk_powerup)(struct gxp_dev *gxp);
@@ -64,6 +71,7 @@ struct gxp_set_acpm_state_work {
 	struct gxp_dev *gxp;
 	unsigned long state;
 	unsigned long prev_state;
+	bool aggressor_vote;
 };
 
 struct gxp_req_pm_qos_work {
@@ -77,7 +85,9 @@ struct gxp_power_manager {
 	struct gxp_dev *gxp;
 	struct mutex pm_lock;
 	uint pwr_state_req_count[AUR_NUM_POWER_STATE];
+	uint non_aggressor_pwr_state_req_count[AUR_NUM_POWER_STATE];
 	uint mem_pwr_state_req_count[AUR_NUM_MEMORY_POWER_STATE];
+	bool curr_aggressor_vote;
 	int curr_state;
 	int curr_memory_state;
 	refcount_t blk_wake_ref;
@@ -142,8 +152,8 @@ int gxp_pm_core_on(struct gxp_dev *gxp, uint core);
 int gxp_pm_core_off(struct gxp_dev *gxp, uint core);
 
 /**
- * gxp_pm_acquire_blk_wakelock() - Acquire blk wakelock
- * to make sure block won't shutdown.
+ * gxp_pm_acquire_blk_wakelock() - Acquire blk wakelock to make sure block won't
+ * shutdown.
  *
  * Can be called multiple times and it will increase
  * reference count.
@@ -170,20 +180,8 @@ int gxp_pm_acquire_blk_wakelock(struct gxp_dev *gxp);
 int gxp_pm_release_blk_wakelock(struct gxp_dev *gxp);
 
 /**
- * gxp_pm_req_state() - API to request a desired power state.
- * @gxp: The GXP device to operate
- * @state: The requested state
- *
- * Return:
- * * 0       - Voting registered
- * * -EINVAL - Invalid requested state
- */
-int gxp_pm_req_state(struct gxp_dev *gxp, enum aur_power_state state);
-
-/**
- * gxp_pm_init() - API for initialize PM
- * interface for GXP, should only be called
- * once per probe
+ * gxp_pm_init() - API for initialize PM interface for GXP, should only be
+ * called once per probe
  * @gxp: The GXP device to operate
  *
  * Return:
@@ -232,8 +230,13 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
  * requested state.
  * @gxp: The GXP device to operate.
  * @origin_state: An existing old requested state, will be cleared. If this is
- * the first vote, pass AUR_OFF.
+ *                the first vote, pass AUR_OFF.
+ * @origin_requested_aggressor: Specify whether the existing vote was requested with
+ *                              aggressor flag.
  * @requested_state: The new requested state.
+ * @requested_aggressor: Specify whether the new vote is requested with aggressor
+ *                       flag. Will take no effect if the @requested state is
+ *                       AUR_OFF.
  *
  * Return:
  * * 0       - Voting registered
@@ -241,14 +244,16 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
  */
 int gxp_pm_update_requested_power_state(struct gxp_dev *gxp,
 					enum aur_power_state origin_state,
-					enum aur_power_state requested_state);
+					bool origin_requested_aggressor,
+					enum aur_power_state requested_state,
+					bool requested_aggressor);
 
 /**
  * gxp_pm_update_requested_memory_power_state() - API for a GXP client to vote for a
  * requested memory power state.
  * @gxp: The GXP device to operate.
  * @origin_state: An existing old requested state, will be cleared. If this is
- * the first vote, pass AUR_MEM_UNDEFINED.
+ *                the first vote, pass AUR_MEM_UNDEFINED.
  * @requested_state: The new requested state.
  *
  * Return:

@@ -237,6 +237,7 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 					container_of(cur->resp,
 						     struct gxp_async_response,
 						     resp);
+
 				cancel_delayed_work(&async_resp->timeout_work);
 				if (async_resp->memory_power_state !=
 				    AUR_MEM_UNDEFINED)
@@ -248,9 +249,12 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 					gxp_pm_update_requested_power_state(
 						async_resp->mailbox->gxp,
 						async_resp->gxp_power_state,
-						AUR_OFF);
+						async_resp->requested_aggressor,
+						AUR_OFF, true);
+
 				spin_lock_irqsave(async_resp->dest_queue_lock,
 						  flags);
+
 				list_add_tail(&async_resp->list_entry,
 					      async_resp->dest_queue);
 				/*
@@ -260,14 +264,24 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 				 * wait_list_lock and cancelling the timeout.
 				 */
 				async_resp->dest_queue = NULL;
-				spin_unlock_irqrestore(
-					async_resp->dest_queue_lock, flags);
+
+				/*
+				 * Don't release the dest_queue_lock until both
+				 * any eventfd has been signaled and any waiting
+				 * thread has been woken. Otherwise one thread
+				 * might consume and free the response before
+				 * this function is done with it.
+				 */
 				if (async_resp->client) {
 					gxp_client_signal_mailbox_eventfd(
 						async_resp->client,
 						mailbox->core_id);
 				}
 				wake_up(async_resp->dest_queue_waitq);
+
+				spin_unlock_irqrestore(
+					async_resp->dest_queue_lock, flags);
+
 			}
 			kfree(cur);
 			break;
@@ -523,6 +537,10 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 			struct gxp_mailbox *mailbox)
 {
 	int i;
+	struct gxp_mailbox_wait_list *cur, *nxt;
+	struct gxp_async_response *async_resp;
+	struct list_head resps_to_flush;
+	unsigned long flags;
 
 	if (!mailbox) {
 		dev_err(mgr->gxp->dev,
@@ -543,6 +561,52 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 	for (i = 0; i < GXP_MAILBOX_INT_BIT_COUNT; i++) {
 		if (mailbox->interrupt_handlers[i])
 			cancel_work_sync(mailbox->interrupt_handlers[i]);
+	}
+
+	/*
+	 * At this point only async responses should be pending. Flush them all
+	 * from the `wait_list` at once so any remaining timeout workers
+	 * waiting on `wait_list_lock` will know their responses have been
+	 * handled already.
+	 */
+	INIT_LIST_HEAD(&resps_to_flush);
+	mutex_lock(&mailbox->wait_list_lock);
+	list_for_each_entry_safe(cur, nxt, &mailbox->wait_list, list) {
+		list_del(&cur->list);
+		if (cur->is_async) {
+			list_add_tail(&cur->list, &resps_to_flush);
+			/*
+			 * Clear the response's destination queue so that if the
+			 * timeout worker is running, it won't try to process
+			 * this response after `wait_list_lock` is released.
+			 */
+			async_resp = container_of(
+				cur->resp, struct gxp_async_response, resp);
+			spin_lock_irqsave(async_resp->dest_queue_lock, flags);
+			async_resp->dest_queue = NULL;
+			spin_unlock_irqrestore(async_resp->dest_queue_lock,
+					       flags);
+
+		} else {
+			dev_warn(
+				mailbox->gxp->dev,
+				"Unexpected synchronous command pending on mailbox release\n");
+			kfree(cur);
+		}
+	}
+	mutex_unlock(&mailbox->wait_list_lock);
+
+	/*
+	 * Cancel the timeout timer of and free any responses that were still in
+	 * the `wait_list` above.
+	 */
+	list_for_each_entry_safe(cur, nxt, &resps_to_flush, list) {
+		list_del(&cur->list);
+		async_resp = container_of(cur->resp, struct gxp_async_response,
+					  resp);
+		cancel_delayed_work_sync(&async_resp->timeout_work);
+		kfree(async_resp);
+		kfree(cur);
 	}
 
 	/* Reset the mailbox HW */
@@ -753,7 +817,8 @@ static void async_cmd_timeout_work(struct work_struct *work)
 		if (async_resp->gxp_power_state != AUR_OFF)
 			gxp_pm_update_requested_power_state(
 				async_resp->mailbox->gxp,
-				async_resp->gxp_power_state, AUR_OFF);
+				async_resp->gxp_power_state,
+				async_resp->requested_aggressor, AUR_OFF, true);
 
 		if (async_resp->client) {
 			gxp_client_signal_mailbox_eventfd(
@@ -773,6 +838,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  spinlock_t *queue_lock,
 				  wait_queue_head_t *queue_waitq,
 				  uint gxp_power_state, uint memory_power_state,
+				  bool requested_aggressor,
 				  struct gxp_client *client)
 {
 	struct gxp_async_response *async_resp;
@@ -789,14 +855,16 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	async_resp->gxp_power_state = gxp_power_state;
 	async_resp->memory_power_state = memory_power_state;
 	async_resp->client = client;
+	async_resp->requested_aggressor = requested_aggressor;
 
 	INIT_DELAYED_WORK(&async_resp->timeout_work, async_cmd_timeout_work);
 	schedule_delayed_work(&async_resp->timeout_work,
 			      msecs_to_jiffies(MAILBOX_TIMEOUT));
 
 	if (gxp_power_state != AUR_OFF)
-		gxp_pm_update_requested_power_state(mailbox->gxp, AUR_OFF,
-						    gxp_power_state);
+		gxp_pm_update_requested_power_state(mailbox->gxp, AUR_OFF, true,
+						    gxp_power_state,
+						    requested_aggressor);
 	if (memory_power_state != AUR_MEM_UNDEFINED)
 		gxp_pm_update_requested_memory_power_state(
 			mailbox->gxp, AUR_MEM_UNDEFINED, memory_power_state);
@@ -813,7 +881,9 @@ err_free_resp:
 			mailbox->gxp, memory_power_state, AUR_MEM_UNDEFINED);
 	if (gxp_power_state != AUR_OFF)
 		gxp_pm_update_requested_power_state(mailbox->gxp,
-						    gxp_power_state, AUR_OFF);
+						    gxp_power_state,
+						    requested_aggressor,
+						    AUR_OFF, true);
 	cancel_delayed_work_sync(&async_resp->timeout_work);
 	kfree(async_resp);
 	return ret;

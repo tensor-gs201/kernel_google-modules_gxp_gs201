@@ -157,7 +157,8 @@ static int gxp_firmware_run_set(void *data, u64 val)
 			goto err_wakelock;
 		}
 		gxp->debugfs_client->has_block_wakelock = true;
-		gxp_pm_update_requested_power_state(gxp, AUR_OFF, AUR_UUD);
+		gxp_pm_update_requested_power_state(gxp, AUR_OFF, true, AUR_UUD,
+						    true);
 
 		down_write(&gxp->vd_semaphore);
 		ret = gxp_vd_start(gxp->debugfs_client->vd);
@@ -180,7 +181,8 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		 */
 		gxp_client_destroy(gxp->debugfs_client);
 		gxp->debugfs_client = NULL;
-		gxp_pm_update_requested_power_state(gxp, AUR_UUD, AUR_OFF);
+		gxp_pm_update_requested_power_state(gxp, AUR_UUD, true, AUR_OFF,
+						    true);
 	}
 
 out:
@@ -190,7 +192,7 @@ out:
 
 err_start:
 	gxp_wakelock_release(gxp);
-	gxp_pm_update_requested_power_state(gxp, AUR_UUD, AUR_OFF);
+	gxp_pm_update_requested_power_state(gxp, AUR_UUD, true, AUR_OFF, true);
 err_wakelock:
 	/* Destroying a client cleans up any VDss or wakelocks it held. */
 	gxp_client_destroy(gxp->debugfs_client);
@@ -234,7 +236,8 @@ static int gxp_wakelock_set(void *data, u64 val)
 			goto out;
 		}
 		gxp->debugfs_wakelock_held = true;
-		gxp_pm_update_requested_power_state(gxp, AUR_OFF, AUR_UUD);
+		gxp_pm_update_requested_power_state(gxp, AUR_OFF, true, AUR_UUD,
+						    true);
 	} else {
 		/* Wakelock Release */
 		if (!gxp->debugfs_wakelock_held) {
@@ -245,7 +248,8 @@ static int gxp_wakelock_set(void *data, u64 val)
 
 		gxp_wakelock_release(gxp);
 		gxp->debugfs_wakelock_held = false;
-		gxp_pm_update_requested_power_state(gxp, AUR_UUD, AUR_OFF);
+		gxp_pm_update_requested_power_state(gxp, AUR_UUD, true, AUR_OFF,
+						    true);
 	}
 
 out:

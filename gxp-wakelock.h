@@ -10,12 +10,6 @@
 #include "gxp.h"
 #include "gxp-internal.h"
 
-/*
- * TODO(b/201600514): This is a temporary, basic interface to support
- * b/204924965. It should be revisited and modified as necessary to properly
- * support the full wakelock interface exposed to driver users.
- */
-
 struct gxp_wakelock_manager {
 	/* Protects count and suspended */
 	struct mutex lock;

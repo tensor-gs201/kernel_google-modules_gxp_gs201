@@ -40,7 +40,6 @@
 #define FW_IMAGE_TYPE_OFFSET	(0x400)
 
 static const struct firmware *fw[GXP_NUM_CORES];
-static void __iomem *aurora_base;
 
 static char *fw_elf[] = {Q7_ELF_FILE0, Q7_ELF_FILE1, Q7_ELF_FILE2,
 			 Q7_ELF_FILE3};
@@ -319,8 +318,8 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	/* Wait for core to come up */
 	dev_notice(gxp->dev, "Waiting for core %u to power up...\n",
 		   core);
-	core_psm_base = ((u8 *)aurora_base) + LPM_BLOCK
-			+ CORE_PSM_BASE(core);
+	core_psm_base =
+		((u8 *)gxp->regs.vaddr) + LPM_BLOCK + CORE_PSM_BASE(core);
 	ctr = 1000;
 	while (ctr) {
 		addr = core_psm_base + PSM_STATUS_OFFSET;
@@ -419,8 +418,6 @@ int gxp_fw_init(struct gxp_dev *gxp)
 	uint core;
 	struct resource r;
 	int ret;
-
-	aurora_base = gxp->regs.vaddr;
 
 	/* Power on BLK_AUR to read the revision and processor ID registers */
 	gxp_pm_blk_on(gxp);
@@ -551,6 +548,9 @@ out_firmware_unload:
 
 void gxp_firmware_stop(struct gxp_dev *gxp, uint core)
 {
+	struct gxp_async_response *cur, *nxt;
+	unsigned long flags;
+
 	if (!(gxp->firmware_running & BIT(core)))
 		dev_err(gxp->dev, "Firmware is not running on core %u\n", core);
 
@@ -564,6 +564,21 @@ void gxp_firmware_stop(struct gxp_dev *gxp, uint core)
 	gxp_mailbox_release(gxp->mailbox_mgr,
 			    gxp->mailbox_mgr->mailboxes[core]);
 	dev_notice(gxp->dev, "Mailbox %u released\n", core);
+
+	/*
+	 * TODO(b/226211187) response queues should be owned by VDs
+	 * This step should not be necessary until a VD is destroyed once the
+	 * queues are owned directly by the VD and not shared by all users of
+	 * a physical core.
+	 */
+	/* Flush and free any abandoned responses left in the queue */
+	spin_lock_irqsave(&gxp->mailbox_resps_lock, flags);
+	list_for_each_entry_safe(cur, nxt, &gxp->mailbox_resp_queues[core],
+				 list_entry) {
+		list_del(&cur->list_entry);
+		kfree(cur);
+	}
+	spin_unlock_irqrestore(&gxp->mailbox_resps_lock, flags);
 
 	gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);

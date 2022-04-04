@@ -79,7 +79,13 @@ struct gxp_async_response {
 	struct gxp_mailbox *mailbox;
 	/* Queue to add the response to once it is complete or timed out */
 	struct list_head *dest_queue;
+	/*
+	 * The lock that protects queue pointed to by `dest_queue`.
+	 * The mailbox code also uses this lock to protect changes to the
+	 * `dest_queue` pointer itself when processing this response.
+	 */
 	spinlock_t *dest_queue_lock;
+	/* Queue of clients to notify when this response is processed */
 	wait_queue_head_t *dest_queue_waitq;
 	/* Specified power state vote during the command execution */
 	uint gxp_power_state;
@@ -87,6 +93,8 @@ struct gxp_async_response {
 	uint memory_power_state;
 	/* gxp_client to signal when the response completes. May be NULL */
 	struct gxp_client *client;
+	/* Specified whether the power state vote is requested with aggressor flag */
+	bool requested_aggressor;
 };
 
 enum gxp_response_status {
@@ -186,6 +194,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  spinlock_t *queue_lock,
 				  wait_queue_head_t *queue_waitq,
 				  uint gxp_power_state, uint memory_power_state,
+				  bool requested_aggressor,
 				  struct gxp_client *client);
 
 int gxp_mailbox_register_interrupt_handler(struct gxp_mailbox *mailbox,

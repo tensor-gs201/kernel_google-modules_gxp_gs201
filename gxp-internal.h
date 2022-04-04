@@ -111,6 +111,7 @@ struct gxp_dev {
 	 * May be NULL if the chip does not support firmware authentication
 	 */
 	struct device *gsa_dev;
+	u32 memory_per_core;
 };
 
 /* GXP device IO functions */

@@ -10,6 +10,11 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
+/* Interface Version */
+#define GXP_INTERFACE_VERSION_MAJOR	1
+#define GXP_INTERFACE_VERSION_MINOR	0
+#define GXP_INTERFACE_VERSION_BUILD	0
+
 /*
  * mmap offsets for logging and tracing buffers
  * Requested size will be divided evenly among all cores. The whole buffer
@@ -18,17 +23,6 @@
  */
 #define GXP_MMAP_LOG_BUFFER_OFFSET	0x10000
 #define GXP_MMAP_TRACE_BUFFER_OFFSET	0x20000
-
-#define GXP_IOCTL_BASE 0xEE
-
-/* GXP map flag macros */
-
-/* The mask for specifying DMA direction in GXP map flag */
-#define GXP_MAP_DIR_MASK		3
-/* The targeted DMA direction for the buffer */
-#define GXP_MAP_DMA_BIDIRECTIONAL	0
-#define GXP_MAP_DMA_TO_DEVICE		1
-#define GXP_MAP_DMA_FROM_DEVICE		2
 
 /*
  * TODO(b/209083969) The following IOCTLs will no longer require the caller
@@ -39,7 +33,265 @@
  * - GXP_SYNC_BUFFER
  * - GXP_MAP_DMABUF
  * - GXP_UNMAP_DMABUF
+ * - GXP_MAP_TPU_MBX_QUEUE
+ * - GXP_UNMAP_TPU_MBX_QUEUE
  */
+
+#define GXP_IOCTL_BASE 0xEE
+
+#define GXP_INTERFACE_VERSION_BUILD_BUFFER_SIZE 64
+struct gxp_interface_version_ioctl {
+	/*
+	 * Driver major version number.
+	 * Increments whenever a non-backwards compatible change to the
+	 * interface defined in this file changes.
+	 */
+	__u16 version_major;
+	/*
+	 * Driver minor version number.
+	 * Increments whenever a backwards compatible change, such as the
+	 * addition of a new IOCTL, is made to the interface defined in this
+	 * file.
+	 */
+	__u16 version_minor;
+	/*
+	 * Driver build identifier.
+	 * NULL-terminated string of the git hash of the commit the driver was
+	 * built from. If the driver had uncommitted changes the string will
+	 * end with "-dirty".
+	 */
+	char version_build[GXP_INTERFACE_VERSION_BUILD_BUFFER_SIZE];
+};
+
+/* Query the driver's interface version. */
+#define GXP_GET_INTERFACE_VERSION                                              \
+	_IOR(GXP_IOCTL_BASE, 26, struct gxp_interface_version_ioctl)
+
+struct gxp_specs_ioctl {
+	/* Maximum number of cores that can be allocated to a virtual device */
+	__u8 core_count;
+	/* Deprecated fields that should be ignored */
+	__u16 reserved_0;
+	__u16 reserved_1;
+	__u16 reserved_2;
+	__u8 reserved_3;
+	/*
+	 * Amount of "tightly-coupled memory" or TCM available to each core.
+	 * The value returned will be in kB, or 0 if the value was not
+	 * specified in the device-tree.
+	 */
+	__u32 memory_per_core;
+};
+
+/* Query system specs. */
+#define GXP_GET_SPECS \
+	_IOR(GXP_IOCTL_BASE, 5, struct gxp_specs_ioctl)
+
+struct gxp_virtual_device_ioctl {
+	/*
+	 * Input:
+	 * The number of cores requested for the virtual device.
+	 */
+	__u8 core_count;
+	/*
+	 * Input:
+	 * The number of threads requested per core.
+	 */
+	__u16 threads_per_core;
+	/*
+	 * Input:
+	 * The amount of memory requested per core, in kB.
+	 */
+	__u32 memory_per_core;
+	/*
+	 * Output:
+	 * The ID assigned to the virtual device and shared with its cores.
+	 */
+	__u32 vdid;
+};
+
+/* Allocate virtual device. */
+#define GXP_ALLOCATE_VIRTUAL_DEVICE \
+	_IOWR(GXP_IOCTL_BASE, 6, struct gxp_virtual_device_ioctl)
+
+/*
+ * Components for which a client may hold a wakelock.
+ * Acquired by passing these values as `components_to_wake` in
+ * `struct gxp_acquire_wakelock_ioctl` to GXP_ACQUIRE_WAKELOCK and released by
+ * passing these values directly as the argument to GXP_RELEASE_WAKELOCK.
+ *
+ * Multiple wakelocks can be acquired or released at once by passing multiple
+ * components, ORed together.
+ */
+#define WAKELOCK_BLOCK		(1 << 0)
+#define WAKELOCK_VIRTUAL_DEVICE	(1 << 1)
+
+/*
+ * DSP subsystem Power state values for use as `gxp_power_state` in
+ * `struct gxp_acquire_wakelock_ioctl`.
+ * Note: GXP_POWER_STATE_READY is the state to keep the BLOCK idle. By setting
+ * this state, the driver will request UUD frequency and switch the CMUMUX
+ * clocks into 25 MHz to save more power.
+ */
+#define GXP_POWER_STATE_OFF	0
+#define GXP_POWER_STATE_UUD	1
+#define GXP_POWER_STATE_SUD	2
+#define GXP_POWER_STATE_UD	3
+#define GXP_POWER_STATE_NOM	4
+#define GXP_POWER_STATE_READY	5
+
+/*
+ * Memory interface power state values for use as `memory_power_state` in
+ * `struct gxp_acquire_wakelock_ioctl`.
+ */
+#define MEMORY_POWER_STATE_UNDEFINED	0
+#define MEMORY_POWER_STATE_MIN		1
+#define MEMORY_POWER_STATE_VERY_LOW	2
+#define MEMORY_POWER_STATE_LOW		3
+#define MEMORY_POWER_STATE_HIGH		4
+#define MEMORY_POWER_STATE_VERY_HIGH	5
+#define MEMORY_POWER_STATE_MAX		6
+
+/*
+ * GXP power flag macros, supported by `flags` in `gxp_acquire_wakelock_ioctl`
+ * and `power_flags in `gxp_mailbox_command_ioctl`.
+ * The client can request non-aggressor vote by this flag, which means if the
+ * requested voltage is lower than the current voltage of VDD_CAM, adopt the
+ * current voltage of VDD_CAM for DSP. On the other hand, if the requested
+ * voltage is higher, adopt the requested one for DSP.
+ *
+ * Note: aggressor votes will have higher priority than non-aggressor votes.
+ */
+#define GXP_POWER_NON_AGGRESSOR		(1 << 0)
+
+struct gxp_acquire_wakelock_ioctl {
+	/*
+	 * The components for which a wakelock will be acquired.
+	 * Should be one of WAKELOCK_BLOCK or WAKELOCK_VIRTUAL_DEVICE, or a
+	 * bitwise OR of both.
+	 *
+	 * A VIRTUAL_DEVICE wakelock cannot be acquired until the client has
+	 * allocated a virtual device. To acquire a VIRTUAL_DEVICE wakelock, a
+	 * client must already have acquired a BLOCK wakelock or acquire both
+	 * in the same call.
+	 */
+	__u32 components_to_wake;
+	/*
+	 * Minimum power state to operate the entire DSP subsystem at until
+	 * the BLOCK wakelock is released. One of the GXP_POWER_STATE_* defines
+	 * from above. Note that the requested power state will not be cleared
+	 * if only the VIRTUAL_DEVICE wakelock is released.
+	 *
+	 * `GXP_POWER_STATE_OFF` is not a valid value when acquiring a
+	 * wakelock.
+	 */
+	__u32 gxp_power_state;
+	/*
+	 * Memory interface power state to request from the system so long as
+	 * the BLOCK wakelock is held. One of the MEMORY_POWER_STATE* defines
+	 * from above. The requested memory power state will not be cleared if
+	 * only the VIRTUAL_DEVICE wakelock is released.
+	 *
+	 * If `MEMORY_POWER_STATE_UNDEFINED` is passed, no request to change
+	 * the memory interface power state will be made.
+	 */
+	__u32 memory_power_state;
+	/*
+	 * How long to wait, in microseconds, before returning if insufficient
+	 * physical cores are available when attempting to acquire a
+	 * VIRTUAL_DEVICE wakelock. A value of 0 indicates that the IOCTL
+	 * should not wait at all if cores are not available.
+	 */
+	__u32 vd_timeout_us;
+	/*
+	 * Flags indicating power attribute requests from the runtime.
+	 * Set RESERVED bits to 0 to ensure backwards compatibility.
+	 *
+	 * Bitfields:
+	 *   [0:0]   - NON_AGGRESSOR setting for ACPM:
+	 *               0 = AGGRESSOR, default value
+	 *               1 = NON_AGGRESSOR
+	 *             If the client makes a NON_AGGRESSOR request, the DSP is
+	 *             only guaranteed to operate at `gxp_power_state` when it
+	 *             is the only component active on its voltage rail. If
+	 *             another component becomes active on the rail, at any
+	 *             point while a NON_AGGRESSOR request is active, the rail
+	 *             will defer to the other component's requested state.
+	 *
+	 *             Note: An AGGRESSOR request from any client overrides all
+	 *             NON_AGGRESSOR requests. At that point, the DSP will
+	 *             operate at the AGGRESSOR request's `gxp_power_state`,
+	 *             regardless of other components on the DSP's rail or what
+	 *             power state any NON_AGGRESSOR requests specified.
+	 *   [31:1]  - RESERVED
+	 */
+	__u32 flags;
+};
+
+/*
+ * Acquire a wakelock and request minimum power states for the DSP subsystem
+ * and the memory interface.
+ *
+ * Upon a successful return, the specified components will be powered on and if
+ * they were not already running at the specified or higher power states,
+ * requests will have been sent to transition both the DSP subsystem and
+ * memory interface to the specified states.
+ *
+ * If the same client invokes this IOCTL for the same component more than once
+ * without a corresponding call to `GXP_RELEASE_WAKE_LOCK` in between, the
+ * second call will update requested power states, but have no other effects.
+ * No additional call to `GXP_RELEASE_WAKE_LOCK` will be required.
+ *
+ * If a client attempts to acquire a VIRTUAL_DEVICE wakelock and there are
+ * insufficient physical cores available, the driver will wait up to
+ * `vd_timeout_us` microseconds, then return -EBUSY if sufficient cores were
+ * never made available. In this case, if both BLOCK and VIRTUAL_DEVICE
+ * wakelocks were being requested, neither will have been acquired.
+ */
+#define GXP_ACQUIRE_WAKE_LOCK                                                  \
+	_IOW(GXP_IOCTL_BASE, 25, struct gxp_acquire_wakelock_ioctl)
+
+/*
+ * Legacy "acquire wakelock" IOCTL that does not support power flags.
+ * This IOCTL exists for backwards compatibility with older runtimes. All other
+ * fields are the same as in `struct gxp_acquire_wakelock_ioctl`.
+ */
+struct gxp_acquire_wakelock_compat_ioctl {
+	__u32 components_to_wake;
+	__u32 gxp_power_state;
+	__u32 memory_power_state;
+	__u32 vd_timeout_us;
+};
+
+#define GXP_ACQUIRE_WAKE_LOCK_COMPAT                                           \
+	_IOW(GXP_IOCTL_BASE, 18, struct gxp_acquire_wakelock_compat_ioctl)
+
+/*
+ * Release a wakelock acquired via `GXP_ACQUIRE_WAKE_LOCK`.
+ *
+ * The argument should be one of WAKELOCK_BLOCK or WAKELOCK_VIRTUAL_DEVICE, or a
+ * bitwise OR of both.
+ *
+ * Upon releasing a VIRTUAL_DEVICE wakelock, a client's virtual device will be
+ * removed from physical cores. At that point the cores may be reallocated to
+ * another client or powered down.
+ *
+ * If no clients hold a BLOCK wakelock, the entire DSP subsytem may be powered
+ * down. If a client attempts to release a BLOCK wakelock while still holding
+ * a VIRTUAL_DEVICE wakelock, this IOCTL will return -EBUSY.
+ *
+ * If a client attempts to release a wakelock it does not hold, this IOCTL will
+ * return -ENODEV.
+ */
+#define GXP_RELEASE_WAKE_LOCK _IOW(GXP_IOCTL_BASE, 19, __u32)
+
+/* GXP map flag macros */
+/* The mask for specifying DMA direction in GXP map flag */
+#define GXP_MAP_DIR_MASK		3
+/* The targeted DMA direction for the buffer */
+#define GXP_MAP_DMA_BIDIRECTIONAL	0
+#define GXP_MAP_DMA_TO_DEVICE		1
+#define GXP_MAP_DMA_FROM_DEVICE		2
 
 struct gxp_map_ioctl {
 	/*
@@ -130,439 +382,6 @@ struct gxp_sync_ioctl {
  */
 #define GXP_SYNC_BUFFER \
 	_IOW(GXP_IOCTL_BASE, 2, struct gxp_sync_ioctl)
-
-struct gxp_mailbox_command_compat_ioctl {
-	/*
-	 * Input:
-	 * The virtual core to dispatch the command to.
-	 */
-	__u16 virtual_core_id;
-	/*
-	 * Output:
-	 * The sequence number assigned to this command. The caller can use
-	 * this value to match responses fetched via `GXP_MAILBOX_RESPONSE`
-	 * with this command.
-	 */
-	__u64 sequence_number;
-	/*
-	 * Input:
-	 * Device address to the buffer containing a GXP command. The user
-	 * should have obtained this address from the GXP_MAP_BUFFER ioctl.
-	 */
-	__u64 device_address;
-	/*
-	 * Input:
-	 * Size of the buffer at `device_address` in bytes.
-	 */
-	__u32 size;
-	/*
-	 * Input:
-	 * Flags describing the command, for use by the GXP device.
-	 */
-	__u32 flags;
-};
-
-/*
- * Push element to the mailbox commmand queue.
- *
- * The client must hold a VIRTUAL_DEVICE wakelock.
- */
-#define GXP_MAILBOX_COMMAND_COMPAT \
-	_IOW(GXP_IOCTL_BASE, 3, struct gxp_mailbox_command_compat_ioctl)
-
-/* GXP mailbox response error code values */
-#define GXP_RESPONSE_ERROR_NONE         (0)
-#define GXP_RESPONSE_ERROR_INTERNAL     (1)
-#define GXP_RESPONSE_ERROR_TIMEOUT      (2)
-
-struct gxp_mailbox_response_ioctl {
-	/*
-	 * Input:
-	 * The virtual core to fetch a response from.
-	 */
-	__u16 virtual_core_id;
-	/*
-	 * Output:
-	 * Sequence number indicating which command this response is for.
-	 */
-	__u64 sequence_number;
-	/*
-	 * Output:
-	 * Driver error code.
-	 * Indicates if the response was obtained successfully,
-	 * `GXP_RESPONSE_ERROR_NONE`, or what error prevented the command
-	 * from completing successfully.
-	 */
-	__u16 error_code;
-	/*
-	 * Output:
-	 * Value returned by firmware in response to a command.
-	 * Only valid if `error_code` == GXP_RESPONSE_ERROR_NONE
-	 */
-	__u32 cmd_retval;
-};
-
-/*
- * Pop element from the mailbox response queue. Blocks until mailbox response
- * is available.
- *
- * The client must hold a VIRTUAL_DEVICE wakelock.
- */
-#define GXP_MAILBOX_RESPONSE \
-	_IOWR(GXP_IOCTL_BASE, 4, struct gxp_mailbox_response_ioctl)
-
-struct gxp_specs_ioctl {
-	__u8 core_count;
-	__u16 version_major;
-	__u16 version_minor;
-	__u16 version_build;
-	__u8 threads_per_core;
-	__u32 memory_per_core;		/* measured in kB */
-};
-
-/* Query system specs. */
-#define GXP_GET_SPECS \
-	_IOR(GXP_IOCTL_BASE, 5, struct gxp_specs_ioctl)
-
-struct gxp_virtual_device_ioctl {
-	/*
-	 * Input:
-	 * The number of cores requested for the virtual device.
-	 */
-	__u8 core_count;
-	/*
-	 * Input:
-	 * The number of threads requested per core.
-	 */
-	__u16 threads_per_core;
-	/*
-	 * Input:
-	 * The amount of memory requested per core, in kB.
-	 */
-	__u32 memory_per_core;
-	/*
-	 * Output:
-	 * The ID assigned to the virtual device and shared with its cores.
-	 */
-	__u32 vdid;
-};
-
-/* Allocate virtual device. */
-#define GXP_ALLOCATE_VIRTUAL_DEVICE \
-	_IOWR(GXP_IOCTL_BASE, 6, struct gxp_virtual_device_ioctl)
-
-#define ETM_TRACE_LSB_MASK 0x1
-#define ETM_TRACE_SYNC_MSG_PERIOD_MIN 8
-#define ETM_TRACE_SYNC_MSG_PERIOD_MAX 256
-#define ETM_TRACE_PC_MATCH_MASK_LEN_MAX 31
-
-/*
- * For all *_enable and pc_match_sense fields, only the least significant bit is
- * considered. All other bits are ignored.
- */
-struct gxp_etm_trace_start_ioctl {
-	__u16 virtual_core_id;
-	__u8 trace_ram_enable; /* Enables local trace memory. */
-	/* When set, trace output is sent out on the ATB interface. */
-	__u8 atb_enable;
-	/* Enables embedding timestamp information in trace messages. */
-	__u8 timestamp_enable;
-	/*
-	 * Determines the rate at which synchronization messages are
-	 * automatically emitted in the output trace.
-	 * Valid values: 0, 8, 16, 32, 64, 128, 256
-	 * Eg. A value of 16 means 1 synchronization message will be emitted
-	 * every 16 messages.
-	 * A value of 0 means no synchronization messages will be emitted.
-	 */
-	__u16 sync_msg_period;
-	__u8 pc_match_enable; /* PC match causes Stop trigger. */
-	/*
-	 * 32-bit address to compare to processor PC when pc_match_enable = 1.
-	 * A match for a given executed instruction triggers trace stop.
-	 * Note: trigger_pc is ignored when pc_match_enable = 0.
-	 */
-	__u32 trigger_pc;
-	/*
-	 * Indicates how many of the lower bits of trigger_pc to ignore.
-	 * Valid values: 0 to 31
-	 * Note: pc_match_mask_length is ignored when pc_match_enable = 0.
-	 */
-	__u8 pc_match_mask_length;
-	/* When 0, match when the processor's PC is in-range of trigger_pc and
-	 * mask. When 1, match when the processor's PC is out-of-range of
-	 * trigger_pc and mask.
-	 * Note: pc_match_sense is ignored when pc_match_enable = 0.
-	 */
-	__u8 pc_match_sense;
-};
-
-/* Configure ETM trace registers and start ETM tracing. */
-#define GXP_ETM_TRACE_START_COMMAND \
-	_IOW(GXP_IOCTL_BASE, 7, struct gxp_etm_trace_start_ioctl)
-
-/*
- * Halts trace generation via a software trigger. The virtual core id is passed
- * in as an input.
- */
-#define GXP_ETM_TRACE_SW_STOP_COMMAND \
-	_IOW(GXP_IOCTL_BASE, 8, __u16)
-
-/*
- * Users should call this IOCTL after tracing has been stopped for the last
- * trace session of the core. Otherwise, there is a risk of having up to 3 bytes
- * of trace data missing towards the end of the trace session.
- * This is a workaround for b/180728272 and b/181623511.
- * The virtual core id is passed in as an input.
- */
-#define GXP_ETM_TRACE_CLEANUP_COMMAND \
-	_IOW(GXP_IOCTL_BASE, 9, __u16)
-
-#define GXP_TRACE_HEADER_SIZE 256
-#define GXP_TRACE_RAM_SIZE 4096
-struct gxp_etm_get_trace_info_ioctl {
-	/*
-	 * Input:
-	 * The virtual core to fetch a response from.
-	 */
-	__u16 virtual_core_id;
-	/*
-	 * Input:
-	 * The type of data to retrieve.
-	 * 0: Trace Header only
-	 * 1: Trace Header + Trace Data in Trace RAM
-	 */
-	__u8 type;
-	/*
-	 * Input:
-	 * Trace header user space address to contain trace header information
-	 * that is used for decoding the trace.
-	 */
-	__u64 trace_header_addr;
-	/*
-	 * Input:
-	 * Trace data user space address to contain Trace RAM data.
-	 * Note: trace_data field will be empty if type == 0
-	 */
-	__u64 trace_data_addr;
-};
-
-/* Retrieves trace header and/or trace data for decoding purposes. */
-#define GXP_ETM_GET_TRACE_INFO_COMMAND \
-	_IOWR(GXP_IOCTL_BASE, 10, struct gxp_etm_get_trace_info_ioctl)
-
-#define GXP_TELEMETRY_TYPE_LOGGING	(0)
-#define GXP_TELEMETRY_TYPE_TRACING	(1)
-
-/*
- * Enable either logging or software tracing for all cores.
- * Accepts either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
- * to specify whether logging or software tracing is to be enabled.
- *
- * Buffers for logging or tracing must have already been mapped via an `mmap()`
- * call with the respective offset and initialized by the client, prior to
- * calling this ioctl.
- *
- * If firmware is already running on any cores, they will be signaled to begin
- * logging/tracing to their buffers. Any cores booting after this call will
- * begin logging/tracing as soon as their firmware is able to.
- */
-#define GXP_ENABLE_TELEMETRY _IOWR(GXP_IOCTL_BASE, 11, __u8)
-
-/*
- * Disable either logging or software tracing for all cores.
- * Accepts either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
- * to specify whether logging or software tracing is to be disabled.
- *
- * This call will block until any running cores have been notified and ACKed
- * that they have disabled the specified telemetry type.
- */
-#define GXP_DISABLE_TELEMETRY _IOWR(GXP_IOCTL_BASE, 12, __u8)
-
-struct gxp_tpu_mbx_queue_ioctl {
-	__u32 tpu_fd; /* TPU virtual device group fd */
-	/*
-	 * Bitfield indicating which virtual cores to allocate and map the
-	 * buffers for.
-	 * To map for virtual core X, set bit X in this field, i.e. `1 << X`.
-	 *
-	 * This field is not used by the unmap IOCTL, which always unmaps the
-	 * buffers for all cores it had been mapped for.
-	 */
-	__u32 virtual_core_list;
-	/*
-	 * The user address of an edgetpu_mailbox_attr struct, containing
-	 * cmd/rsp queue size, mailbox priority and other relevant info.
-	 * This structure is defined in edgetpu.h in the TPU driver.
-	 */
-	__u64 attr_ptr;
-};
-
-/*
- * Map TPU-DSP mailbox cmd/rsp queue buffers.
- */
-#define GXP_MAP_TPU_MBX_QUEUE \
-	_IOW(GXP_IOCTL_BASE, 13, struct gxp_tpu_mbx_queue_ioctl)
-
-/*
- * Un-map TPU-DSP mailbox cmd/rsp queue buffers previously mapped by
- * GXP_MAP_TPU_MBX_QUEUE.
- *
- * Only the @tpu_fd field will be used. Other fields will be fetched
- * from the kernel's internal records. It is recommended to use the argument
- * that was passed in GXP_MAP_TPU_MBX_QUEUE to un-map the buffers.
- */
-#define GXP_UNMAP_TPU_MBX_QUEUE \
-	_IOW(GXP_IOCTL_BASE, 14, struct gxp_tpu_mbx_queue_ioctl)
-
-struct gxp_register_telemetry_eventfd_ioctl {
-	/*
-	 * File-descriptor obtained via eventfd().
-	 *
-	 * Not used during the unregister step; the driver will unregister
-	 * whichever eventfd it has currently registered for @type, if any.
-	 */
-	__u32 eventfd;
-	/*
-	 * Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`.
-	 * The driver will signal @eventfd whenever any core signals a
-	 * telemetry state change while this type of telemetry is active.
-	 */
-	__u8 type;
-};
-
-#define GXP_REGISTER_TELEMETRY_EVENTFD                                         \
-	_IOW(GXP_IOCTL_BASE, 15, struct gxp_register_telemetry_eventfd_ioctl)
-
-#define GXP_UNREGISTER_TELEMETRY_EVENTFD                                       \
-	_IOW(GXP_IOCTL_BASE, 16, struct gxp_register_telemetry_eventfd_ioctl)
-
-/*
- * Reads the 2 global counter registers in AURORA_TOP and combines them to
- * return the full 64-bit value of the counter.
- */
-#define GXP_READ_GLOBAL_COUNTER _IOR(GXP_IOCTL_BASE, 17, __u64)
-
-/*
- * Components for which a client may hold a wakelock.
- * Acquired by passing these values as `components_to_wake` in
- * `struct gxp_acquire_wakelock_ioctl` to GXP_ACQUIRE_WAKELOCK and released by
- * passing these values directly as the argument to GXP_RELEASE_WAKELOCK.
- *
- * Multiple wakelocks can be acquired or released at once by passing multiple
- * components, ORed together.
- */
-#define WAKELOCK_BLOCK		(1 << 0)
-#define WAKELOCK_VIRTUAL_DEVICE	(1 << 1)
-
-/*
- * DSP subsystem Power state values for use as `gxp_power_state` in
- * `struct gxp_acquire_wakelock_ioctl`.
- * Note: GXP_POWER_STATE_READY is the state to keep the BLOCK idle. By setting
- * this state, the driver will request UUD frequency and switch the CMUMUX
- * clocks into 25 MHz to save more power.
- */
-#define GXP_POWER_STATE_OFF	0
-#define GXP_POWER_STATE_UUD	1
-#define GXP_POWER_STATE_SUD	2
-#define GXP_POWER_STATE_UD	3
-#define GXP_POWER_STATE_NOM	4
-#define GXP_POWER_STATE_READY	5
-
-/*
- * Memory interface power state values for use as `memory_power_state` in
- * `struct gxp_acquire_wakelock_ioctl`.
- */
-#define MEMORY_POWER_STATE_UNDEFINED	0
-#define MEMORY_POWER_STATE_MIN		1
-#define MEMORY_POWER_STATE_VERY_LOW	2
-#define MEMORY_POWER_STATE_LOW		3
-#define MEMORY_POWER_STATE_HIGH		4
-#define MEMORY_POWER_STATE_VERY_HIGH	5
-#define MEMORY_POWER_STATE_MAX		6
-
-struct gxp_acquire_wakelock_ioctl {
-	/*
-	 * The components for which a wakelock will be acquired.
-	 * Should be one of WAKELOCK_BLOCK or WAKELOCK_VIRTUAL_DEVICE, or a
-	 * bitwise OR of both.
-	 *
-	 * A VIRTUAL_DEVICE wakelock cannot be acquired until the client has
-	 * allocated a virtual device. To acquire a VIRTUAL_DEVICE wakelock, a
-	 * client must already have acquired a BLOCK wakelock or acquire both
-	 * in the same call.
-	 */
-	__u32 components_to_wake;
-	/*
-	 * Minimum power state to operate the entire DSP subsystem at until
-	 * the BLOCK wakelock is released. One of the GXP_POWER_STATE_* defines
-	 * from above. Note that the requested power state will not be cleared
-	 * if only the VIRTUAL_DEVICE wakelock is released.
-	 *
-	 * `GXP_POWER_STATE_OFF` is not a valid value when acquiring a
-	 * wakelock.
-	 */
-	__u32 gxp_power_state;
-	/*
-	 * Memory interface power state to request from the system so long as
-	 * the BLOCK wakelock is held. One of the MEMORY_POWER_STATE* defines
-	 * from above. The requested memory power state will not be cleared if
-	 * only the VIRTUAL_DEVICE wakelock is released.
-	 *
-	 * If `MEMORY_POWER_STATE_UNDEFINED` is passed, no request to change
-	 * the memory interface power state will be made.
-	 */
-	__u32 memory_power_state;
-	/*
-	 * How long to wait, in microseconds, before returning if insufficient
-	 * physical cores are available when attempting to acquire a
-	 * VIRTUAL_DEVICE wakelock. A value of 0 indicates that the IOCTL
-	 * should not wait at all if cores are not available.
-	 */
-	__u32 vd_timeout_us;
-};
-
-/*
- * Acquire a wakelock and request minimum power states for the DSP subsystem
- * and the memory interface.
- *
- * Upon a successful return, the specified components will be powered on and if
- * they were not already running at the specified or higher power states,
- * requests will have been sent to transition both the DSP subsystem and
- * memory interface to the specified states.
- *
- * If the same client invokes this IOCTL for the same component more than once
- * without a corresponding call to `GXP_RELEASE_WAKE_LOCK` in between, the
- * second call will update requested power states, but have no other effects.
- * No additional call to `GXP_RELEASE_WAKE_LOCK` will be required.
- *
- * If a client attempts to acquire a VIRTUAL_DEVICE wakelock and there are
- * insufficient physical cores available, the driver will wait up to
- * `vd_timeout_us` microseconds, then return -EBUSY if sufficient cores were
- * never made available. In this case, if both BLOCK and VIRTUAL_DEVICE
- * wakelocks were being requested, neither will have been acquired.
- */
-#define GXP_ACQUIRE_WAKE_LOCK                                                  \
-	_IOW(GXP_IOCTL_BASE, 18, struct gxp_acquire_wakelock_ioctl)
-
-/*
- * Release a wakelock acquired via `GXP_ACQUIRE_WAKE_LOCK`.
- *
- * The argument should be one of WAKELOCK_BLOCK or WAKELOCK_VIRTUAL_DEVICE, or a
- * bitwise OR of both.
- *
- * Upon releasing a VIRTUAL_DEVICE wakelock, a client's virtual device will be
- * removed from physical cores. At that point the cores may be reallocated to
- * another client or powered down.
- *
- * If no clients hold a BLOCK wakelock, the entire DSP subsytem may be powered
- * down. If a client attempts to release a BLOCK wakelock while still holding
- * a VIRTUAL_DEVICE wakelock, this IOCTL will return -EBUSY.
- *
- * If a client attempts to release a wakelock it does not hold, this IOCTL will
- * return -ENODEV.
- */
-#define GXP_RELEASE_WAKE_LOCK _IOW(GXP_IOCTL_BASE, 19, __u32)
 
 struct gxp_map_dmabuf_ioctl {
 	/*
@@ -669,9 +488,17 @@ struct gxp_mailbox_command_ioctl {
 	__u32 flags;
 	/*
 	 * Input:
-	 * Flags relevant to the power state requests. Currently reserved.
+	 * Flags indicating power attribute requests from the runtime.
+	 * Set RESERVED bits to 0 to ensure backwards compatibility.
+	 *
+	 * Bitfields:
+	 *   [0:0]   - NON_AGGRESSOR setting for ACPM:
+	 *               0 = AGGRESSOR, default value
+	 *               1 = NON_AGGRESSOR
+	 *             Note: It takes effect only if every client holds a
+	 *             wakelock with NON_AGGRESSOR.
+	 *   [31:1]  - RESERVED
 	 */
-	/* TODO(221320387): Document the flags once support is implemented. */
 	__u32 power_flags;
 };
 
@@ -682,6 +509,65 @@ struct gxp_mailbox_command_ioctl {
  */
 #define GXP_MAILBOX_COMMAND \
 	_IOWR(GXP_IOCTL_BASE, 23, struct gxp_mailbox_command_ioctl)
+
+/*
+ * Legacy "mailbox command" IOCTL that does not support power requests.
+ * This IOCTL exists for backwards compatibility with older runtimes. All
+ * fields, other than the unsupported `gxp_power_state`, `memory_power_state`,
+ * and `power_flags`, are the same as in `struct gxp_mailbox_command_ioctl`.
+ */
+struct gxp_mailbox_command_compat_ioctl {
+	__u16 virtual_core_id;
+	__u64 sequence_number;
+	__u64 device_address;
+	__u32 size;
+	__u32 flags;
+};
+
+/* The client must hold a VIRTUAL_DEVICE wakelock. */
+#define GXP_MAILBOX_COMMAND_COMPAT \
+	_IOW(GXP_IOCTL_BASE, 3, struct gxp_mailbox_command_compat_ioctl)
+
+/* GXP mailbox response error code values */
+#define GXP_RESPONSE_ERROR_NONE         (0)
+#define GXP_RESPONSE_ERROR_INTERNAL     (1)
+#define GXP_RESPONSE_ERROR_TIMEOUT      (2)
+
+struct gxp_mailbox_response_ioctl {
+	/*
+	 * Input:
+	 * The virtual core to fetch a response from.
+	 */
+	__u16 virtual_core_id;
+	/*
+	 * Output:
+	 * Sequence number indicating which command this response is for.
+	 */
+	__u64 sequence_number;
+	/*
+	 * Output:
+	 * Driver error code.
+	 * Indicates if the response was obtained successfully,
+	 * `GXP_RESPONSE_ERROR_NONE`, or what error prevented the command
+	 * from completing successfully.
+	 */
+	__u16 error_code;
+	/*
+	 * Output:
+	 * Value returned by firmware in response to a command.
+	 * Only valid if `error_code` == GXP_RESPONSE_ERROR_NONE
+	 */
+	__u32 cmd_retval;
+};
+
+/*
+ * Pop element from the mailbox response queue. Blocks until mailbox response
+ * is available.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_MAILBOX_RESPONSE \
+	_IOWR(GXP_IOCTL_BASE, 4, struct gxp_mailbox_response_ioctl)
 
 struct gxp_register_mailbox_eventfd_ioctl {
 	/*
@@ -709,10 +595,231 @@ struct gxp_register_mailbox_eventfd_ioctl {
 	__u16 virtual_core_id;
 };
 
+/*
+ * Register an eventfd to be signaled whenever the specified virtual core
+ * sends a mailbox response.
+ *
+ * The client must have allocated a virtual device.
+ */
 #define GXP_REGISTER_MAILBOX_EVENTFD                                           \
 	_IOW(GXP_IOCTL_BASE, 22, struct gxp_register_mailbox_eventfd_ioctl)
 
+/*
+ * Clear a previously registered mailbox response eventfd.
+ *
+ * The client must have allocated a virtual device.
+ */
 #define GXP_UNREGISTER_MAILBOX_EVENTFD                                         \
 	_IOW(GXP_IOCTL_BASE, 24, struct gxp_register_mailbox_eventfd_ioctl)
+
+#define ETM_TRACE_LSB_MASK 0x1
+#define ETM_TRACE_SYNC_MSG_PERIOD_MIN 8
+#define ETM_TRACE_SYNC_MSG_PERIOD_MAX 256
+#define ETM_TRACE_PC_MATCH_MASK_LEN_MAX 31
+
+/*
+ * For all *_enable and pc_match_sense fields, only the least significant bit is
+ * considered. All other bits are ignored.
+ */
+struct gxp_etm_trace_start_ioctl {
+	__u16 virtual_core_id;
+	__u8 trace_ram_enable; /* Enables local trace memory. */
+	/* When set, trace output is sent out on the ATB interface. */
+	__u8 atb_enable;
+	/* Enables embedding timestamp information in trace messages. */
+	__u8 timestamp_enable;
+	/*
+	 * Determines the rate at which synchronization messages are
+	 * automatically emitted in the output trace.
+	 * Valid values: 0, 8, 16, 32, 64, 128, 256
+	 * Eg. A value of 16 means 1 synchronization message will be emitted
+	 * every 16 messages.
+	 * A value of 0 means no synchronization messages will be emitted.
+	 */
+	__u16 sync_msg_period;
+	__u8 pc_match_enable; /* PC match causes Stop trigger. */
+	/*
+	 * 32-bit address to compare to processor PC when pc_match_enable = 1.
+	 * A match for a given executed instruction triggers trace stop.
+	 * Note: trigger_pc is ignored when pc_match_enable = 0.
+	 */
+	__u32 trigger_pc;
+	/*
+	 * Indicates how many of the lower bits of trigger_pc to ignore.
+	 * Valid values: 0 to 31
+	 * Note: pc_match_mask_length is ignored when pc_match_enable = 0.
+	 */
+	__u8 pc_match_mask_length;
+	/* When 0, match when the processor's PC is in-range of trigger_pc and
+	 * mask. When 1, match when the processor's PC is out-of-range of
+	 * trigger_pc and mask.
+	 * Note: pc_match_sense is ignored when pc_match_enable = 0.
+	 */
+	__u8 pc_match_sense;
+};
+
+/*
+ * Configure ETM trace registers and start ETM tracing.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_ETM_TRACE_START_COMMAND \
+	_IOW(GXP_IOCTL_BASE, 7, struct gxp_etm_trace_start_ioctl)
+
+/*
+ * Halts trace generation via a software trigger. The virtual core id is passed
+ * in as an input.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_ETM_TRACE_SW_STOP_COMMAND \
+	_IOW(GXP_IOCTL_BASE, 8, __u16)
+
+/*
+ * Users should call this IOCTL after tracing has been stopped for the last
+ * trace session of the core. Otherwise, there is a risk of having up to 3 bytes
+ * of trace data missing towards the end of the trace session.
+ * This is a workaround for b/180728272 and b/181623511.
+ * The virtual core id is passed in as an input.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_ETM_TRACE_CLEANUP_COMMAND \
+	_IOW(GXP_IOCTL_BASE, 9, __u16)
+
+#define GXP_TRACE_HEADER_SIZE 256
+#define GXP_TRACE_RAM_SIZE 4096
+struct gxp_etm_get_trace_info_ioctl {
+	/*
+	 * Input:
+	 * The virtual core to fetch a response from.
+	 */
+	__u16 virtual_core_id;
+	/*
+	 * Input:
+	 * The type of data to retrieve.
+	 * 0: Trace Header only
+	 * 1: Trace Header + Trace Data in Trace RAM
+	 */
+	__u8 type;
+	/*
+	 * Input:
+	 * Trace header user space address to contain trace header information
+	 * that is used for decoding the trace.
+	 */
+	__u64 trace_header_addr;
+	/*
+	 * Input:
+	 * Trace data user space address to contain Trace RAM data.
+	 * Note: trace_data field will be empty if type == 0
+	 */
+	__u64 trace_data_addr;
+};
+
+/*
+ * Retrieves trace header and/or trace data for decoding purposes.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_ETM_GET_TRACE_INFO_COMMAND \
+	_IOWR(GXP_IOCTL_BASE, 10, struct gxp_etm_get_trace_info_ioctl)
+
+#define GXP_TELEMETRY_TYPE_LOGGING	(0)
+#define GXP_TELEMETRY_TYPE_TRACING	(1)
+
+/*
+ * Enable either logging or software tracing for all cores.
+ * Accepts either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ * to specify whether logging or software tracing is to be enabled.
+ *
+ * Buffers for logging or tracing must have already been mapped via an `mmap()`
+ * call with the respective offset and initialized by the client, prior to
+ * calling this ioctl.
+ *
+ * If firmware is already running on any cores, they will be signaled to begin
+ * logging/tracing to their buffers. Any cores booting after this call will
+ * begin logging/tracing as soon as their firmware is able to.
+ */
+#define GXP_ENABLE_TELEMETRY _IOWR(GXP_IOCTL_BASE, 11, __u8)
+
+/*
+ * Disable either logging or software tracing for all cores.
+ * Accepts either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
+ * to specify whether logging or software tracing is to be disabled.
+ *
+ * This call will block until any running cores have been notified and ACKed
+ * that they have disabled the specified telemetry type.
+ */
+#define GXP_DISABLE_TELEMETRY _IOWR(GXP_IOCTL_BASE, 12, __u8)
+
+struct gxp_register_telemetry_eventfd_ioctl {
+	/*
+	 * File-descriptor obtained via eventfd().
+	 *
+	 * Not used during the unregister step; the driver will unregister
+	 * whichever eventfd it has currently registered for @type, if any.
+	 */
+	__u32 eventfd;
+	/*
+	 * Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`.
+	 * The driver will signal @eventfd whenever any core signals a
+	 * telemetry state change while this type of telemetry is active.
+	 */
+	__u8 type;
+};
+
+#define GXP_REGISTER_TELEMETRY_EVENTFD                                         \
+	_IOW(GXP_IOCTL_BASE, 15, struct gxp_register_telemetry_eventfd_ioctl)
+
+#define GXP_UNREGISTER_TELEMETRY_EVENTFD                                       \
+	_IOW(GXP_IOCTL_BASE, 16, struct gxp_register_telemetry_eventfd_ioctl)
+
+/*
+ * Reads the 2 global counter registers in AURORA_TOP and combines them to
+ * return the full 64-bit value of the counter.
+ *
+ * The client must hold a BLOCK wakelock.
+ */
+#define GXP_READ_GLOBAL_COUNTER _IOR(GXP_IOCTL_BASE, 17, __u64)
+
+struct gxp_tpu_mbx_queue_ioctl {
+	__u32 tpu_fd; /* TPU virtual device group fd */
+	/*
+	 * Bitfield indicating which virtual cores to allocate and map the
+	 * buffers for.
+	 * To map for virtual core X, set bit X in this field, i.e. `1 << X`.
+	 *
+	 * This field is not used by the unmap IOCTL, which always unmaps the
+	 * buffers for all cores it had been mapped for.
+	 */
+	__u32 virtual_core_list;
+	/*
+	 * The user address of an edgetpu_mailbox_attr struct, containing
+	 * cmd/rsp queue size, mailbox priority and other relevant info.
+	 * This structure is defined in edgetpu.h in the TPU driver.
+	 */
+	__u64 attr_ptr;
+};
+
+/*
+ * Map TPU-DSP mailbox cmd/rsp queue buffers.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_MAP_TPU_MBX_QUEUE \
+	_IOW(GXP_IOCTL_BASE, 13, struct gxp_tpu_mbx_queue_ioctl)
+
+/*
+ * Un-map TPU-DSP mailbox cmd/rsp queue buffers previously mapped by
+ * GXP_MAP_TPU_MBX_QUEUE.
+ *
+ * Only the @tpu_fd field will be used. Other fields will be fetched
+ * from the kernel's internal records. It is recommended to use the argument
+ * that was passed in GXP_MAP_TPU_MBX_QUEUE to un-map the buffers.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ */
+#define GXP_UNMAP_TPU_MBX_QUEUE \
+	_IOW(GXP_IOCTL_BASE, 14, struct gxp_tpu_mbx_queue_ioctl)
 
 #endif /* __GXP_H__ */
