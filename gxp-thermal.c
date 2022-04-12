@@ -26,19 +26,18 @@
 #include "gxp-thermal.h"
 #include "gxp-lpm.h"
 
-#define MAX_NUM_GXP_STATES 10
-#define OF_DATA_NUM_MAX (MAX_NUM_GXP_STATES * 2)
-
 /*
  * Value comes from internal measurement
- * https://docs.google.com/spreadsheets
- * /d/1owRNFlm9EH-7IsycHXBnctyzGAd5j-VyLQOZ1ysFb7c
+ * b/229623553
  */
-static struct gxp_state_pwr state_pwr_map[MAX_NUM_GXP_STATES] = {
-	{1055000, 180},
-	{750000, 72},
-	{373000, 21},
-	{178000, 10},
+static struct gxp_state_pwr state_pwr_map[] = {
+	{1155000, 78},
+	{975000, 58},
+	{750000, 40},
+	{560000, 27},
+	{373000, 20},
+	{268000, 16},
+	{178000, 13},
 };
 
 static int gxp_get_max_state(struct thermal_cooling_device *cdev,
@@ -82,7 +81,9 @@ static int gxp_set_cur_state(struct thermal_cooling_device *cdev,
 	if (cooling_state != thermal->cooling_state) {
 #ifdef CONFIG_GXP_CLOUDRIPPER
 		ret = exynos_acpm_set_policy(AUR_DVFS_DOMAIN,
-			pwr_state < AUR_UUD ? AUR_UUD : pwr_state);
+			pwr_state < aur_power_state2rate[AUR_UUD] ?
+			aur_power_state2rate[AUR_UUD] :
+			pwr_state);
 #endif
 		if (ret) {
 			dev_err(dev,
