@@ -460,6 +460,9 @@ static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 	if (!mailbox->response_wq)
 		goto err_workqueue;
 
+	/* Initialize driver before interacting with its registers */
+	gxp_mailbox_driver_init(mailbox);
+
 	return mailbox;
 
 err_workqueue:
@@ -499,6 +502,8 @@ static void enable_mailbox(struct gxp_mailbox *mailbox)
 	mutex_init(&mailbox->wait_list_lock);
 	INIT_WORK(&mailbox->response_work, gxp_mailbox_consume_responses_work);
 
+	/* Only enable interrupts once everything has been setup */
+	gxp_mailbox_driver_enable_interrupts(mailbox);
 	/* Enable the mailbox */
 	gxp_mailbox_write_status(mailbox, 1);
 	/* TODO(b/190868834) define interrupt bits */
@@ -537,12 +542,12 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 	}
 
 	/*
-	 * Halt the mailbox driver.
+	 * Halt the mailbox driver by preventing any incoming requests..
 	 * This must happen before the mailbox itself is cleaned-up/released
 	 * to make sure the mailbox does not disappear out from under the
 	 * mailbox driver. This also halts all incoming responses/interrupts.
 	 */
-	gxp_mailbox_driver_exit(mailbox);
+	gxp_mailbox_driver_disable_interrupts(mailbox);
 
 	/* Halt and flush any traffic */
 	cancel_work_sync(&mailbox->response_work);
@@ -599,6 +604,9 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 
 	/* Reset the mailbox HW */
 	gxp_mailbox_reset_hw(mailbox);
+
+	/* Cleanup now that all mailbox interactions are finished */
+	gxp_mailbox_driver_exit(mailbox);
 
 	/*
 	 * At this point all users of the mailbox have been halted or are

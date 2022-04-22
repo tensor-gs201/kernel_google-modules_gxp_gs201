@@ -5,10 +5,12 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#include <asm/barrier.h>
 #include <linux/bitops.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
 #include <linux/of_irq.h>
+#include <linux/spinlock.h>
 
 #include "gxp-mailbox-driver.h"
 #include "gxp-mailbox-regs.h"
@@ -111,10 +113,21 @@ static void unregister_irq(struct gxp_mailbox *mailbox)
 
 void gxp_mailbox_driver_init(struct gxp_mailbox *mailbox)
 {
-	register_irq(mailbox);
+	spin_lock_init(&mailbox->cmd_tail_resp_head_lock);
+	spin_lock_init(&mailbox->cmd_head_resp_tail_lock);
 }
 
 void gxp_mailbox_driver_exit(struct gxp_mailbox *mailbox)
+{
+	/* Nothing to cleanup */
+}
+
+void gxp_mailbox_driver_enable_interrupts(struct gxp_mailbox *mailbox)
+{
+	register_irq(mailbox);
+}
+
+void gxp_mailbox_driver_disable_interrupts(struct gxp_mailbox *mailbox)
 {
 	unregister_irq(mailbox);
 }
@@ -139,6 +152,16 @@ void gxp_mailbox_reset_hw(struct gxp_mailbox *mailbox)
 void gxp_mailbox_generate_device_interrupt(struct gxp_mailbox *mailbox,
 					   u32 int_mask)
 {
+	/*
+	 * Ensure all memory writes have been committed to memory before
+	 * signalling to the device to read from them. This avoids the scenario
+	 * where the interrupt trigger write gets delivered to the MBX HW before
+	 * the DRAM transactions made it to DRAM since they're Normal
+	 * transactions and can be re-ordered and backed off behind other
+	 * transfers.
+	 */
+	wmb();
+
 	csr_write(mailbox, MBOX_INTGR0_OFFSET, int_mask);
 }
 
@@ -177,72 +200,124 @@ void gxp_mailbox_write_descriptor(struct gxp_mailbox *mailbox,
 
 void gxp_mailbox_write_cmd_queue_tail(struct gxp_mailbox *mailbox, u16 val)
 {
-	u32 current_resp_head =
-		data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET) &
-		RESP_HEAD_MASK;
-	u32 new_cmd_tail = (u32)val << CMD_TAIL_SHIFT;
+	u32 current_resp_head;
+	u32 new_cmd_tail;
+	unsigned long flags;
 
+	spin_lock_irqsave(&mailbox->cmd_tail_resp_head_lock, flags);
+
+	current_resp_head = data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET) &
+				      RESP_HEAD_MASK;
+	new_cmd_tail = (u32)val << CMD_TAIL_SHIFT;
 	data_write(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET,
 		   new_cmd_tail | current_resp_head);
+
+	spin_unlock_irqrestore(&mailbox->cmd_tail_resp_head_lock, flags);
 }
 
 void gxp_mailbox_write_resp_queue_head(struct gxp_mailbox *mailbox, u16 val)
 {
-	u32 current_cmd_tail =
-		data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET) &
-		CMD_TAIL_MASK;
-	u32 new_resp_head = (u32)val << RESP_HEAD_SHIFT;
+	u32 current_cmd_tail;
+	u32 new_resp_head;
+	unsigned long flags;
 
+	spin_lock_irqsave(&mailbox->cmd_tail_resp_head_lock, flags);
+
+	current_cmd_tail = data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET) &
+				     CMD_TAIL_MASK;
+	new_resp_head = (u32)val << RESP_HEAD_SHIFT;
 	data_write(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET,
 		   current_cmd_tail | new_resp_head);
+
+	spin_unlock_irqrestore(&mailbox->cmd_tail_resp_head_lock, flags);
 }
 
 u16 gxp_mailbox_read_cmd_queue_head(struct gxp_mailbox *mailbox)
 {
-	u32 reg_val = data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET);
+	u32 reg_val;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mailbox->cmd_head_resp_tail_lock, flags);
+
+	reg_val = data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET);
+
+	spin_unlock_irqrestore(&mailbox->cmd_head_resp_tail_lock, flags);
 
 	return (u16)((reg_val & CMD_HEAD_MASK) >> CMD_HEAD_SHIFT);
 }
 
 u16 gxp_mailbox_read_resp_queue_tail(struct gxp_mailbox *mailbox)
 {
-	u32 reg_val = data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET);
+	u32 reg_val;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mailbox->cmd_head_resp_tail_lock, flags);
+
+	reg_val = data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET);
+
+	spin_unlock_irqrestore(&mailbox->cmd_head_resp_tail_lock, flags);
 
 	return (u16)((reg_val & RESP_TAIL_MASK) >> RESP_TAIL_SHIFT);
 }
 
 void gxp_mailbox_write_cmd_queue_head(struct gxp_mailbox *mailbox, u16 val)
 {
-	u32 current_resp_tail =
-		data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET) &
-		RESP_TAIL_MASK;
-	u32 new_cmd_head = (u32)val << CMD_HEAD_SHIFT;
+	u32 current_resp_tail;
+	u32 new_cmd_head;
+	unsigned long flags;
 
+	spin_lock_irqsave(&mailbox->cmd_head_resp_tail_lock, flags);
+
+	current_resp_tail = data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET) &
+				      RESP_TAIL_MASK;
+	new_cmd_head = (u32)val << CMD_HEAD_SHIFT;
 	data_write(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET,
 		   new_cmd_head | current_resp_tail);
+
+	spin_unlock_irqrestore(&mailbox->cmd_head_resp_tail_lock, flags);
 }
 
 void gxp_mailbox_write_resp_queue_tail(struct gxp_mailbox *mailbox, u16 val)
 {
-	u32 current_cmd_head =
-		data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET) &
-		CMD_HEAD_MASK;
-	u32 new_resp_tail = (u32)val << RESP_TAIL_SHIFT;
+	u32 current_cmd_head;
+	u32 new_resp_tail;
+	unsigned long flags;
 
+	spin_lock_irqsave(&mailbox->cmd_head_resp_tail_lock, flags);
+
+	current_cmd_head = data_read(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET) &
+				     CMD_HEAD_MASK;
+	new_resp_tail = (u32)val << RESP_TAIL_SHIFT;
 	data_write(mailbox, MBOX_CMD_HEAD_RESP_TAIL_OFFSET,
 		   current_cmd_head | new_resp_tail);
+
+	spin_unlock_irqrestore(&mailbox->cmd_head_resp_tail_lock, flags);
 }
 
 u16 gxp_mailbox_read_cmd_queue_tail(struct gxp_mailbox *mailbox)
 {
-	u32 reg_val = data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET);
+	u32 reg_val;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mailbox->cmd_tail_resp_head_lock, flags);
+
+	reg_val = data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET);
+
+	spin_unlock_irqrestore(&mailbox->cmd_tail_resp_head_lock, flags);
 
 	return (u16)((reg_val & CMD_TAIL_MASK) >> CMD_TAIL_SHIFT);
 }
 
 u16 gxp_mailbox_read_resp_queue_head(struct gxp_mailbox *mailbox)
 {
-	u32 reg_val = data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET);
+	u32 reg_val;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mailbox->cmd_tail_resp_head_lock, flags);
+
+	reg_val = data_read(mailbox, MBOX_CMD_TAIL_RESP_HEAD_OFFSET);
+
+	spin_unlock_irqrestore(&mailbox->cmd_tail_resp_head_lock, flags);
 
 	return (u16)((reg_val & RESP_HEAD_MASK) >> RESP_HEAD_SHIFT);
 }

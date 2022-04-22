@@ -16,6 +16,7 @@
 
 /* Holds state belonging to a client */
 struct gxp_client {
+	struct list_head list_entry;
 	struct gxp_dev *gxp;
 
 	/*
@@ -38,6 +39,8 @@ struct gxp_client {
 	struct gxp_tpu_mbx_desc mbx_desc;
 
 	struct gxp_eventfd *mb_eventfds[GXP_NUM_CORES];
+
+	pid_t pid;
 };
 
 /*

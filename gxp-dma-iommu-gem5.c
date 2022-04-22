@@ -371,6 +371,12 @@ void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 }
 #endif // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
+int gxp_dma_ssmt_program(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			 uint virt_core, uint core)
+{
+	/* NO-OP when aux domains are not supported */
+	return 0;
+}
 int gxp_dma_domain_attach_device(struct gxp_dev *gxp,
 				 struct gxp_virtual_device *vd, uint virt_core,
 				 uint core)

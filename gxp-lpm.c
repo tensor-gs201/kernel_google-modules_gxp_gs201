@@ -19,12 +19,28 @@
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
 
-static void enable_state(struct gxp_dev *gxp, uint psm, uint state)
+#define gxp_lpm_wait_until(lpm_state, condition)                               \
+	do {                                                                   \
+		int i = 100000;                                                \
+		while (i) {                                                    \
+			lpm_state =                                            \
+				lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET) & \
+				PSM_CURR_STATE_MASK;                           \
+			if (condition)                                         \
+				break;                                         \
+			udelay(1 * GXP_TIME_DELAY_FACTOR);                     \
+			i--;                                                   \
+		}                                                              \
+		return i != 0;                                                 \
+	} while (0)
+
+void gxp_lpm_enable_state(struct gxp_dev *gxp, uint psm, uint state)
 {
 	uint offset = LPM_REG_ENABLE_STATE_0 + (LPM_STATE_TABLE_SIZE * state);
 
 	/* PS0 should always be enabled */
-	WARN_ON(state == 0);
+	if (state == 0)
+		return;
 
 	/* Disable all low power states */
 	lpm_write_32_psm(gxp, psm, LPM_REG_ENABLE_STATE_1, 0x0);
@@ -60,7 +76,7 @@ bool gxp_lpm_is_powered(struct gxp_dev *gxp, uint psm)
 	return state == LPM_ACTIVE_STATE || state == LPM_CG_STATE;
 }
 
-static uint get_state(struct gxp_dev *gxp, uint psm)
+uint gxp_lpm_get_state(struct gxp_dev *gxp, uint psm)
 {
 	u32 status = lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET);
 
@@ -88,16 +104,16 @@ static int set_state_internal(struct gxp_dev *gxp, uint psm, uint target_state)
 	}
 
 	if (!i) {
-		dev_err(gxp->dev, "Failed to switch to PS%u\n", target_state);
+		dev_err(gxp->dev, "Failed to switch PSM%u to PS%u\n", psm, target_state);
 		return -EIO;
 	}
 
 	return 0;
 }
 
-static int set_state(struct gxp_dev *gxp, uint psm, uint target_state)
+int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state)
 {
-	uint curr_state = get_state(gxp, psm);
+	uint curr_state = gxp_lpm_get_state(gxp, psm);
 
 	if (curr_state == target_state)
 		return 0;
@@ -106,7 +122,7 @@ static int set_state(struct gxp_dev *gxp, uint psm, uint target_state)
 		 target_state, psm,
 		 lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET));
 
-	enable_state(gxp, psm, target_state);
+	gxp_lpm_enable_state(gxp, psm, target_state);
 
 	if ((curr_state != LPM_ACTIVE_STATE)
 	    && (target_state != LPM_ACTIVE_STATE)) {
@@ -117,7 +133,7 @@ static int set_state(struct gxp_dev *gxp, uint psm, uint target_state)
 	set_state_internal(gxp, psm, target_state);
 
 	dev_warn(gxp->dev, "Finished forced transition on core %u.  target: PS%u, actual: PS%u, status: %x\n",
-		 psm, target_state, get_state(gxp, psm),
+		 psm, target_state, gxp_lpm_get_state(gxp, psm),
 		 lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET));
 
 	/* Set HW sequencing mode */
@@ -133,8 +149,8 @@ static int psm_enable(struct gxp_dev *gxp, uint psm)
 	/* Return early if LPM is already initialized */
 	if (gxp_lpm_is_initialized(gxp, psm)) {
 		if (psm != LPM_TOP_PSM) {
-			/* Ensure core is in PS2 */
-			return set_state(gxp, psm, LPM_PG_W_RET_STATE);
+			/* Ensure core is in PS3 */
+			return gxp_lpm_set_state(gxp, psm, LPM_PG_STATE);
 		}
 
 		return 0;
@@ -173,7 +189,7 @@ void gxp_lpm_init(struct gxp_dev *gxp)
 void gxp_lpm_destroy(struct gxp_dev *gxp)
 {
 	/* (b/171063370) Put Top PSM in ACTIVE state before block shutdown */
-	dev_notice(gxp->dev, "Kicking Top PSM out of ACG\n");
+	dev_dbg(gxp->dev, "Kicking Top PSM out of ACG\n");
 
 	/* Disable all low-power states for TOP */
 	lpm_write_32_psm(gxp, LPM_TOP_PSM, LPM_REG_ENABLE_STATE_1, 0x0);
@@ -194,7 +210,7 @@ int gxp_lpm_up(struct gxp_dev *gxp, uint core)
 	dev_notice(gxp->dev, "Enabled\n");
 
 	/* Enable PS1 (Clk Gated) */
-	enable_state(gxp, core, LPM_CG_STATE);
+	gxp_lpm_enable_state(gxp, core, LPM_CG_STATE);
 
 	gxp_bpm_start(gxp, core);
 
@@ -203,10 +219,12 @@ int gxp_lpm_up(struct gxp_dev *gxp, uint core)
 
 void gxp_lpm_down(struct gxp_dev *gxp, uint core)
 {
-	/* Enable PS2 (Pwr Gated w/Ret) */
-	enable_state(gxp, core, LPM_PG_W_RET_STATE);
+	if (gxp_lpm_get_state(gxp, core) == LPM_PG_STATE)
+		return;
+	/* Enable PS3 (Pwr Gated) */
+	gxp_lpm_enable_state(gxp, core, LPM_PG_STATE);
 
-	/* Set wakeup doorbell to trigger an automatic transition to PS2 */
+	/* Set wakeup doorbell to trigger an automatic transition to PS3 */
 	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
 	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL);
 	msleep(25 * GXP_TIME_DELAY_FACTOR);
@@ -218,6 +236,20 @@ void gxp_lpm_down(struct gxp_dev *gxp, uint core)
 	gxp_write_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0, 0);
 	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL);
 
-	/* Ensure core is in PS2 */
-	set_state(gxp, core, LPM_PG_W_RET_STATE);
+	/* Ensure core is in PS3 */
+	gxp_lpm_set_state(gxp, core, LPM_PG_STATE);
+}
+
+bool gxp_lpm_wait_state_ne(struct gxp_dev *gxp, uint psm, uint state)
+{
+	uint lpm_state;
+
+	gxp_lpm_wait_until(lpm_state, lpm_state != state);
+}
+
+bool gxp_lpm_wait_state_eq(struct gxp_dev *gxp, uint psm, uint state)
+{
+	uint lpm_state;
+
+	gxp_lpm_wait_until(lpm_state, lpm_state == state);
 }

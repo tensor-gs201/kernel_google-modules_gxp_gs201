@@ -82,6 +82,33 @@ bool gxp_lpm_is_initialized(struct gxp_dev *gxp, uint psm);
  */
 bool gxp_lpm_is_powered(struct gxp_dev *gxp, uint psm);
 
+/*
+ * Wait for the specified @psm to be in any state other than @state
+ * Return whether the waiting is successful or the timeout occurs.
+ */
+bool gxp_lpm_wait_state_ne(struct gxp_dev *gxp, uint psm, uint state);
+
+/*
+ * Wait for the specified @psm to be in the specified @state
+ * Return whether the waiting is successful or the timeout occurs.
+ */
+bool gxp_lpm_wait_state_eq(struct gxp_dev *gxp, uint psm, uint state);
+
+/*
+ * Force a state transition on the specified PSM.
+ */
+int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state);
+
+/*
+ * Get current LPM state of the specified PSM.
+ */
+uint gxp_lpm_get_state(struct gxp_dev *gxp, uint psm);
+
+/*
+ * Enable a state on the specified PSM.
+ */
+void gxp_lpm_enable_state(struct gxp_dev *gxp, uint psm, uint state);
+
 static inline u32 lpm_read_32(struct gxp_dev *gxp, uint reg_offset)
 {
 	uint offset = GXP_LPM_BASE + reg_offset;

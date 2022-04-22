@@ -5,6 +5,7 @@
  * Copyright (C) 2022 Google LLC
  */
 
+#include "gxp-client.h"
 #include "gxp-dma.h"
 #include "gxp-pm.h"
 #include "gxp-wakelock.h"
@@ -92,13 +93,48 @@ int gxp_wakelock_suspend(struct gxp_dev *gxp)
 {
 	struct gxp_wakelock_manager *mgr = gxp->wakelock_mgr;
 	int ret;
+	struct gxp_client *client;
 
-	mutex_lock(&mgr->lock);
+	if (!mutex_trylock(&mgr->lock))
+		return -EAGAIN;
 
 	/* Can't suspend if there are any active clients */
 	mgr->suspended = mgr->count == 0;
 	ret = mgr->suspended ? 0 : -EAGAIN;
 
+	/* Suspend successful. Can exit now. */
+	if (!ret)
+		goto out;
+
+	/* Log clients currently holding a wakelock */
+	if (!mutex_trylock(&gxp->client_list_lock)) {
+		dev_warn_ratelimited(
+			gxp->dev,
+			"Unable to get client list lock on suspend failure\n");
+		goto out;
+	}
+
+	list_for_each_entry(client, &gxp->client_list, list_entry) {
+		if (!down_read_trylock(&client->semaphore)) {
+			dev_warn_ratelimited(
+				gxp->dev,
+				"Unable to acquire client lock (pid=%d)\n",
+				client->pid);
+			continue;
+		}
+
+		if (client->has_block_wakelock)
+			dev_warn_ratelimited(
+				gxp->dev,
+				"Cannot suspend with client holding wakelock (pid=%d)\n",
+				client->pid);
+
+		up_read(&client->semaphore);
+	}
+
+	mutex_unlock(&gxp->client_list_lock);
+
+out:
 	mutex_unlock(&mgr->lock);
 
 	return ret;

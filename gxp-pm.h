@@ -96,13 +96,19 @@ struct gxp_power_manager {
 	int curr_memory_state;
 	refcount_t blk_wake_ref;
 	struct gxp_pm_device_ops *ops;
-	struct gxp_set_acpm_state_work set_acpm_state_work[AUR_NUM_POWER_STATE_WORKER];
+	struct gxp_set_acpm_state_work
+		set_acpm_state_work[AUR_NUM_POWER_STATE_WORKER];
+	/* Serializes searching for an open worker in set_acpm_state_work[] */
+	struct mutex set_acpm_state_work_lock;
 	struct gxp_req_pm_qos_work req_pm_qos_work[AUR_NUM_POWER_STATE_WORKER];
+	/* Serializes searching for an open worker in req_pm_qos_work[] */
+	struct mutex req_pm_qos_work_lock;
 	struct workqueue_struct *wq;
 	/* INT/MIF requests for memory bandwidth */
 	struct exynos_pm_qos_request int_min;
 	struct exynos_pm_qos_request mif_min;
 	int force_noc_mux_normal_count;
+	u64 blk_switch_count;
 };
 
 /**
@@ -136,15 +142,25 @@ int gxp_pm_blk_off(struct gxp_dev *gxp);
 int gxp_pm_get_blk_state(struct gxp_dev *gxp);
 
 /**
+ * gxp_pm_get_blk_switch_count() - Get the blk switch count number
+ * @gxp: The GXP device to switch the blk
+ *
+ * Return:
+ * * count   - Switch count number after the module initialization.
+ */
+int gxp_pm_get_blk_switch_count(struct gxp_dev *gxp);
+
+/**
  * gxp_pm_core_on() - Turn on a core on GXP device
  * @gxp: The GXP device to operate
  * @core: The core ID to turn on
+ * @verbose: A boolean flag to indicate whether to print the log
  *
  * Return:
  * * 0       - Core on process finished successfully
  * * -ETIMEDOUT - Core on process timed-out.
  */
-int gxp_pm_core_on(struct gxp_dev *gxp, uint core);
+int gxp_pm_core_on(struct gxp_dev *gxp, uint core, bool verbose);
 
 /**
  * gxp_pm_core_off() - Turn off a core on GXP device

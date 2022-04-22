@@ -100,6 +100,8 @@ struct gxp_dev {
 	 */
 	struct device *gsa_dev;
 	u32 memory_per_core;
+	struct list_head client_list;
+	struct mutex client_list_lock;
 };
 
 /* GXP device IO functions */

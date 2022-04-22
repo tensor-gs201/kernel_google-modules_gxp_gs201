@@ -20,6 +20,7 @@
 #include "gxp-debug-dump.h"
 #include "gxp-doorbell.h"
 #include "gxp-firmware.h"
+#include "gxp-host-device-structs.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
 #include "gxp-mailbox.h"
@@ -215,9 +216,27 @@ gxp_firmware_load_authenticated(struct gxp_dev *gxp, const struct firmware *fw,
 /* Forward declaration for usage inside gxp_firmware_load(..). */
 static void gxp_firmware_unload(struct gxp_dev *gxp, uint core);
 
+static void gxp_program_reset_vector(struct gxp_dev *gxp, uint core, bool verbose)
+{
+	u32 reset_vec;
+
+	reset_vec = gxp_read_32_core(gxp, core,
+				     GXP_REG_ALT_RESET_VECTOR);
+	if (verbose)
+		dev_notice(gxp->dev,
+			   "Current Aurora reset vector for core %u: 0x%x\n",
+			   core, reset_vec);
+	gxp_write_32_core(gxp, core, GXP_REG_ALT_RESET_VECTOR,
+			  gxp->fwbufs[core].daddr);
+	if (verbose)
+		dev_notice(gxp->dev,
+			   "New Aurora reset vector for core %u: 0x%llx\n",
+			   core, gxp->fwbufs[core].daddr);
+}
+
 static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 {
-	u32 reset_vec, offset;
+	u32 offset;
 	void __iomem *core_scratchpad_base;
 	int ret;
 
@@ -278,16 +297,6 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 	dev_notice(gxp->dev,
 		   "ELF loaded at virtual: %pK and physical: 0x%llx\n",
 		   gxp->fwbufs[core].vaddr, gxp->fwbufs[core].paddr);
-
-	/* Program reset vector */
-	reset_vec = gxp_read_32_core(gxp, core,
-				     GXP_REG_ALT_RESET_VECTOR);
-	dev_notice(gxp->dev, "Current Aurora reset vector for core %u: 0x%x\n",
-		   core, reset_vec);
-	gxp_write_32_core(gxp, core, GXP_REG_ALT_RESET_VECTOR,
-			  gxp->fwbufs[core].daddr);
-	dev_notice(gxp->dev, "New Aurora reset vector for core %u: 0x%llx\n",
-		   core, gxp->fwbufs[core].daddr);
 
 	/* Configure bus performance monitors */
 	gxp_bpm_configure(gxp, core, INST_BPM_OFFSET, BPM_EVENT_READ_XFER);
@@ -491,8 +500,13 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 		return ret;
 	}
 
+	/* Mark this as a cold boot */
+	gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
+			  GXP_BOOT_MODE_REQUEST_COLD_BOOT);
+
 	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
-	ret = gxp_pm_core_on(gxp, core);
+	ret = gxp_firmware_setup_hw_after_block_off(gxp, core,
+						    /*verbose=*/true);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to power up core %u\n", core);
 		goto out_firmware_unload;
@@ -546,6 +560,13 @@ out_firmware_unload:
 	return ret;
 }
 
+int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
+					  bool verbose)
+{
+	gxp_program_reset_vector(gxp, core, verbose);
+	return gxp_pm_core_on(gxp, core, verbose);
+}
+
 void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 		       uint virt_core, uint core)
 {
@@ -563,6 +584,7 @@ void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 			    gxp->mailbox_mgr->mailboxes[core]);
 	dev_notice(gxp->dev, "Mailbox %u released\n", core);
 
-	gxp_pm_core_off(gxp, core);
+	if (vd->state == GXP_VD_RUNNING)
+		gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);
 }

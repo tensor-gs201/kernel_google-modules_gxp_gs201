@@ -5,6 +5,7 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -50,7 +51,7 @@ void gxp_client_destroy(struct gxp_client *client)
 	gxp_dma_unmap_tpu_buffer(gxp, client->vd, client->mbx_desc);
 #endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
-	if (client->has_vd_wakelock)
+	if (client->vd && client->vd->state != GXP_VD_OFF)
 		gxp_vd_stop(client->vd);
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {

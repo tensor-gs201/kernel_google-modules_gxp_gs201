@@ -11,10 +11,21 @@
 #include "gxp-dma.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
+#include "gxp-host-device-structs.h"
 #include "gxp-internal.h"
+#include "gxp-lpm.h"
 #include "gxp-mailbox.h"
+#include "gxp-notification.h"
+#include "gxp-pm.h"
 #include "gxp-telemetry.h"
 #include "gxp-vd.h"
+#include "gxp-wakelock.h"
+
+static inline void hold_core_in_reset(struct gxp_dev *gxp, uint core)
+{
+	gxp_write_32_core(gxp, core, GXP_REG_ETM_PWRCTL,
+			  1 << GXP_REG_ETM_PWRCTL_CORE_RESET_SHIFT);
+}
 
 int gxp_vd_init(struct gxp_dev *gxp)
 {
@@ -58,6 +69,7 @@ struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 
 	vd->gxp = gxp;
 	vd->num_cores = requested_cores;
+	vd->state = GXP_VD_OFF;
 
 	vd->core_domains =
 		kcalloc(requested_cores, sizeof(*vd->core_domains), GFP_KERNEL);
@@ -238,6 +250,7 @@ int gxp_vd_start(struct gxp_virtual_device *vd)
 		ret = -EIO;
 		goto out_vd_stop;
 	}
+	vd->state = GXP_VD_RUNNING;
 
 	return ret;
 
@@ -253,15 +266,19 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 	struct gxp_dev *gxp = vd->gxp;
 	uint core;
 	uint virt_core = 0;
+	uint lpm_state;
 
-	/*
-	 * Put all cores in the VD into reset so they can not wake each other up
-	 */
-	for (core = 0; core < GXP_NUM_CORES; core++) {
-		if (gxp->core_to_vd[core] == vd) {
-			gxp_write_32_core(
-				gxp, core, GXP_REG_ETM_PWRCTL,
-				1 << GXP_REG_ETM_PWRCTL_CORE_RESET_SHIFT);
+	if ((vd->state == GXP_VD_OFF || vd->state == GXP_VD_RUNNING) &&
+	    gxp_pm_get_blk_state(gxp) != AUR_OFF) {
+		/*
+		 * Put all cores in the VD into reset so they can not wake each other up
+		 */
+		for (core = 0; core < GXP_NUM_CORES; core++) {
+			if (gxp->core_to_vd[core] == vd) {
+				lpm_state = gxp_lpm_get_state(gxp, core);
+				if (lpm_state != LPM_PG_STATE)
+					hold_core_in_reset(gxp, core);
+			}
 		}
 	}
 
@@ -270,7 +287,8 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 			gxp_firmware_stop(gxp, vd, virt_core, core);
 			unmap_telemetry_buffers(gxp, vd, virt_core, core);
 			gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
-			gxp_dma_domain_detach_device(gxp, vd, virt_core);
+			if (vd->state == GXP_VD_RUNNING)
+				gxp_dma_domain_detach_device(gxp, vd, virt_core);
 			gxp->core_to_vd[core] = NULL;
 			virt_core++;
 		}
@@ -280,6 +298,189 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 		gxp_fw_data_destroy_app(gxp, vd->fw_app);
 		vd->fw_app = NULL;
 	}
+}
+
+/*
+ * Caller must have locked `gxp->vd_semaphore` for writing.
+ */
+void gxp_vd_suspend(struct gxp_virtual_device *vd)
+{
+	uint core;
+	struct gxp_dev *gxp = vd->gxp;
+	u32 boot_state;
+	uint failed_cores = 0;
+	uint virt_core;
+
+	lockdep_assert_held_write(&gxp->vd_semaphore);
+	if (vd->state == GXP_VD_SUSPENDED) {
+		dev_err(gxp->dev,
+			"Attempt to suspend a virtual device twice\n");
+		return;
+	}
+	gxp_pm_force_cmu_noc_user_mux_normal(gxp);
+	/*
+	 * Start the suspend process for all of this VD's cores without waiting
+	 * for completion.
+	 */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_vd[core] == vd) {
+			if (!gxp_lpm_wait_state_ne(gxp, core, LPM_ACTIVE_STATE)) {
+				vd->state = GXP_VD_UNAVAILABLE;
+				failed_cores |= BIT(core);
+				hold_core_in_reset(gxp, core);
+				dev_err(gxp->dev, "Core %u stuck at LPM_ACTIVE_STATE", core);
+				continue;
+			}
+			/* Mark the boot mode as a suspend event */
+			gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
+					  GXP_BOOT_MODE_REQUEST_SUSPEND);
+			/*
+			 * Request a suspend event by sending a mailbox
+			 * notification.
+			 */
+			gxp_notification_send(gxp, core,
+					      CORE_NOTIF_SUSPEND_REQUEST);
+		}
+	}
+	virt_core = 0;
+	/* Wait for all cores to complete core suspension. */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_vd[core] == vd) {
+			if (!(failed_cores & BIT(core))) {
+				if (!gxp_lpm_wait_state_eq(gxp, core,
+							   LPM_PG_STATE)) {
+					boot_state = gxp_read_32_core(
+						gxp, core, GXP_REG_BOOT_MODE);
+					if (boot_state !=
+					    GXP_BOOT_MODE_STATUS_SUSPEND_COMPLETED) {
+						dev_err(gxp->dev,
+							"Suspension request on core %u failed (status: %u)",
+							core, boot_state);
+						vd->state = GXP_VD_UNAVAILABLE;
+						failed_cores |= BIT(core);
+						hold_core_in_reset(gxp, core);
+					}
+				} else {
+					/* Re-set PS1 as the default low power state. */
+					gxp_lpm_enable_state(gxp, core,
+							     LPM_CG_STATE);
+				}
+			}
+			gxp_dma_domain_detach_device(gxp, vd, virt_core);
+			virt_core++;
+		}
+	}
+	if (vd->state == GXP_VD_UNAVAILABLE) {
+		/* shutdown all cores if virtual device is unavailable */
+		for (core = 0; core < GXP_NUM_CORES; core++)
+			if (gxp->core_to_vd[core] == vd)
+				gxp_pm_core_off(gxp, core);
+	} else {
+		vd->blk_switch_count_when_suspended =
+			gxp_pm_get_blk_switch_count(gxp);
+		vd->state = GXP_VD_SUSPENDED;
+	}
+	gxp_pm_check_cmu_noc_user_mux(gxp);
+}
+
+/*
+ * Caller must have locked `gxp->vd_semaphore` for writing.
+ */
+int gxp_vd_resume(struct gxp_virtual_device *vd)
+{
+	int ret = 0;
+	uint core;
+	uint virt_core = 0;
+	uint timeout;
+	u32 boot_state;
+	struct gxp_dev *gxp = vd->gxp;
+	u64 curr_blk_switch_count;
+	uint failed_cores = 0;
+
+	lockdep_assert_held_write(&gxp->vd_semaphore);
+	if (vd->state != GXP_VD_SUSPENDED) {
+		dev_err(gxp->dev,
+			"Attempt to resume a virtual device which was not suspended\n");
+		return -EBUSY;
+	}
+	gxp_pm_force_cmu_noc_user_mux_normal(gxp);
+	curr_blk_switch_count = gxp_pm_get_blk_switch_count(gxp);
+	/*
+	 * Start the resume process for all of this VD's cores without waiting
+	 * for completion.
+	 */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_vd[core] == vd) {
+			gxp_dma_domain_attach_device(gxp, vd, virt_core, core);
+			/*
+			 * The comparison is to check if blk_switch_count is
+			 * changed. If it's changed, it means the block is rebooted and
+			 * therefore we need to set up the hardware again.
+			 */
+			if (vd->blk_switch_count_when_suspended != curr_blk_switch_count) {
+				ret = gxp_firmware_setup_hw_after_block_off(
+					gxp, core, false);
+				if (ret) {
+					vd->state = GXP_VD_UNAVAILABLE;
+					failed_cores |= BIT(core);
+					virt_core++;
+					dev_err(gxp->dev, "Failed to power up core %u\n", core);
+					continue;
+				}
+			}
+			/* Mark this as a resume power-up event. */
+			gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
+					  GXP_BOOT_MODE_REQUEST_RESUME);
+			/*
+			 * Power on the core by explicitly switching its PSM to
+			 * PS0 (LPM_ACTIVE_STATE).
+			 */
+			gxp_lpm_set_state(gxp, core, LPM_ACTIVE_STATE);
+			virt_core++;
+		}
+	}
+	/* Wait for all cores to complete core resumption. */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->core_to_vd[core] == vd) {
+			if (!(failed_cores & BIT(core))) {
+				/* in microseconds */
+				timeout = 1000000;
+				while (--timeout) {
+					boot_state = gxp_read_32_core(
+						gxp, core, GXP_REG_BOOT_MODE);
+					if (boot_state ==
+					    GXP_BOOT_MODE_STATUS_RESUME_COMPLETED)
+						break;
+					udelay(1 * GXP_TIME_DELAY_FACTOR);
+				}
+				if (timeout == 0 &&
+				    boot_state !=
+					    GXP_BOOT_MODE_STATUS_RESUME_COMPLETED) {
+					dev_err(gxp->dev,
+						"Resume request on core %u failed (status: %u)",
+						core, boot_state);
+					ret = -EBUSY;
+					vd->state = GXP_VD_UNAVAILABLE;
+					failed_cores |= BIT(core);
+				}
+			}
+		}
+	}
+	if (vd->state == GXP_VD_UNAVAILABLE) {
+		/* shutdown all cores if virtual device is unavailable */
+		virt_core = 0;
+		for (core = 0; core < GXP_NUM_CORES; core++) {
+			if (gxp->core_to_vd[core] == vd) {
+				gxp_dma_domain_detach_device(gxp, vd, virt_core);
+				gxp_pm_core_off(gxp, core);
+				virt_core++;
+			}
+		}
+	} else {
+		vd->state = GXP_VD_RUNNING;
+	}
+	gxp_pm_check_cmu_noc_user_mux(gxp);
+	return ret;
 }
 
 /* Caller must have locked `gxp->vd_semaphore` for reading */

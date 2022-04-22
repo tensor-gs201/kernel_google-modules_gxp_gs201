@@ -24,12 +24,32 @@ struct mailbox_resp_queue {
 	wait_queue_head_t waitq;
 };
 
+enum gxp_virtual_device_state {
+	GXP_VD_OFF = 0,
+	GXP_VD_RUNNING = 1,
+	GXP_VD_SUSPENDED = 2,
+	/*
+	 * If the virtual device is in the unavailable state, it won't be changed
+	 * back no matter what we do.
+	 * Note: this state will only be set on suspend/resume failure.
+	 */
+	GXP_VD_UNAVAILABLE = 3,
+};
+
 struct gxp_virtual_device {
 	struct gxp_dev *gxp;
 	uint num_cores;
 	void *fw_app;
 	struct iommu_domain **core_domains;
 	struct mailbox_resp_queue *mailbox_resp_queues;
+	enum gxp_virtual_device_state state;
+	/*
+	 * Record the gxp->power_mgr->blk_switch_count when the vd was
+	 * suspended. Use this information to know whether the block has been
+	 * restarted and therefore we need to re-program CSRs in the resume
+	 * process.
+	 */
+	u64 blk_switch_count_when_suspended;
 };
 
 /*
@@ -115,5 +135,25 @@ uint gxp_vd_virt_core_list_to_phys_core_list(struct gxp_virtual_device *vd,
  * The caller must have locked gxp->vd_semaphore for reading.
  */
 int gxp_vd_phys_core_to_virt_core(struct gxp_virtual_device *vd, u16 phys_core);
+
+/**
+ * gxp_vd_suspend() - Suspend a running virtual device
+ * @vd: The virtual device to suspend
+ *
+ * The caller must have locked gxp->vd_semaphore for writing.
+ */
+void gxp_vd_suspend(struct gxp_virtual_device *vd);
+
+/**
+ * gxp_vd_resume() - Resume a suspended virtual device
+ * @vd: The virtual device to resume
+ *
+ * The caller must have locked gxp->vd_semaphore for writing.
+ *
+ * Return:
+ * * 0          - Success
+ * * -ETIMEDOUT - Fail to power on physical cores
+ */
+int gxp_vd_resume(struct gxp_virtual_device *vd);
 
 #endif /* __GXP_VD_H__ */

@@ -44,6 +44,48 @@
 #include "gxp-vd.h"
 #include "gxp-wakelock.h"
 
+/* Caller needs to hold client->semaphore for reading */
+static bool check_client_has_available_vd(struct gxp_client *client,
+					  char *ioctl_name)
+{
+	struct gxp_dev *gxp = client->gxp;
+
+	lockdep_assert_held_read(&client->semaphore);
+	if (!client->vd) {
+		dev_err(gxp->dev,
+			"%s requires the client allocate a VIRTUAL_DEVICE\n",
+			ioctl_name);
+		return false;
+	}
+	if (client->vd->state == GXP_VD_UNAVAILABLE) {
+		dev_err(gxp->dev, "Cannot do %s on a broken virtual device\n",
+			ioctl_name);
+		return false;
+	}
+	return true;
+}
+
+/* Caller needs to hold client->semaphore for reading */
+static bool check_client_has_available_vd_wakelock(struct gxp_client *client,
+						   char *ioctl_name)
+{
+	struct gxp_dev *gxp = client->gxp;
+
+	lockdep_assert_held_read(&client->semaphore);
+	if (!client->has_vd_wakelock) {
+		dev_err(gxp->dev,
+			"%s requires the client hold a VIRTUAL_DEVICE wakelock\n",
+			ioctl_name);
+		return false;
+	}
+	if (client->vd->state == GXP_VD_UNAVAILABLE) {
+		dev_err(gxp->dev, "Cannot do %s on a broken virtual device\n",
+			ioctl_name);
+		return false;
+	}
+	return true;
+}
+
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 static struct sscd_platform_data gxp_sscd_pdata;
 
@@ -83,7 +125,13 @@ static int gxp_open(struct inode *inode, struct file *file)
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
+	client->pid = current->pid;
+
 	file->private_data = client;
+
+	mutex_lock(&gxp->client_list_lock);
+	list_add(&client->list_entry, &gxp->client_list);
+	mutex_unlock(&gxp->client_list_lock);
 
 	return 0;
 }
@@ -97,6 +145,10 @@ static int gxp_release(struct inode *inode, struct file *file)
 	 */
 	if (!client)
 		return 0;
+
+	mutex_lock(&client->gxp->client_list_lock);
+	list_del(&client->list_entry);
+	mutex_unlock(&client->gxp->client_list_lock);
 
 	/*
 	 * TODO (b/184572070): Unmap buffers and drop mailbox responses
@@ -145,9 +197,7 @@ static int gxp_map_buffer(struct gxp_client *client,
 
 	down_read(&client->semaphore);
 
-	if (!client->vd) {
-		dev_err(gxp->dev,
-			"GXP_MAP_BUFFER requires the client allocate a VIRTUAL_DEVICE\n");
+	if (!check_client_has_available_vd(client, "GXP_MAP_BUFFER")) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -285,11 +335,10 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_MAILBOX_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd_wakelock(client,
+						   "GXP_MAILBOX_COMMAND")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -353,6 +402,7 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_read(&client->semaphore);
 
 	return ret;
@@ -394,11 +444,10 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_MAILBOX_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd_wakelock(client,
+						   "GXP_MAILBOX_COMMAND")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -463,6 +512,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_read(&client->semaphore);
 
 	return ret;
@@ -484,9 +534,8 @@ static int gxp_mailbox_response(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_MAILBOX_RESPONSE requires the client hold a VIRTUAL_DEVICE wakelock\n");
+	if (!check_client_has_available_vd_wakelock(client,
+						    "GXP_MAILBOX_RESPONSE")) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -663,11 +712,10 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_ETM_TRACE_START_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd_wakelock(
+		    client, "GXP_ETM_TRACE_START_COMMAND")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -689,6 +737,7 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_read(&client->semaphore);
 
 	return ret;
@@ -708,11 +757,10 @@ static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_ETM_TRACE_SW_STOP_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd_wakelock(
+		    client, "GXP_ETM_TRACE_SW_STOP_COMMAND")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -733,6 +781,7 @@ static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_read(&client->semaphore);
 
 	return ret;
@@ -752,11 +801,10 @@ static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_ETM_TRACE_CLEANUP_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd_wakelock(
+		    client, "GXP_ETM_TRACE_CLEANUP_COMMAND")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -777,6 +825,7 @@ static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_read(&client->semaphore);
 
 	return ret;
@@ -802,11 +851,10 @@ gxp_etm_get_trace_info_command(struct gxp_client *client,
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
-		dev_err(gxp->dev,
-			"GXP_ETM_GET_TRACE_INFO_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd_wakelock(
+		    client, "GXP_ETM_GET_TRACE_INFO_COMMAND")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -858,6 +906,7 @@ out_free_header:
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_read(&client->semaphore);
 
 	return ret;
@@ -918,11 +967,9 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 
 	down_write(&client->semaphore);
 
-	if (!client->vd) {
-		dev_err(gxp->dev,
-			"GXP_MAP_TPU_MBX_QUEUE requires the client allocate a VIRTUAL_DEVICE\n");
-		up_read(&client->semaphore);
-		return -ENODEV;
+	if (!check_client_has_available_vd(client, "GXP_MAP_TPU_MBX_QUEUE")) {
+		ret = -ENODEV;
+		goto out_unlock_client_semphore;
 	}
 
 	down_read(&gxp->vd_semaphore);
@@ -992,6 +1039,7 @@ out_free:
 
 out:
 	up_read(&gxp->vd_semaphore);
+out_unlock_client_semphore:
 	up_write(&client->semaphore);
 
 	return ret;
@@ -1166,6 +1214,12 @@ static int gxp_acquire_wake_lock_compat(
 		}
 
 		client->has_block_wakelock = true;
+
+		/*
+		 * Update client's PID in case the process that opened /dev/gxp
+		 * is not the one that called this IOCTL.
+		 */
+		client->pid = current->pid;
 	}
 
 	/* Acquire a VIRTUAL_DEVICE wakelock if requested */
@@ -1178,9 +1232,19 @@ static int gxp_acquire_wake_lock_compat(
 
 		}
 
+		if (client->vd->state == GXP_VD_UNAVAILABLE) {
+			dev_err(gxp->dev,
+				"Cannot acquire VIRTUAL_DEVICE wakelock on a broken virtual device\n");
+			ret = -ENODEV;
+			goto out;
+		}
+
 		if (!client->has_vd_wakelock) {
 			down_write(&gxp->vd_semaphore);
-			ret = gxp_vd_start(client->vd);
+			if (client->vd->state == GXP_VD_OFF)
+				ret = gxp_vd_start(client->vd);
+			else
+				ret = gxp_vd_resume(client->vd);
 			up_write(&gxp->vd_semaphore);
 		}
 
@@ -1286,9 +1350,19 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 
 		}
 
+		if (client->vd->state == GXP_VD_UNAVAILABLE) {
+			dev_err(gxp->dev,
+				"Cannot acquire VIRTUAL_DEVICE wakelock on a broken virtual device\n");
+			ret = -ENODEV;
+			goto err_acquiring_vd_wl;
+		}
+
 		if (!client->has_vd_wakelock) {
 			down_write(&gxp->vd_semaphore);
-			ret = gxp_vd_start(client->vd);
+			if (client->vd->state == GXP_VD_OFF)
+				ret = gxp_vd_start(client->vd);
+			else
+				ret = gxp_vd_resume(client->vd);
 			up_write(&gxp->vd_semaphore);
 		}
 
@@ -1355,9 +1429,17 @@ static int gxp_release_wake_lock(struct gxp_client *client, __u32 __user *argp)
 			goto out;
 		}
 
-		down_write(&gxp->vd_semaphore);
-		gxp_vd_stop(client->vd);
-		up_write(&gxp->vd_semaphore);
+		/*
+		 * Currently VD state will not be GXP_VD_UNAVAILABLE if
+		 * has_vd_wakelock is true. Add this check just in case
+		 * GXP_VD_UNAVAILABLE will occur in more scenarios in the
+		 * future.
+		 */
+		if (client->vd->state != GXP_VD_UNAVAILABLE) {
+			down_write(&gxp->vd_semaphore);
+			gxp_vd_suspend(client->vd);
+			up_write(&gxp->vd_semaphore);
+		}
 
 		client->has_vd_wakelock = false;
 	}
@@ -1416,9 +1498,7 @@ static int gxp_map_dmabuf(struct gxp_client *client,
 
 	down_read(&client->semaphore);
 
-	if (!client->vd) {
-		dev_err(gxp->dev,
-			"GXP_MAP_DMABUF requires the client allocate a VIRTUAL_DEVICE\n");
+	if (!check_client_has_available_vd(client, "GXP_MAP_DMABUF")) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1487,9 +1567,7 @@ static int gxp_register_mailbox_eventfd(
 
 	down_write(&client->semaphore);
 
-	if (!client->vd) {
-		dev_err(client->gxp->dev,
-			"GXP_REGISTER_MAILBOX_EVENTFD requires the client allocate a VIRTUAL_DEVICE\n");
+	if (!check_client_has_available_vd(client, "GXP_REGISTER_MAILBOX_EVENTFD")) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1911,6 +1989,9 @@ static int gxp_platform_probe(struct platform_device *pdev)
 	if (!gxp->thermal_mgr)
 		dev_err(dev, "Failed to init thermal driver\n");
 	dev_dbg(dev, "Probe finished\n");
+
+	INIT_LIST_HEAD(&gxp->client_list);
+	mutex_init(&gxp->client_list_lock);
 
 	return 0;
 

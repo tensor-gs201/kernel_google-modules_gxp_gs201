@@ -17,6 +17,7 @@
 #include <soc/google/exynos_pm_qos.h>
 
 #include "gxp-bpm.h"
+#include "gxp-client.h"
 #include "gxp-doorbell.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
@@ -122,12 +123,20 @@ int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate)
 
 static void set_cmu_noc_user_mux_state(struct gxp_dev *gxp, u32 val)
 {
-	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_NOC_USER);
+	if (!IS_ERR_OR_NULL(gxp->cmu.vaddr))
+		writel(val << 4, gxp->cmu.vaddr + PLL_CON0_NOC_USER);
 }
 
 static void set_cmu_pll_aur_mux_state(struct gxp_dev *gxp, u32 val)
 {
-	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_PLL_AUR);
+	if (!IS_ERR_OR_NULL(gxp->cmu.vaddr))
+		writel(val << 4, gxp->cmu.vaddr + PLL_CON0_PLL_AUR);
+}
+
+static void reset_cmu_mux_state(struct gxp_dev *gxp)
+{
+	set_cmu_pll_aur_mux_state(gxp, AUR_CMU_MUX_NORMAL);
+	set_cmu_noc_user_mux_state(gxp, AUR_CMU_MUX_NORMAL);
 }
 
 void gxp_pm_force_cmu_noc_user_mux_normal(struct gxp_dev *gxp)
@@ -211,6 +220,7 @@ int gxp_pm_blk_on(struct gxp_dev *gxp)
 
 	/* Startup TOP's PSM */
 	gxp_lpm_init(gxp);
+	gxp->power_mgr->blk_switch_count++;
 
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 
@@ -231,15 +241,16 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 		mutex_unlock(&gxp->power_mgr->pm_lock);
 		return -EBUSY;
 	}
+	/*
+	 * Shouldn't happen unless this function has been called twice without blk_on
+	 * first.
+	 */
 	if (gxp->power_mgr->curr_state == AUR_OFF) {
 		mutex_unlock(&gxp->power_mgr->pm_lock);
 		return ret;
 	}
-	/* Reset MUX frequency from AUR_READY state */
-	if (gxp->power_mgr->curr_state == AUR_READY) {
-		set_cmu_pll_aur_mux_state(gxp, AUR_CMU_MUX_NORMAL);
-		set_cmu_noc_user_mux_state(gxp, AUR_CMU_MUX_NORMAL);
-	}
+	/* Above has checked device is powered, it's safe to access the CMU regs. */
+	reset_cmu_mux_state(gxp);
 
 	/* Shutdown TOP's PSM */
 	gxp_lpm_destroy(gxp);
@@ -248,6 +259,21 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 	if (!ret)
 		gxp->power_mgr->curr_state = AUR_OFF;
 	mutex_unlock(&gxp->power_mgr->pm_lock);
+	return ret;
+}
+
+int gxp_pm_get_blk_switch_count(struct gxp_dev *gxp)
+{
+	int ret;
+
+	if (!gxp->power_mgr) {
+		dev_err(gxp->dev, "%s: No PM found\n", __func__);
+		return -ENODEV;
+	}
+	mutex_lock(&gxp->power_mgr->pm_lock);
+	ret = gxp->power_mgr->blk_switch_count;
+	mutex_unlock(&gxp->power_mgr->pm_lock);
+
 	return ret;
 }
 
@@ -266,7 +292,7 @@ int gxp_pm_get_blk_state(struct gxp_dev *gxp)
 	return ret;
 }
 
-int gxp_pm_core_on(struct gxp_dev *gxp, uint core)
+int gxp_pm_core_on(struct gxp_dev *gxp, uint core, bool verbose)
 {
 	int ret = 0;
 
@@ -285,7 +311,8 @@ int gxp_pm_core_on(struct gxp_dev *gxp, uint core)
 
 	mutex_unlock(&gxp->power_mgr->pm_lock);
 
-	dev_notice(gxp->dev, "%s: Core %d up\n", __func__, core);
+	if (verbose)
+		dev_notice(gxp->dev, "%s: Core %d up\n", __func__, core);
 	return ret;
 }
 
@@ -318,10 +345,9 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 	}
 	if (state != gxp->power_mgr->curr_state ||
 	    aggressor_vote != gxp->power_mgr->curr_aggressor_vote) {
-		if (state == AUR_OFF) {
-			dev_warn(gxp->dev,
-				 "It is not supported to request AUR_OFF\n");
-		} else {
+		if (state != AUR_OFF) {
+			mutex_lock(&gxp->power_mgr->set_acpm_state_work_lock);
+
 			for (i = 0; i < AUR_NUM_POWER_STATE_WORKER; i++) {
 				if (!gxp->power_mgr->set_acpm_state_work[i]
 					     .using)
@@ -332,7 +358,20 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 				dev_warn(
 					gxp->dev,
 					"The workqueue for power state transition is full");
+				mutex_unlock(&gxp->power_mgr->pm_lock);
 				flush_workqueue(gxp->power_mgr->wq);
+				mutex_lock(&gxp->power_mgr->pm_lock);
+
+				/* Verify that a request is still needed */
+				if (state == gxp->power_mgr->curr_state &&
+				    aggressor_vote ==
+					    gxp->power_mgr->curr_aggressor_vote) {
+					mutex_unlock(
+						&gxp->power_mgr
+							 ->set_acpm_state_work_lock);
+					return 0;
+				}
+
 				/*
 				 * All set_acpm_state_work should be available
 				 * now, pick the first one.
@@ -348,9 +387,12 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 			queue_work(
 				gxp->power_mgr->wq,
 				&gxp->power_mgr->set_acpm_state_work[i].work);
+
+			gxp->power_mgr->curr_state = state;
+			gxp->power_mgr->curr_aggressor_vote = aggressor_vote;
+
+			mutex_unlock(&gxp->power_mgr->set_acpm_state_work_lock);
 		}
-		gxp->power_mgr->curr_state = state;
-		gxp->power_mgr->curr_aggressor_vote = aggressor_vote;
 	}
 
 	return 0;
@@ -475,7 +517,8 @@ static void gxp_pm_req_pm_qos_async(struct work_struct *work)
 	mutex_unlock(&req_pm_qos_work->gxp->power_mgr->pm_lock);
 }
 
-static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_power_state state)
+static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp,
+					  enum aur_memory_power_state state)
 {
 	s32 int_val = 0, mif_val = 0;
 	uint i;
@@ -485,6 +528,8 @@ static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_p
 		return -EINVAL;
 	}
 	if (state != gxp->power_mgr->curr_memory_state) {
+		mutex_lock(&gxp->power_mgr->req_pm_qos_work_lock);
+
 		for (i = 0; i < AUR_NUM_POWER_STATE_WORKER; i++) {
 			if (!gxp->power_mgr->req_pm_qos_work[i].using)
 				break;
@@ -494,7 +539,17 @@ static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_p
 			dev_warn(
 				gxp->dev,
 				"The workqueue for memory power state transition is full");
+			mutex_unlock(&gxp->power_mgr->pm_lock);
 			flush_workqueue(gxp->power_mgr->wq);
+			mutex_lock(&gxp->power_mgr->pm_lock);
+
+			/* Verify that a request is still needed */
+			if (state == gxp->power_mgr->curr_memory_state) {
+				mutex_unlock(
+					&gxp->power_mgr->req_pm_qos_work_lock);
+				return 0;
+			}
+
 			/*
 			 * All req_pm_qos_work should be available
 			 * now, pick the first one.
@@ -507,7 +562,10 @@ static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_p
 		gxp->power_mgr->req_pm_qos_work[i].int_val = int_val;
 		gxp->power_mgr->req_pm_qos_work[i].mif_val = mif_val;
 		gxp->power_mgr->req_pm_qos_work[i].using = true;
-		queue_work(gxp->power_mgr->wq, &gxp->power_mgr->req_pm_qos_work[i].work);
+		queue_work(gxp->power_mgr->wq,
+			   &gxp->power_mgr->req_pm_qos_work[i].work);
+
+		mutex_unlock(&gxp->power_mgr->req_pm_qos_work_lock);
 	}
 
 	return 0;
@@ -635,9 +693,12 @@ int gxp_pm_init(struct gxp_dev *gxp)
 		INIT_WORK(&mgr->req_pm_qos_work[i].work,
 			  gxp_pm_req_pm_qos_async);
 	}
+	mutex_init(&mgr->set_acpm_state_work_lock);
+	mutex_init(&mgr->req_pm_qos_work_lock);
 	gxp->power_mgr->wq =
 		create_singlethread_workqueue("gxp_power_work_queue");
 	gxp->power_mgr->force_noc_mux_normal_count = 0;
+	gxp->power_mgr->blk_switch_count = 0l;
 
 #if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	pm_runtime_enable(gxp->dev);

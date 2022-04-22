@@ -61,5 +61,11 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
  */
 void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 		       uint virt_core, uint core);
+/*
+ * Re-program the reset vector and power on the core's LPM if the block had
+ * been shut down.
+ */
+int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
+					  bool verbose);
 
 #endif /* __GXP_FIRMWARE_H__ */

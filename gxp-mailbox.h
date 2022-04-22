@@ -128,6 +128,8 @@ struct gxp_mailbox {
 	void (*handle_irq)(struct gxp_mailbox *mailbox);
 	struct work_struct *interrupt_handlers[GXP_MAILBOX_INT_BIT_COUNT];
 	unsigned int interrupt_virq;
+	spinlock_t cmd_tail_resp_head_lock;
+	spinlock_t cmd_head_resp_tail_lock;
 	struct task_struct *to_host_poll_task;
 	/* Protects to_host_poll_task while it holds a sync barrier */
 	struct mutex polling_lock;

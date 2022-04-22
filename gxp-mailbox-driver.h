@@ -12,6 +12,9 @@
 void gxp_mailbox_driver_init(struct gxp_mailbox *mailbox);
 void gxp_mailbox_driver_exit(struct gxp_mailbox *mailbox);
 
+void gxp_mailbox_driver_enable_interrupts(struct gxp_mailbox *mailbox);
+void gxp_mailbox_driver_disable_interrupts(struct gxp_mailbox *mailbox);
+
 void __iomem *gxp_mailbox_get_csr_base(struct gxp_dev *gxp, uint index);
 void __iomem *gxp_mailbox_get_data_base(struct gxp_dev *gxp, uint index);
 
