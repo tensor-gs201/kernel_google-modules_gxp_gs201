@@ -28,7 +28,8 @@ struct gxp_mapping {
 	 * should not be used if a regular buffer mapping was expected.
 	 */
 	u64 host_address;
-	uint core_list;
+	uint virt_core_list;
+	struct gxp_virtual_device *vd;
 	/*
 	 * `device_address` and `size` are the base address and size of the
 	 * user buffer a mapping represents.
@@ -46,14 +47,17 @@ struct gxp_mapping {
 };
 
 int gxp_mapping_init(struct gxp_dev *gxp);
-struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp, uint core_list,
-				       u64 user_address, size_t size, u32 flags,
+struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
+				       struct gxp_virtual_device *vd,
+				       uint virt_core_list, u64 user_address,
+				       size_t size, u32 flags,
 				       enum dma_data_direction dir);
 void gxp_mapping_destroy(struct gxp_dev *gxp, struct gxp_mapping *mapping);
 int gxp_mapping_sync(struct gxp_dev *gxp, struct gxp_mapping *mapping,
 		     u32 offset, u32 size, bool for_cpu);
 int gxp_mapping_put(struct gxp_dev *gxp, struct gxp_mapping *map);
-struct gxp_mapping *gxp_mapping_get(struct gxp_dev *gxp, u64 device_address);
+struct gxp_mapping *gxp_mapping_get(struct gxp_dev *gxp,
+				    dma_addr_t device_address);
 struct gxp_mapping *gxp_mapping_get_host(struct gxp_dev *gxp, u64 host_address);
 void gxp_mapping_remove(struct gxp_dev *gxp, struct gxp_mapping *map);
 

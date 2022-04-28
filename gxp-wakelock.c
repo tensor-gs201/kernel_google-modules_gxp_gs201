@@ -50,14 +50,6 @@ int gxp_wakelock_acquire(struct gxp_dev *gxp)
 				ret, mgr->count);
 			goto err_blk_on;
 		}
-
-		ret = gxp_dma_ssmt_program(gxp);
-		if (ret) {
-			dev_err(gxp->dev,
-				"Failed to program SSMTs after powering on BLK_AUR (ret=%d)\n",
-				ret);
-			goto err_ssmt_program;
-		}
 	}
 
 out:
@@ -65,8 +57,6 @@ out:
 
 	return ret;
 
-err_ssmt_program:
-	gxp_pm_blk_off(gxp);
 err_blk_on:
 	mgr->count--;
 	mutex_unlock(&mgr->lock);

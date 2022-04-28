@@ -21,6 +21,10 @@
 #define GXP_TIME_DELAY_FACTOR 1
 #endif
 
+#define DOORBELL_COUNT 32
+
+#define SYNC_BARRIER_COUNT 16
+
 #include "gxp-csrs.h"
 
 /* Core address space starts at Inst_BPM block */

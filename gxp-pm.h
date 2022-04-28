@@ -59,6 +59,8 @@ enum aur_power_cmu_mux_state {
  */
 #define AUR_NON_AGGRESSOR_BIT 24
 
+#define AUR_NUM_POWER_STATE_WORKER 16
+
 struct gxp_pm_device_ops {
 	int (*pre_blk_powerup)(struct gxp_dev *gxp);
 	int (*post_blk_powerup)(struct gxp_dev *gxp);
@@ -72,6 +74,7 @@ struct gxp_set_acpm_state_work {
 	unsigned long state;
 	unsigned long prev_state;
 	bool aggressor_vote;
+	bool using;
 };
 
 struct gxp_req_pm_qos_work {
@@ -79,6 +82,7 @@ struct gxp_req_pm_qos_work {
 	struct gxp_dev *gxp;
 	s32 int_val;
 	s32 mif_val;
+	bool using;
 };
 
 struct gxp_power_manager {
@@ -92,12 +96,13 @@ struct gxp_power_manager {
 	int curr_memory_state;
 	refcount_t blk_wake_ref;
 	struct gxp_pm_device_ops *ops;
-	struct gxp_set_acpm_state_work set_acpm_state_work;
-	struct gxp_req_pm_qos_work req_pm_qos_work;
+	struct gxp_set_acpm_state_work set_acpm_state_work[AUR_NUM_POWER_STATE_WORKER];
+	struct gxp_req_pm_qos_work req_pm_qos_work[AUR_NUM_POWER_STATE_WORKER];
 	struct workqueue_struct *wq;
 	/* INT/MIF requests for memory bandwidth */
 	struct exynos_pm_qos_request int_min;
 	struct exynos_pm_qos_request mif_min;
+	int force_noc_mux_normal_count;
 };
 
 /**
@@ -263,5 +268,19 @@ int gxp_pm_update_requested_power_state(struct gxp_dev *gxp,
 int gxp_pm_update_requested_memory_power_state(
 	struct gxp_dev *gxp, enum aur_memory_power_state origin_state,
 	enum aur_memory_power_state requested_state);
+
+/*
+ * gxp_pm_force_cmu_noc_user_mux_normal() - Force PLL_CON0_NOC_USER MUX switch to the
+ * normal state. This is required to guarantee LPM works when the core is starting the
+ * firmware.
+ */
+void gxp_pm_force_cmu_noc_user_mux_normal(struct gxp_dev *gxp);
+
+/*
+ * gxp_pm_check_cmu_noc_user_mux() - Check PLL_CON0_NOC_USER MUX state modified
+ * by gxp_pm_force_cmu_noc_user_mux_normal(). If the requested state is
+ * AUR_READY, should set it to AUR_CMU_MUX_LOW.
+ */
+void gxp_pm_check_cmu_noc_user_mux(struct gxp_dev *gxp);
 
 #endif /* __GXP_PM_H__ */

@@ -24,19 +24,6 @@
 #define GXP_MMAP_LOG_BUFFER_OFFSET	0x10000
 #define GXP_MMAP_TRACE_BUFFER_OFFSET	0x20000
 
-/*
- * TODO(b/209083969) The following IOCTLs will no longer require the caller
- * to hold a virtual device wakelock to call them once virtual device
- * suspend/resume is implemented:
- * - GXP_MAP_BUFFER
- * - GXP_UNMAP_BUFFER
- * - GXP_SYNC_BUFFER
- * - GXP_MAP_DMABUF
- * - GXP_UNMAP_DMABUF
- * - GXP_MAP_TPU_MBX_QUEUE
- * - GXP_UNMAP_TPU_MBX_QUEUE
- */
-
 #define GXP_IOCTL_BASE 0xEE
 
 #define GXP_INTERFACE_VERSION_BUILD_BUFFER_SIZE 64
@@ -324,7 +311,7 @@ struct gxp_map_ioctl {
 /*
  * Map host buffer.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  */
 #define GXP_MAP_BUFFER \
 	_IOWR(GXP_IOCTL_BASE, 0, struct gxp_map_ioctl)
@@ -336,7 +323,7 @@ struct gxp_map_ioctl {
  * from the kernel's internal records. It is recommended to use the argument
  * that was passed in GXP_MAP_BUFFER to un-map the buffer.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  */
 #define GXP_UNMAP_BUFFER \
 	_IOW(GXP_IOCTL_BASE, 1, struct gxp_map_ioctl)
@@ -374,7 +361,7 @@ struct gxp_sync_ioctl {
 /*
  * Sync buffer previously mapped by GXP_MAP_BUFFER.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  *
  * EINVAL: If a mapping for @device_address is not found.
  * EINVAL: If @size equals 0.
@@ -420,7 +407,7 @@ struct gxp_map_dmabuf_ioctl {
 /*
  * Map host buffer via its dma-buf FD.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  */
 #define GXP_MAP_DMABUF _IOWR(GXP_IOCTL_BASE, 20, struct gxp_map_dmabuf_ioctl)
 
@@ -431,7 +418,7 @@ struct gxp_map_dmabuf_ioctl {
  * kernel's internal records. It is recommended to use the argument that was
  * passed in GXP_MAP_DMABUF to un-map the dma-buf.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  */
 #define GXP_UNMAP_DMABUF _IOW(GXP_IOCTL_BASE, 21, struct gxp_map_dmabuf_ioctl)
 
@@ -804,7 +791,7 @@ struct gxp_tpu_mbx_queue_ioctl {
 /*
  * Map TPU-DSP mailbox cmd/rsp queue buffers.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  */
 #define GXP_MAP_TPU_MBX_QUEUE \
 	_IOW(GXP_IOCTL_BASE, 13, struct gxp_tpu_mbx_queue_ioctl)
@@ -817,7 +804,7 @@ struct gxp_tpu_mbx_queue_ioctl {
  * from the kernel's internal records. It is recommended to use the argument
  * that was passed in GXP_MAP_TPU_MBX_QUEUE to un-map the buffers.
  *
- * The client must hold a VIRTUAL_DEVICE wakelock.
+ * The client must have allocated a virtual device.
  */
 #define GXP_UNMAP_TPU_MBX_QUEUE \
 	_IOW(GXP_IOCTL_BASE, 14, struct gxp_tpu_mbx_queue_ioctl)

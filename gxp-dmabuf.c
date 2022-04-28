@@ -29,8 +29,10 @@ struct gxp_dmabuf_mapping {
 	struct sg_table *sgt;
 };
 
-struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp, uint core_list, int fd,
-				   u32 flags, enum dma_data_direction dir)
+struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
+				   struct gxp_virtual_device *vd,
+				   uint virt_core_list, int fd, u32 flags,
+				   enum dma_data_direction dir)
 {
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *attachment;
@@ -53,7 +55,7 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp, uint core_list, int fd,
 		goto err_attach;
 	}
 
-	sgt = gxp_dma_map_dmabuf_attachment(gxp, core_list, attachment, dir);
+	sgt = gxp_dma_map_dmabuf_attachment(gxp, vd, virt_core_list, attachment, dir);
 	if (IS_ERR(sgt)) {
 		dev_err(gxp->dev,
 			"Failed to map dma-buf attachment (ret=%ld)\n",
@@ -70,7 +72,7 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp, uint core_list, int fd,
 
 	/* dma-buf mappings are indicated by a host_address of 0 */
 	dmabuf_mapping->mapping.host_address = 0;
-	dmabuf_mapping->mapping.core_list = core_list;
+	dmabuf_mapping->mapping.virt_core_list = virt_core_list;
 	dmabuf_mapping->mapping.device_address = sg_dma_address(sgt->sgl);
 	dmabuf_mapping->mapping.dir = dir;
 	dmabuf_mapping->dmabuf = dmabuf;
@@ -88,7 +90,7 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp, uint core_list, int fd,
 err_put_mapping:
 	kfree(dmabuf_mapping);
 err_alloc_mapping:
-	gxp_dma_unmap_dmabuf_attachment(gxp, core_list, attachment, sgt, dir);
+	gxp_dma_unmap_dmabuf_attachment(gxp, vd, virt_core_list, attachment, sgt, dir);
 err_map_attachment:
 	dma_buf_detach(dmabuf, attachment);
 err_attach:
@@ -96,7 +98,8 @@ err_attach:
 	return ERR_PTR(ret);
 }
 
-void gxp_dmabuf_unmap(struct gxp_dev *gxp, dma_addr_t device_address)
+void gxp_dmabuf_unmap(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		      dma_addr_t device_address)
 {
 	struct gxp_dmabuf_mapping *dmabuf_mapping;
 	struct gxp_mapping *mapping;
@@ -118,7 +121,7 @@ void gxp_dmabuf_unmap(struct gxp_dev *gxp, dma_addr_t device_address)
 	dmabuf_mapping =
 		container_of(mapping, struct gxp_dmabuf_mapping, mapping);
 
-	gxp_dma_unmap_dmabuf_attachment(gxp, mapping->core_list,
+	gxp_dma_unmap_dmabuf_attachment(gxp, vd, mapping->virt_core_list,
 					dmabuf_mapping->attachment,
 					dmabuf_mapping->sgt, mapping->dir);
 	dma_buf_detach(dmabuf_mapping->dmabuf, dmabuf_mapping->attachment);

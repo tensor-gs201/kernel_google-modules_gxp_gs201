@@ -12,8 +12,10 @@ gxp-objs +=	\
 		gxp-debugfs.o \
 		gxp-dmabuf.o \
 		gxp-doorbell.o \
+		gxp-eventfd.o \
 		gxp-firmware.o \
 		gxp-firmware-data.o \
+		gxp-hw-mailbox-driver.o \
 		gxp-lpm.o \
 		gxp-mailbox.o \
 		gxp-mapping.o \
@@ -52,29 +54,12 @@ ifdef CONFIG_GXP_TEST
 	GXP_PLATFORM = CLOUDRIPPER
 endif
 
-# Default to using the HW mailbox and SysMMU
-GXP_SW_MAILBOX ?= 0
-GXP_HAS_SYSMMU ?= 1
-
-# Setup the linked mailbox implementation and definitions.
-ifeq ($(GXP_SW_MAILBOX),1)
-	ccflags-y += -DCONFIG_GXP_USE_SW_MAILBOX
-	gxp-objs += gxp-sw-mailbox-driver.o
-else
-	gxp-objs += gxp-hw-mailbox-driver.o
-endif
-
 # Setup which version of the gxp-dma interface is used.
-ifeq ($(GXP_HAS_SYSMMU),1)
-	ccflags-y += -DCONFIG_GXP_HAS_SYSMMU
-	# For gem5, need to adopt dma interface without aux domain.
-	ifeq ($(GXP_PLATFORM), GEM5)
-		gxp-objs += gxp-dma-iommu-gem5.o
-	else
-		gxp-objs += gxp-dma-iommu.o
-	endif
+# For gem5, need to adopt dma interface without aux domain.
+ifeq ($(GXP_PLATFORM), GEM5)
+	gxp-objs += gxp-dma-iommu-gem5.o
 else
-	gxp-objs += gxp-dma-rmem.o
+	gxp-objs += gxp-dma-iommu.o
 endif
 
 ccflags-y += -DCONFIG_GXP_$(GXP_PLATFORM)

@@ -18,7 +18,6 @@
 #include "gxp-mailbox.h"
 #include "gxp-mailbox-driver.h"
 #include "gxp-pm.h"
-#include "gxp-tmp.h"
 
 /* Timeout of 8s by default to account for slower emulation platforms */
 static int mbx_timeout = 8000;
@@ -40,20 +39,6 @@ module_param(mbx_timeout, int, 0660);
 #define MBOX_RESP_QUEUE_NUM_ENTRIES 1024
 #define MBOX_RESP_QUEUE_SIZE                                                   \
 	(sizeof(struct gxp_response) * MBOX_RESP_QUEUE_NUM_ENTRIES)
-
-#ifndef CONFIG_GXP_HAS_SYSMMU
-/* Constants for static queues in systems without a SysMMU */
-
-/*
- * Queues in scratchpad space start at 0x280 to allow 0x180 of space for
- * emulated registers in systems using software mailboxes.
- */
-#define MBOX_CMD_QUEUE_SCRATCHPAD_OFFSET 0x280
-#define MBOX_RESP_QUEUE_SCRATCHPAD_OFFSET                                      \
-	(MBOX_CMD_QUEUE_SCRATCHPAD_OFFSET + MBOX_CMD_QUEUE_SIZE)
-#define MBOX_DESCRIPTOR_SCRATCHPAD_OFFSET                                      \
-	(MBOX_RESP_QUEUE_SCRATCHPAD_OFFSET + MBOX_RESP_QUEUE_SIZE)
-#endif
 
 /*
  * Returns the number of elements in a circular queue given its @head, @tail,
@@ -272,11 +257,11 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 				 * might consume and free the response before
 				 * this function is done with it.
 				 */
-				if (async_resp->client) {
-					gxp_client_signal_mailbox_eventfd(
-						async_resp->client,
-						mailbox->core_id);
+				if (async_resp->eventfd) {
+					gxp_eventfd_signal(async_resp->eventfd);
+					gxp_eventfd_put(async_resp->eventfd);
 				}
+
 				wake_up(async_resp->dest_queue_waitq);
 
 				spin_unlock_irqrestore(
@@ -416,7 +401,8 @@ static inline void gxp_mailbox_handle_irq(struct gxp_mailbox *mailbox)
 #define _RESPONSE_WORKQUEUE_NAME(_x_) "gxp_responses_" #_x_
 #define RESPONSE_WORKQUEUE_NAME(_x_) _RESPONSE_WORKQUEUE_NAME(_x_)
 static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
-					  u8 core_id)
+					  struct gxp_virtual_device *vd,
+					  uint virt_core, u8 core_id)
 {
 	struct gxp_mailbox *mailbox;
 
@@ -431,7 +417,7 @@ static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 
 	/* Allocate and initialize the command queue */
 	mailbox->cmd_queue = (struct gxp_command *)gxp_dma_alloc_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
+		mailbox->gxp, vd, BIT(virt_core),
 		sizeof(struct gxp_command) * MBOX_CMD_QUEUE_NUM_ENTRIES,
 		&(mailbox->cmd_queue_device_addr), GFP_KERNEL, 0);
 	if (!mailbox->cmd_queue)
@@ -443,7 +429,7 @@ static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 
 	/* Allocate and initialize the response queue */
 	mailbox->resp_queue = (struct gxp_response *)gxp_dma_alloc_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
+		mailbox->gxp, vd, BIT(virt_core),
 		sizeof(struct gxp_response) * MBOX_RESP_QUEUE_NUM_ENTRIES,
 		&(mailbox->resp_queue_device_addr), GFP_KERNEL, 0);
 	if (!mailbox->resp_queue)
@@ -456,7 +442,7 @@ static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 	/* Allocate and initialize the mailbox descriptor */
 	mailbox->descriptor =
 		(struct gxp_mailbox_descriptor *)gxp_dma_alloc_coherent(
-			mailbox->gxp, BIT(mailbox->core_id),
+			mailbox->gxp, vd, BIT(virt_core),
 			sizeof(struct gxp_mailbox_descriptor),
 			&(mailbox->descriptor_device_addr), GFP_KERNEL, 0);
 	if (!mailbox->descriptor)
@@ -477,18 +463,18 @@ static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 	return mailbox;
 
 err_workqueue:
-	gxp_dma_free_coherent(mailbox->gxp, BIT(mailbox->core_id),
+	gxp_dma_free_coherent(mailbox->gxp, vd, BIT(virt_core),
 			      sizeof(struct gxp_mailbox_descriptor),
 			      mailbox->descriptor,
 			      mailbox->descriptor_device_addr);
 err_descriptor:
 	gxp_dma_free_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
+		mailbox->gxp, vd, BIT(virt_core),
 		sizeof(struct gxp_response) * mailbox->resp_queue_size,
 		mailbox->resp_queue, mailbox->resp_queue_device_addr);
 err_resp_queue:
 	gxp_dma_free_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
+		mailbox->gxp, vd, BIT(virt_core),
 		sizeof(struct gxp_command) * mailbox->cmd_queue_size,
 		mailbox->cmd_queue, mailbox->cmd_queue_device_addr);
 err_cmd_queue:
@@ -520,11 +506,12 @@ static void enable_mailbox(struct gxp_mailbox *mailbox)
 }
 
 struct gxp_mailbox *gxp_mailbox_alloc(struct gxp_mailbox_manager *mgr,
-				      u8 core_id)
+				      struct gxp_virtual_device *vd,
+				      uint virt_core, u8 core_id)
 {
 	struct gxp_mailbox *mailbox;
 
-	mailbox = create_mailbox(mgr, core_id);
+	mailbox = create_mailbox(mgr, vd, virt_core, core_id);
 	if (IS_ERR(mailbox))
 		return mailbox;
 
@@ -534,7 +521,8 @@ struct gxp_mailbox *gxp_mailbox_alloc(struct gxp_mailbox_manager *mgr,
 }
 
 void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
-			struct gxp_mailbox *mailbox)
+			 struct gxp_virtual_device *vd, uint virt_core,
+			 struct gxp_mailbox *mailbox)
 {
 	int i;
 	struct gxp_mailbox_wait_list *cur, *nxt;
@@ -622,14 +610,14 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 
 	/* Clean up resources */
 	gxp_dma_free_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
+		mailbox->gxp, vd, BIT(virt_core),
 		sizeof(struct gxp_command) * mailbox->cmd_queue_size,
 		mailbox->cmd_queue, mailbox->cmd_queue_device_addr);
 	gxp_dma_free_coherent(
-		mailbox->gxp, BIT(mailbox->core_id),
+		mailbox->gxp, vd, BIT(virt_core),
 		sizeof(struct gxp_response) * mailbox->resp_queue_size,
 		mailbox->resp_queue, mailbox->resp_queue_device_addr);
-	gxp_dma_free_coherent(mailbox->gxp, BIT(mailbox->core_id),
+	gxp_dma_free_coherent(mailbox->gxp, vd, BIT(virt_core),
 			      sizeof(struct gxp_mailbox_descriptor),
 			      mailbox->descriptor,
 			      mailbox->descriptor_device_addr);
@@ -820,10 +808,9 @@ static void async_cmd_timeout_work(struct work_struct *work)
 				async_resp->gxp_power_state,
 				async_resp->requested_aggressor, AUR_OFF, true);
 
-		if (async_resp->client) {
-			gxp_client_signal_mailbox_eventfd(
-				async_resp->client,
-				async_resp->mailbox->core_id);
+		if (async_resp->eventfd) {
+			gxp_eventfd_signal(async_resp->eventfd);
+			gxp_eventfd_put(async_resp->eventfd);
 		}
 
 		wake_up(async_resp->dest_queue_waitq);
@@ -839,7 +826,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  wait_queue_head_t *queue_waitq,
 				  uint gxp_power_state, uint memory_power_state,
 				  bool requested_aggressor,
-				  struct gxp_client *client)
+				  struct gxp_eventfd *eventfd)
 {
 	struct gxp_async_response *async_resp;
 	int ret;
@@ -854,8 +841,11 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	async_resp->dest_queue_waitq = queue_waitq;
 	async_resp->gxp_power_state = gxp_power_state;
 	async_resp->memory_power_state = memory_power_state;
-	async_resp->client = client;
 	async_resp->requested_aggressor = requested_aggressor;
+	if (eventfd && gxp_eventfd_get(eventfd))
+		async_resp->eventfd = eventfd;
+	else
+		async_resp->eventfd = NULL;
 
 	INIT_DELAYED_WORK(&async_resp->timeout_work, async_cmd_timeout_work);
 	schedule_delayed_work(&async_resp->timeout_work,

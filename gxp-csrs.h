@@ -57,9 +57,6 @@ enum gxp_core_csrs {
 	GXP_REG_ETM_PWRCTL = 0xB020,
 };
 
-#define DOORBELL_COUNT 32
-
-#define SYNC_BARRIER_COUNT 16
 #define SYNC_BARRIER_SHADOW_OFFSET 0x800
 
 #define CORE_PD_BASE(_x_)	((_x_) << 2)

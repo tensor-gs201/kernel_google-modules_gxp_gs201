@@ -27,8 +27,10 @@ int gxp_mapping_init(struct gxp_dev *gxp)
 	return 0;
 }
 
-struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp, uint core_list,
-				       u64 user_address, size_t size, u32 flags,
+struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
+				       struct gxp_virtual_device *vd,
+				       uint virt_core_list, u64 user_address,
+				       size_t size, u32 flags,
 				       enum dma_data_direction dir)
 {
 	struct gxp_mapping *mapping = NULL;
@@ -90,7 +92,8 @@ struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp, uint core_list,
 		goto error_unpin_pages;
 	}
 	mapping->host_address = user_address;
-	mapping->core_list = core_list;
+	mapping->virt_core_list = virt_core_list;
+	mapping->vd = vd;
 	mapping->size = size;
 	mapping->map_count = 1;
 	mapping->gxp_dma_flags = flags;
@@ -104,8 +107,8 @@ struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp, uint core_list,
 	}
 
 	/* map the user pages */
-	ret = gxp_dma_map_sg(gxp, mapping->core_list, mapping->sgt.sgl,
-			     mapping->sgt.nents, mapping->dir,
+	ret = gxp_dma_map_sg(gxp, mapping->vd, mapping->virt_core_list,
+			     mapping->sgt.sgl, mapping->sgt.nents, mapping->dir,
 			     DMA_ATTR_SKIP_CPU_SYNC, mapping->gxp_dma_flags);
 	if (!ret) {
 		dev_dbg(gxp->dev, "Failed to map sgt (ret=%d)\n", ret);
@@ -144,9 +147,9 @@ void gxp_mapping_destroy(struct gxp_dev *gxp, struct gxp_mapping *mapping)
 	 * user requires a mapping be synced before unmapping, they are
 	 * responsible for calling `gxp_mapping_sync()` before hand.
 	 */
-	gxp_dma_unmap_sg(gxp, mapping->core_list, mapping->sgt.sgl,
-			 mapping->sgt.orig_nents, mapping->dir,
-			 DMA_ATTR_SKIP_CPU_SYNC);
+	gxp_dma_unmap_sg(gxp, mapping->vd, mapping->virt_core_list,
+			 mapping->sgt.sgl, mapping->sgt.orig_nents,
+			 mapping->dir, DMA_ATTR_SKIP_CPU_SYNC);
 
 	/* Unpin the user pages */
 	for_each_sg_page(mapping->sgt.sgl, &sg_iter, mapping->sgt.orig_nents,
@@ -255,8 +258,8 @@ int gxp_mapping_put(struct gxp_dev *gxp, struct gxp_mapping *map)
 {
 	struct rb_node **link;
 	struct rb_node *parent = NULL;
-	u64 device_address = map->device_address;
-	struct gxp_mapping *this;
+	dma_addr_t device_address = map->device_address;
+	struct gxp_mapping *mapping;
 
 	link = &gxp->mappings->rb.rb_node;
 
@@ -265,11 +268,11 @@ int gxp_mapping_put(struct gxp_dev *gxp, struct gxp_mapping *map)
 	/* Figure out where to put new node */
 	while (*link) {
 		parent = *link;
-		this = rb_entry(parent, struct gxp_mapping, node);
+		mapping = rb_entry(parent, struct gxp_mapping, node);
 
-		if (this->device_address > device_address)
+		if (mapping->device_address > device_address)
 			link = &(*link)->rb_left;
-		else if (this->device_address < device_address)
+		else if (mapping->device_address < device_address)
 			link = &(*link)->rb_right;
 		else
 			goto out;
@@ -285,42 +288,43 @@ int gxp_mapping_put(struct gxp_dev *gxp, struct gxp_mapping *map)
 
 out:
 	mutex_unlock(&gxp->mappings->lock);
-	dev_err(gxp->dev, "Duplicate mapping: 0x%llx", map->device_address);
+	dev_err(gxp->dev, "Duplicate mapping: %pad", &map->device_address);
 	return -EINVAL;
 }
 
-struct gxp_mapping *gxp_mapping_get(struct gxp_dev *gxp, u64 device_address)
+struct gxp_mapping *gxp_mapping_get(struct gxp_dev *gxp,
+				    dma_addr_t device_address)
 {
 	struct rb_node *node;
-	struct gxp_mapping *this;
+	struct gxp_mapping *mapping;
 
 	mutex_lock(&gxp->mappings->lock);
 
 	node = gxp->mappings->rb.rb_node;
 
 	while (node) {
-		this = rb_entry(node, struct gxp_mapping, node);
+		mapping = rb_entry(node, struct gxp_mapping, node);
 
-		if (this->device_address > device_address) {
+		if (mapping->device_address > device_address) {
 			node = node->rb_left;
-		} else if (this->device_address < device_address) {
+		} else if (mapping->device_address < device_address) {
 			node = node->rb_right;
 		} else {
 			mutex_unlock(&gxp->mappings->lock);
-			return this;  /* Found it */
+			return mapping;  /* Found it */
 		}
 	}
 
 	mutex_unlock(&gxp->mappings->lock);
 
-	dev_err(gxp->dev, "Mapping not found: 0x%llx", device_address);
+	dev_err(gxp->dev, "Mapping not found: %pad", &device_address);
 	return NULL;
 }
 
 struct gxp_mapping *gxp_mapping_get_host(struct gxp_dev *gxp, u64 host_address)
 {
 	struct rb_node *node;
-	struct gxp_mapping *this;
+	struct gxp_mapping *mapping;
 
 	mutex_lock(&gxp->mappings->lock);
 
@@ -332,10 +336,10 @@ struct gxp_mapping *gxp_mapping_get_host(struct gxp_dev *gxp, u64 host_address)
 
 	/* Iterate through the elements in the rbtree */
 	for (node = rb_first(&gxp->mappings->rb); node; node = rb_next(node)) {
-		this = rb_entry(node, struct gxp_mapping, node);
-		if (this->host_address == host_address) {
+		mapping = rb_entry(node, struct gxp_mapping, node);
+		if (mapping->host_address == host_address) {
 			mutex_unlock(&gxp->mappings->lock);
-			return this;
+			return mapping;
 		}
 	}
 

@@ -19,13 +19,14 @@ struct gxp_client *gxp_client_create(struct gxp_dev *gxp)
 {
 	struct gxp_client *client;
 
-	client = kmalloc(sizeof(*client), GFP_KERNEL);
+	client = kzalloc(sizeof(*client), GFP_KERNEL);
 	if (!client)
 		return ERR_PTR(-ENOMEM);
 
 	client->gxp = gxp;
 	init_rwsem(&client->semaphore);
 	client->has_block_wakelock = false;
+	client->has_vd_wakelock = false;
 	client->requested_power_state = AUR_OFF;
 	client->requested_memory_power_state = 0;
 	client->vd = NULL;
@@ -46,7 +47,7 @@ void gxp_client_destroy(struct gxp_client *client)
 	 * Unmap TPU buffers, if the mapping is already removed, this
 	 * is a no-op.
 	 */
-	gxp_dma_unmap_tpu_buffer(gxp, client->mbx_desc);
+	gxp_dma_unmap_tpu_buffer(gxp, client->vd, client->mbx_desc);
 #endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
 	if (client->has_vd_wakelock)
@@ -54,7 +55,7 @@ void gxp_client_destroy(struct gxp_client *client)
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (client->mb_eventfds[core])
-			eventfd_ctx_put(client->mb_eventfds[core]);
+			gxp_eventfd_put(client->mb_eventfds[core]);
 	}
 
 	up_write(&gxp->vd_semaphore);
@@ -69,29 +70,8 @@ void gxp_client_destroy(struct gxp_client *client)
 			AUR_MEM_UNDEFINED);
 	}
 
-	gxp_vd_release(client->vd);
+	if (client->vd)
+		gxp_vd_release(client->vd);
 
 	kfree(client);
-}
-
-void gxp_client_signal_mailbox_eventfd(struct gxp_client *client,
-				       uint phys_core)
-{
-	int virtual_core;
-
-	down_read(&client->semaphore);
-
-	virtual_core = gxp_vd_phys_core_to_virt_core(client->vd, phys_core);
-	if (unlikely(virtual_core < 0)) {
-		dev_err(client->gxp->dev,
-			"%s: core %d is not part of client's virtual device.\n",
-			__func__, phys_core);
-		goto out;
-	}
-
-	if (client->mb_eventfds[virtual_core])
-		eventfd_signal(client->mb_eventfds[virtual_core], 1);
-
-out:
-	up_read(&client->semaphore);
 }

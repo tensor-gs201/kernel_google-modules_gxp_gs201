@@ -20,11 +20,11 @@
 #include <linux/spinlock.h>
 
 #include "gxp-config.h"
-#include "gxp-tmp.h"
 
 /* Holds Client's TPU mailboxes info used during mapping */
 struct gxp_tpu_mbx_desc {
 	uint phys_core_list;
+	uint virt_core_list;
 	size_t cmdq_size, respq_size;
 };
 
@@ -34,11 +34,6 @@ struct gxp_mapped_resource {
 	phys_addr_t paddr;		 /* starting physical address */
 	dma_addr_t daddr;		 /* starting device address */
 	resource_size_t size;		 /* size in bytes */
-};
-
-struct mailbox_resp_list {
-	struct list_head list;
-	struct gxp_response *resp;
 };
 
 /* Structure to hold TPU device info */
@@ -71,13 +66,6 @@ struct gxp_dev {
 	struct gxp_mapped_resource cmu; /* CMU CSRs */
 	struct gxp_mailbox_manager *mailbox_mgr;
 	struct gxp_power_manager *power_mgr;
-	/*
-	 * TODO(b/182416287): This should be a rb_tree of lists keyed by
-	 * virtual device. For now, keep an array of one list per physical core
-	 */
-	struct list_head mailbox_resp_queues[GXP_NUM_CORES];
-	wait_queue_head_t mailbox_resp_waitqs[GXP_NUM_CORES];
-	spinlock_t mailbox_resps_lock;
 	struct gxp_debug_dump_manager *debug_dump_mgr;
 	struct gxp_mapping_root *mappings;	/* tree of user mappings */
 	u32 firmware_running;		 /* firmware status bitmap */
@@ -140,61 +128,6 @@ static inline void gxp_write_32_core(struct gxp_dev *gxp, uint core,
 	uint offset = GXP_CORE_0_BASE + (GXP_CORE_SIZE * core) + reg_offset;
 
 	gxp_write_32(gxp, offset, value);
-}
-
-static inline void gxp_acquire_sync_barrier(struct gxp_dev *gxp, uint index)
-{
-	uint barrier_reg_offset;
-
-	if (index >= SYNC_BARRIER_COUNT) {
-		dev_err(gxp->dev,
-			"Attempt to acquire non-existent sync barrier: %d\n",
-			index);
-		return;
-	}
-
-	barrier_reg_offset = SYNC_BARRIER_BLOCK + SYNC_BARRIER_BASE(index);
-	while (gxp_read_32(gxp, barrier_reg_offset) !=
-	       SYNC_BARRIER_FREE_VALUE) {
-		/*
-		 * Sleep for the minimum amount.
-		 * msleep(1~20) may not do what the caller intends, and will
-		 * often sleep longer (~20 ms actual sleep for any value given
-		 * in the 1~20ms range).
-		 */
-		msleep(20);
-	}
-}
-
-static inline void gxp_release_sync_barrier(struct gxp_dev *gxp, uint index)
-{
-	uint barrier_reg_offset;
-
-	if (index >= SYNC_BARRIER_COUNT) {
-		dev_err(gxp->dev,
-			"Attempt to acquire non-existent sync barrier: %d\n",
-			index);
-		return;
-	}
-
-	barrier_reg_offset = SYNC_BARRIER_BLOCK + SYNC_BARRIER_BASE(index);
-	gxp_write_32(gxp, barrier_reg_offset, 1);
-}
-static inline u32 gxp_read_sync_barrier_shadow(struct gxp_dev *gxp, uint index)
-{
-	uint barrier_reg_offset;
-
-	if (index >= SYNC_BARRIER_COUNT) {
-		dev_err(gxp->dev,
-			"Attempt to read non-existent sync barrier: %0u\n",
-			index);
-		return 0;
-	}
-
-	barrier_reg_offset = SYNC_BARRIER_BLOCK + SYNC_BARRIER_BASE(index) +
-			     SYNC_BARRIER_SHADOW_OFFSET;
-
-	return gxp_read_32(gxp, barrier_reg_offset);
 }
 
 static inline int gxp_acquire_rmem_resource(struct gxp_dev *gxp,

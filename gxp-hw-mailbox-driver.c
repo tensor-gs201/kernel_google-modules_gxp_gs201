@@ -10,10 +10,9 @@
 #include <linux/kthread.h>
 #include <linux/of_irq.h>
 
-#include "gxp-tmp.h"
-#include "gxp-mailbox.h"
 #include "gxp-mailbox-driver.h"
 #include "gxp-mailbox-regs.h"
+#include "gxp-mailbox.h"
 
 static u32 csr_read(struct gxp_mailbox *mailbox, uint reg_offset)
 {

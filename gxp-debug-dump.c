@@ -21,11 +21,13 @@
 #include "gxp-doorbell.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
-#include "gxp-tmp.h"
 
 #define GXP_COREDUMP_PENDING 0xF
 #define KERNEL_INIT_DUMP_TIMEOUT (10000 * GXP_TIME_DELAY_FACTOR)
 #define SSCD_MSG_LENGTH 64
+
+#define SYNC_BARRIER_BLOCK	0x00100000
+#define SYNC_BARRIER_BASE(_x_)	((_x_) << 12)
 
 /* Enum indicating the debug dump request reason. */
 enum gxp_debug_dump_init_type {
@@ -50,6 +52,22 @@ static void gxp_debug_dump_cache_flush(struct gxp_dev *gxp)
 	return;
 }
 
+static u32 gxp_read_sync_barrier_shadow(struct gxp_dev *gxp, uint index)
+{
+	uint barrier_reg_offset;
+
+	if (index >= SYNC_BARRIER_COUNT) {
+		dev_err(gxp->dev,
+			"Attempt to read non-existent sync barrier: %0u\n",
+			index);
+		return 0;
+	}
+
+	barrier_reg_offset = SYNC_BARRIER_BLOCK + SYNC_BARRIER_BASE(index) +
+			     SYNC_BARRIER_SHADOW_OFFSET;
+
+	return gxp_read_32(gxp, barrier_reg_offset);
+}
 
 static void
 gxp_get_common_registers(struct gxp_dev *gxp, struct gxp_seg_header *seg_header,

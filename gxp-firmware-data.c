@@ -9,12 +9,11 @@
 #include <linux/dma-mapping.h>
 #include <linux/genalloc.h>
 
-#include "gxp.h"
 #include "gxp-firmware-data.h"
 #include "gxp-host-device-structs.h"
 #include "gxp-internal.h"
 #include "gxp-range-alloc.h"
-#include "gxp-tmp.h"
+#include "gxp.h"
 
 /*
  * The minimum alignment order (power of 2) of allocations in the firmware data
@@ -27,11 +26,9 @@
 
 /* IDs for dedicated doorbells used by some system components */
 #define DOORBELL_ID_CORE_WAKEUP		0
-#define DOORBELL_ID_SW_MBX(_core_)	(31 - _core_)
 
 /* IDs for dedicated sync barriers used by some system components */
 #define SYNC_BARRIER_ID_UART		1
-#define SYNC_BARRIER_ID_SW_MBX		15
 
 /* Default application parameters */
 #define DEFAULT_APP_ID			1
@@ -73,16 +70,10 @@ struct gxp_fw_data_manager {
 	/* Doorbells allocator and reserved doorbell IDs */
 	struct range_alloc *doorbell_allocator;
 	int cores_wakeup_doorbell;
-#ifdef CONFIG_GXP_USE_SW_MAILBOX
-	int core_sw_mailbox_doorbells[NUM_CORES];
-#endif  // CONFIG_GXP_USE_SW_MAILBOX
 	int semaphore_doorbells[NUM_CORES];
 
 	/* Sync barriers allocator and reserved sync barrier IDs */
 	struct range_alloc *sync_barrier_allocator;
-#ifdef CONFIG_GXP_USE_SW_MAILBOX
-	int sw_mailbox_barrier;
-#endif  // CONFIG_GXP_USE_SW_MAILBOX
 	int uart_sync_barrier;
 	int timer_regions_barrier;
 	int watchdog_region_barrier;
@@ -506,15 +497,6 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 	if (res)
 		goto err;
 
-#ifdef CONFIG_GXP_USE_SW_MAILBOX
-	/* Pinned: SW mailbox doorbells */
-	for (i = 0; i < NUM_CORES; i++) {
-		mgr->core_sw_mailbox_doorbells[i] = DOORBELL_ID_SW_MBX(i);
-		range_alloc_get(mgr->doorbell_allocator,
-				mgr->core_sw_mailbox_doorbells[i]);
-	}
-#endif  // CONFIG_GXP_USE_SW_MAILBOX
-
 	/* Semaphores operation doorbells */
 	for (i = 0; i < NUM_CORES; i++) {
 		range_alloc_get_any(mgr->doorbell_allocator,
@@ -530,15 +512,6 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 			      mgr->uart_sync_barrier);
 	if (res)
 		goto err;
-
-#ifdef CONFIG_GXP_USE_SW_MAILBOX
-	/* Pinned: SW MBX sync barrier */
-	mgr->sw_mailbox_barrier = SYNC_BARRIER_ID_SW_MBX;
-	res = range_alloc_get(mgr->sync_barrier_allocator,
-			      mgr->sw_mailbox_barrier);
-	if (res)
-		goto err;
-#endif  // CONFIG_GXP_USE_SW_MAILBOX
 
 	/* Doorbell regions for all apps */
 	res = range_alloc_get_any(mgr->sync_barrier_allocator,

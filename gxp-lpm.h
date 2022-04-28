@@ -46,6 +46,13 @@ enum lpm_state {
 #define AUR_DVFS_DEBUG_REQ (1 << 31)
 #define AUR_DEBUG_CORE_FREQ (AUR_DVFS_DEBUG_REQ | (3 << 27))
 
+#define PSM_INIT_DONE_MASK	0x80
+#define PSM_CURR_STATE_MASK	0x0F
+#define PSM_STATE_VALID_MASK	0x10
+
+#define PSM_HW_MODE		0x0
+#define PSM_START		0x1
+
 /*
  * Initializes the power manager for the first time after block power up.
  * The function needs to be called once after a block power up event.
@@ -69,6 +76,11 @@ void gxp_lpm_down(struct gxp_dev *gxp, uint core);
  * PSM0-PSM3 are for core0-core3, PSM4 is the TOP LPM.
  */
 bool gxp_lpm_is_initialized(struct gxp_dev *gxp, uint psm);
+
+/*
+ * Return whether the specified PSM is powered.
+ */
+bool gxp_lpm_is_powered(struct gxp_dev *gxp, uint psm);
 
 static inline u32 lpm_read_32(struct gxp_dev *gxp, uint reg_offset)
 {

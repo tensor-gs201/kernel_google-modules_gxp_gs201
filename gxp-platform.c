@@ -128,7 +128,6 @@ static int gxp_map_buffer(struct gxp_client *client,
 	struct gxp_map_ioctl ibuf;
 	struct gxp_mapping *map;
 	int ret = 0;
-	uint phys_core_list;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
@@ -141,49 +140,21 @@ static int gxp_map_buffer(struct gxp_client *client,
 			"Mapped buffers must be cache line aligned and padded.\n");
 		return -EINVAL;
 	}
+	if (ibuf.virtual_core_list == 0)
+		return -EINVAL;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_MAP_BUFFER requires the client hold a VIRTUAL_DEVICE wakelock\n");
+			"GXP_MAP_BUFFER requires the client allocate a VIRTUAL_DEVICE\n");
 		ret = -ENODEV;
 		goto out;
 	}
 
-	phys_core_list = gxp_vd_virt_core_list_to_phys_core_list(
-		client->vd, ibuf.virtual_core_list);
-	if (phys_core_list == 0) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-#ifndef CONFIG_GXP_HAS_SYSMMU
-	/*
-	 * TODO(b/193272602) On systems without a SysMMU, all attempts to map
-	 * the same buffer must use the same mapping/bounce buffer or cores
-	 * may corrupt each others' updates to the buffer. Once mirror mapping
-	 * is supported, and a buffer can be mapped to multiple cores at once,
-	 * attempting to remap a buffer can be considered an error and this
-	 * check removed.
-	 */
-	/* Check if this buffer has already been mapped */
-	map = gxp_mapping_get_host(gxp, ibuf.host_address);
-	if (map) {
-		ibuf.device_address = map->device_address;
-		if (copy_to_user(argp, &ibuf, sizeof(ibuf))) {
-			ret = -EFAULT;
-			goto out
-		}
-
-		map->map_count++;
-		goto out;
-	}
-#endif
-
-	map = gxp_mapping_create(gxp, phys_core_list, ibuf.host_address,
-				 ibuf.size, /*gxp_dma_flags=*/0,
+	map = gxp_mapping_create(gxp, client->vd, ibuf.virtual_core_list,
+				 ibuf.host_address, ibuf.size,
+				 /*gxp_dma_flags=*/0,
 				 mapping_flags_to_dma_dir(ibuf.flags));
 	if (IS_ERR(map)) {
 		ret = PTR_ERR(map);
@@ -226,17 +197,16 @@ static int gxp_unmap_buffer(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_UNMAP_BUFFER requires the client hold a VIRTUAL_DEVICE wakelock\n");
+			"GXP_UNMAP_BUFFER requires the client allocate a VIRTUAL_DEVICE\n");
 		ret = -ENODEV;
 		goto out;
 	}
 
-	map = gxp_mapping_get(gxp, ibuf.device_address);
+	map = gxp_mapping_get(gxp, (dma_addr_t)ibuf.device_address);
 	if (!map) {
 		ret = -EINVAL;
 		goto out;
@@ -270,17 +240,16 @@ static int gxp_sync_buffer(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_SYNC_BUFFER requires the client hold a VIRTUAL_DEVICE wakelock\n");
+			"GXP_SYNC_BUFFER requires the client allocate a VIRTUAL_DEVICE\n");
 		ret = -ENODEV;
 		goto out;
 	}
 
-	map = gxp_mapping_get(gxp, ibuf.device_address);
+	map = gxp_mapping_get(gxp, (dma_addr_t)ibuf.device_address);
 	if (!map) {
 		ret = -EINVAL;
 		goto out;
@@ -303,7 +272,7 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 	struct gxp_mailbox_command_compat_ioctl ibuf;
 	struct gxp_command cmd;
 	struct buffer_descriptor buffer;
-	int phys_core;
+	int virt_core, phys_core;
 	int ret = 0;
 	uint gxp_power_state, memory_power_state;
 
@@ -319,15 +288,18 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 	if (!client->has_vd_wakelock) {
 		dev_err(gxp->dev,
 			"GXP_MAILBOX_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
 
-	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
+	down_read(&gxp->vd_semaphore);
+
+	virt_core = ibuf.virtual_core_id;
+	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virt_core);
 	if (phys_core < 0) {
 		dev_err(gxp->dev,
 			"Mailbox command failed: Invalid virtual core id (%u)\n",
-			ibuf.virtual_core_id);
+			virt_core);
 		ret = -EINVAL;
 		goto out;
 	}
@@ -359,13 +331,13 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 	gxp_power_state = AUR_OFF;
 	memory_power_state = AUR_MEM_UNDEFINED;
 
-	down_read(&gxp->vd_semaphore);
 	ret = gxp_mailbox_execute_cmd_async(
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
-		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
-		&gxp->mailbox_resp_waitqs[phys_core], gxp_power_state,
-		memory_power_state, true, client);
-	up_read(&gxp->vd_semaphore);
+		&client->vd->mailbox_resp_queues[virt_core].queue,
+		&client->vd->mailbox_resp_queues[virt_core].lock,
+		&client->vd->mailbox_resp_queues[virt_core].waitq,
+		gxp_power_state, memory_power_state, true,
+		client->mb_eventfds[virt_core]);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
 			ret);
@@ -380,6 +352,7 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 	}
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_read(&client->semaphore);
 
 	return ret;
@@ -392,7 +365,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	struct gxp_mailbox_command_ioctl ibuf;
 	struct gxp_command cmd;
 	struct buffer_descriptor buffer;
-	int phys_core;
+	int virt_core, phys_core;
 	int ret = 0;
 	uint gxp_power_state, memory_power_state;
 	bool requested_aggressor = false;
@@ -424,15 +397,18 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	if (!client->has_vd_wakelock) {
 		dev_err(gxp->dev,
 			"GXP_MAILBOX_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
 
-	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
+	down_read(&gxp->vd_semaphore);
+
+	virt_core = ibuf.virtual_core_id;
+	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virt_core);
 	if (phys_core < 0) {
 		dev_err(gxp->dev,
 			"Mailbox command failed: Invalid virtual core id (%u)\n",
-			ibuf.virtual_core_id);
+			virt_core);
 		ret = -EINVAL;
 		goto out;
 	}
@@ -465,13 +441,13 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	memory_power_state = aur_memory_state_array[ibuf.memory_power_state];
 	requested_aggressor = (ibuf.power_flags & GXP_POWER_NON_AGGRESSOR) == 0;
 
-	down_read(&gxp->vd_semaphore);
 	ret = gxp_mailbox_execute_cmd_async(
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
-		&gxp->mailbox_resp_queues[phys_core], &gxp->mailbox_resps_lock,
-		&gxp->mailbox_resp_waitqs[phys_core], gxp_power_state,
-		memory_power_state, requested_aggressor, client);
-	up_read(&gxp->vd_semaphore);
+		&client->vd->mailbox_resp_queues[virt_core].queue,
+		&client->vd->mailbox_resp_queues[virt_core].lock,
+		&client->vd->mailbox_resp_queues[virt_core].waitq,
+		gxp_power_state, memory_power_state, requested_aggressor,
+		client->mb_eventfds[virt_core]);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
 			ret);
@@ -486,6 +462,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	}
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_read(&client->semaphore);
 
 	return ret;
@@ -495,10 +472,9 @@ static int gxp_mailbox_response(struct gxp_client *client,
 				struct gxp_mailbox_response_ioctl __user *argp)
 {
 	struct gxp_dev *gxp = client->gxp;
-	u16 virtual_core_id;
 	struct gxp_mailbox_response_ioctl ibuf;
 	struct gxp_async_response *resp_ptr;
-	int phys_core;
+	int virt_core;
 	unsigned long flags;
 	int ret = 0;
 
@@ -515,23 +491,16 @@ static int gxp_mailbox_response(struct gxp_client *client,
 		goto out;
 	}
 
-	virtual_core_id = ibuf.virtual_core_id;
-	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virtual_core_id);
-	if (phys_core < 0) {
+	virt_core = ibuf.virtual_core_id;
+	if (virt_core >= client->vd->num_cores) {
 		dev_err(gxp->dev, "Mailbox response failed: Invalid virtual core id (%u)\n",
-			virtual_core_id);
+			virt_core);
 		ret = -EINVAL;
 		goto out;
 	}
 
-	if (!gxp_is_fw_running(gxp, phys_core)) {
-		dev_err(gxp->dev, "Cannot process mailbox response for core %d when firmware isn't running\n",
-			phys_core);
-		ret = -EINVAL;
-		goto out;
-	}
-
-	spin_lock_irqsave(&gxp->mailbox_resps_lock, flags);
+	spin_lock_irqsave(&client->vd->mailbox_resp_queues[virt_core].lock,
+			  flags);
 
 	/*
 	 * No timeout is required since commands have a hard timeout after
@@ -544,20 +513,26 @@ static int gxp_mailbox_response(struct gxp_client *client,
 	 * proceed per wake event.
 	 */
 	wait_event_exclusive_cmd(
-		gxp->mailbox_resp_waitqs[phys_core],
-		!list_empty(&(gxp->mailbox_resp_queues[phys_core])),
+		client->vd->mailbox_resp_queues[virt_core].waitq,
+		!list_empty(&client->vd->mailbox_resp_queues[virt_core].queue),
 		/* Release the lock before sleeping */
-		spin_unlock_irqrestore(&gxp->mailbox_resps_lock, flags),
+		spin_unlock_irqrestore(
+			&client->vd->mailbox_resp_queues[virt_core].lock,
+			flags),
 		/* Reacquire the lock after waking */
-		spin_lock_irqsave(&gxp->mailbox_resps_lock, flags));
+		spin_lock_irqsave(
+			&client->vd->mailbox_resp_queues[virt_core].lock,
+			flags));
 
-	resp_ptr = list_first_entry(&(gxp->mailbox_resp_queues[phys_core]),
-				    struct gxp_async_response, list_entry);
+	resp_ptr = list_first_entry(
+		&client->vd->mailbox_resp_queues[virt_core].queue,
+		struct gxp_async_response, list_entry);
 
 	/* Pop the front of the response list */
 	list_del(&(resp_ptr->list_entry));
 
-	spin_unlock_irqrestore(&gxp->mailbox_resps_lock, flags);
+	spin_unlock_irqrestore(&client->vd->mailbox_resp_queues[virt_core].lock,
+			       flags);
 
 	ibuf.sequence_number = resp_ptr->resp.seq;
 	switch (resp_ptr->resp.status) {
@@ -691,9 +666,11 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	if (!client->has_vd_wakelock) {
 		dev_err(gxp->dev,
 			"GXP_ETM_TRACE_START_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
+
+	down_read(&gxp->vd_semaphore);
 
 	phys_core =
 		gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
@@ -711,6 +688,7 @@ gxp_etm_trace_start_command(struct gxp_client *client,
 	 */
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_read(&client->semaphore);
 
 	return ret;
@@ -733,10 +711,11 @@ static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
 	if (!client->has_vd_wakelock) {
 		dev_err(gxp->dev,
 			"GXP_ETM_TRACE_SW_STOP_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
 
+	down_read(&gxp->vd_semaphore);
 
 	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virtual_core_id);
 	if (phys_core < 0) {
@@ -753,6 +732,7 @@ static int gxp_etm_trace_sw_stop_command(struct gxp_client *client,
 	 */
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_read(&client->semaphore);
 
 	return ret;
@@ -775,9 +755,11 @@ static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
 	if (!client->has_vd_wakelock) {
 		dev_err(gxp->dev,
 			"GXP_ETM_TRACE_CLEANUP_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
+
+	down_read(&gxp->vd_semaphore);
 
 	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, virtual_core_id);
 	if (phys_core < 0) {
@@ -794,6 +776,7 @@ static int gxp_etm_trace_cleanup_command(struct gxp_client *client,
 	 */
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_read(&client->semaphore);
 
 	return ret;
@@ -822,9 +805,11 @@ gxp_etm_get_trace_info_command(struct gxp_client *client,
 	if (!client->has_vd_wakelock) {
 		dev_err(gxp->dev,
 			"GXP_ETM_GET_TRACE_INFO_COMMAND requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
+
+	down_read(&gxp->vd_semaphore);
 
 	phys_core = gxp_vd_virt_core_to_phys_core(client->vd, ibuf.virtual_core_id);
 	if (phys_core < 0) {
@@ -872,6 +857,7 @@ out_free_header:
 	kfree(trace_header);
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_read(&client->semaphore);
 
 	return ret;
@@ -930,15 +916,16 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_write(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_MAP_TPU_MBX_QUEUE requires the client hold a VIRTUAL_DEVICE wakelock\n");
-		ret = -ENODEV;
-		goto out;
+			"GXP_MAP_TPU_MBX_QUEUE requires the client allocate a VIRTUAL_DEVICE\n");
+		up_read(&client->semaphore);
+		return -ENODEV;
 	}
+
+	down_read(&gxp->vd_semaphore);
 
 	virtual_core_list = ibuf.virtual_core_list;
 	core_count = hweight_long(virtual_core_list);
@@ -983,7 +970,8 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	mbx_info->cmdq_size = ALIGN(mbx_info->cmdq_size, PAGE_SIZE);
 	mbx_info->respq_size = ALIGN(mbx_info->respq_size, PAGE_SIZE);
 
-	ret = gxp_dma_map_tpu_buffer(gxp, phys_core_list, mbx_info);
+	ret = gxp_dma_map_tpu_buffer(gxp, client->vd, virtual_core_list,
+				     phys_core_list, mbx_info);
 	if (ret) {
 		dev_err(gxp->dev, "%s: failed to map TPU mailbox buffer %d\n",
 			__func__, ret);
@@ -994,6 +982,7 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 		goto out_free;
 	}
 	client->mbx_desc.phys_core_list = phys_core_list;
+	client->mbx_desc.virt_core_list = virtual_core_list;
 	client->mbx_desc.cmdq_size = mbx_info->cmdq_size;
 	client->mbx_desc.respq_size = mbx_info->respq_size;
 	client->tpu_mbx_allocated = true;
@@ -1002,6 +991,7 @@ out_free:
 	kfree(mbx_info);
 
 out:
+	up_read(&gxp->vd_semaphore);
 	up_write(&client->semaphore);
 
 	return ret;
@@ -1022,12 +1012,11 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_write(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_UNMAP_TPU_MBX_QUEUE requires the client hold a VIRTUAL_DEVICE wakelock\n");
+			"GXP_UNMAP_TPU_MBX_QUEUE requires the client allocate a VIRTUAL_DEVICE\n");
 		ret = -ENODEV;
 		goto out;
 	}
@@ -1039,7 +1028,7 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 		goto out;
 	}
 
-	gxp_dma_unmap_tpu_buffer(gxp, client->mbx_desc);
+	gxp_dma_unmap_tpu_buffer(gxp, client->vd, client->mbx_desc);
 
 	gxp_tpu_info.tpu_fd = ibuf.tpu_fd;
 	ret = edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
@@ -1418,29 +1407,24 @@ static int gxp_map_dmabuf(struct gxp_client *client,
 	struct gxp_map_dmabuf_ioctl ibuf;
 	struct gxp_mapping *mapping;
 	int ret = 0;
-	uint phys_core_list;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
+	if (ibuf.virtual_core_list == 0)
+		return -EINVAL;
+
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_MAP_DMABUF requires the client hold a VIRTUAL_DEVICE wakelock\n");
+			"GXP_MAP_DMABUF requires the client allocate a VIRTUAL_DEVICE\n");
 		ret = -ENODEV;
 		goto out;
 	}
 
-	phys_core_list = gxp_vd_virt_core_list_to_phys_core_list(
-		client->vd, ibuf.virtual_core_list);
-	if (phys_core_list == 0) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	mapping = gxp_dmabuf_map(gxp, phys_core_list, ibuf.dmabuf_fd,
+	mapping = gxp_dmabuf_map(gxp, client->vd, ibuf.virtual_core_list,
+				 ibuf.dmabuf_fd,
 				 /*gxp_dma_flags=*/0,
 				 mapping_flags_to_dma_dir(ibuf.flags));
 	if (IS_ERR(mapping)) {
@@ -1453,7 +1437,7 @@ static int gxp_map_dmabuf(struct gxp_client *client,
 
 	if (copy_to_user(argp, &ibuf, sizeof(ibuf))) {
 		/* If the IOCTL fails, the dma-buf must be unmapped */
-		gxp_dmabuf_unmap(gxp, ibuf.device_address);
+		gxp_dmabuf_unmap(gxp, client->vd, ibuf.device_address);
 		ret = -EFAULT;
 	}
 
@@ -1473,17 +1457,16 @@ static int gxp_unmap_dmabuf(struct gxp_client *client,
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
 
-	if (!client->has_vd_wakelock) {
+	if (!client->vd) {
 		dev_err(gxp->dev,
-			"GXP_UNMAP_DMABUF requires the client hold a VIRTUAL_DEVICE wakelock\n");
+			"GXP_UNMAP_DMABUF requires the client allocate a VIRTUAL_DEVICE\n");
 		ret = -ENODEV;
 		goto out;
 	}
 
-	gxp_dmabuf_unmap(gxp, ibuf.device_address);
+	gxp_dmabuf_unmap(gxp, client->vd, ibuf.device_address);
 
 out:
 	up_read(&client->semaphore);
@@ -1496,30 +1479,43 @@ static int gxp_register_mailbox_eventfd(
 	struct gxp_register_mailbox_eventfd_ioctl __user *argp)
 {
 	struct gxp_register_mailbox_eventfd_ioctl ibuf;
-	struct eventfd_ctx *new_ctx;
+	struct gxp_eventfd *eventfd;
+	int ret = 0;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	if (ibuf.virtual_core_id >= client->vd->num_cores)
-		return -EINVAL;
+	down_write(&client->semaphore);
+
+	if (!client->vd) {
+		dev_err(client->gxp->dev,
+			"GXP_REGISTER_MAILBOX_EVENTFD requires the client allocate a VIRTUAL_DEVICE\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
+	if (ibuf.virtual_core_id >= client->vd->num_cores) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	/* Make sure the provided eventfd is valid */
-	new_ctx = eventfd_ctx_fdget(ibuf.eventfd);
-	if (IS_ERR(new_ctx))
-		return PTR_ERR(new_ctx);
-
-	down_write(&client->semaphore);
+	eventfd = gxp_eventfd_create(ibuf.eventfd);
+	if (IS_ERR(eventfd)) {
+		ret = PTR_ERR(eventfd);
+		goto out;
+	}
 
 	/* Set the new eventfd, replacing any existing one */
 	if (client->mb_eventfds[ibuf.virtual_core_id])
-		eventfd_ctx_put(client->mb_eventfds[ibuf.virtual_core_id]);
+		gxp_eventfd_put(client->mb_eventfds[ibuf.virtual_core_id]);
 
-	client->mb_eventfds[ibuf.virtual_core_id] = new_ctx;
+	client->mb_eventfds[ibuf.virtual_core_id] = eventfd;
 
+out:
 	up_write(&client->semaphore);
 
-	return 0;
+	return ret;
 }
 
 static int gxp_unregister_mailbox_eventfd(
@@ -1527,23 +1523,34 @@ static int gxp_unregister_mailbox_eventfd(
 	struct gxp_register_mailbox_eventfd_ioctl __user *argp)
 {
 	struct gxp_register_mailbox_eventfd_ioctl ibuf;
+	int ret = 0;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
 		return -EFAULT;
 
-	if (ibuf.virtual_core_id >= client->vd->num_cores)
-		return -EINVAL;
-
 	down_write(&client->semaphore);
 
+	if (!client->vd) {
+		dev_err(client->gxp->dev,
+			"GXP_UNREGISTER_MAILBOX_EVENTFD requires the client allocate a VIRTUAL_DEVICE\n");
+		ret = -ENODEV;
+		goto out;
+	}
+
+	if (ibuf.virtual_core_id >= client->vd->num_cores) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	if (client->mb_eventfds[ibuf.virtual_core_id])
-		eventfd_ctx_put(client->mb_eventfds[ibuf.virtual_core_id]);
+		gxp_eventfd_put(client->mb_eventfds[ibuf.virtual_core_id]);
 
 	client->mb_eventfds[ibuf.virtual_core_id] = NULL;
 
+out:
 	up_write(&client->semaphore);
 
-	return 0;
+	return ret;
 }
 
 static int
@@ -1775,7 +1782,6 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-#ifndef CONFIG_GXP_USE_SW_MAILBOX
 	for (i = 0; i < GXP_NUM_CORES; i++) {
 		r = platform_get_resource(pdev, IORESOURCE_MEM, i + 1);
 		if (IS_ERR_OR_NULL(r)) {
@@ -1828,7 +1834,6 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		dev_warn(dev, "TPU will not be available for interop\n");
 		gxp->tpu_dev.mbx_paddr = 0;
 	}
-#endif  // !CONFIG_GXP_USE_SW_MAILBOX
 
 	ret = gxp_dma_init(gxp);
 	if (ret) {
@@ -1842,7 +1847,6 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto err_dma_exit;
 	}
-	spin_lock_init(&gxp->mailbox_resps_lock);
 
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	ret = gxp_debug_dump_init(gxp, &gxp_sscd_dev, &gxp_sscd_pdata);
@@ -1868,12 +1872,7 @@ static int gxp_platform_probe(struct platform_device *pdev)
 		goto err_debug_dump_exit;
 	}
 
-	ret = gxp_dma_map_resources(gxp);
-	if (ret) {
-		dev_err(dev, "Failed to map resources for GXP cores (ret=%d)\n",
-			ret);
-		goto err_vd_destroy;
-	}
+	gxp_dma_init_default_resources(gxp);
 
 	/* Get GSA device from device tree */
 	np = of_parse_phandle(dev->of_node, "gsa-device", 0);
@@ -1922,9 +1921,7 @@ err_debug_dump_exit:
 err_dma_exit:
 	gxp_dma_exit(gxp);
 err_put_tpu_dev:
-#ifndef CONFIG_GXP_USE_SW_MAILBOX
 	put_device(gxp->tpu_dev.dev);
-#endif
 err:
 	misc_deregister(&gxp->misc_dev);
 	devm_kfree(dev, (void *)gxp);
@@ -1940,11 +1937,8 @@ static int gxp_platform_remove(struct platform_device *pdev)
 	gxp_remove_debugfs(gxp);
 	gxp_fw_data_destroy(gxp);
 	gxp_vd_destroy(gxp);
-	gxp_dma_unmap_resources(gxp);
 	gxp_dma_exit(gxp);
-#ifndef CONFIG_GXP_USE_SW_MAILBOX
 	put_device(gxp->tpu_dev.dev);
-#endif
 	if (gxp->gsa_dev)
 		put_device(gxp->gsa_dev);
 	misc_deregister(&gxp->misc_dev);

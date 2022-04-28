@@ -91,10 +91,10 @@ struct gxp_async_response {
 	uint gxp_power_state;
 	/* Specified memory power state vote during the command execution */
 	uint memory_power_state;
-	/* gxp_client to signal when the response completes. May be NULL */
-	struct gxp_client *client;
 	/* Specified whether the power state vote is requested with aggressor flag */
 	bool requested_aggressor;
+	/* gxp_eventfd to signal when the response completes. May be NULL */
+	struct gxp_eventfd *eventfd;
 };
 
 enum gxp_response_status {
@@ -179,8 +179,10 @@ struct gxp_mailbox_manager *gxp_mailbox_create_manager(struct gxp_dev *gxp,
  */
 
 struct gxp_mailbox *gxp_mailbox_alloc(struct gxp_mailbox_manager *mgr,
-				      u8 core_id);
+				      struct gxp_virtual_device *vd,
+				      uint virt_core, u8 core_id);
 void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
+			 struct gxp_virtual_device *vd, uint virt_core,
 			 struct gxp_mailbox *mailbox);
 
 void gxp_mailbox_reset(struct gxp_mailbox *mailbox);
@@ -195,7 +197,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  wait_queue_head_t *queue_waitq,
 				  uint gxp_power_state, uint memory_power_state,
 				  bool requested_aggressor,
-				  struct gxp_client *client);
+				  struct gxp_eventfd *eventfd);
 
 int gxp_mailbox_register_interrupt_handler(struct gxp_mailbox *mailbox,
 					   u32 int_bit,

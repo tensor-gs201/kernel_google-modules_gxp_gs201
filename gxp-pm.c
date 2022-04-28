@@ -120,10 +120,33 @@ int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate)
 	return ret;
 }
 
-static void set_cmu_mux_state(struct gxp_dev *gxp, u32 val)
+static void set_cmu_noc_user_mux_state(struct gxp_dev *gxp, u32 val)
+{
+	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_NOC_USER);
+}
+
+static void set_cmu_pll_aur_mux_state(struct gxp_dev *gxp, u32 val)
 {
 	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_PLL_AUR);
-	writel(val << 4, gxp->cmu.vaddr + PLL_CON0_NOC_USER);
+}
+
+void gxp_pm_force_cmu_noc_user_mux_normal(struct gxp_dev *gxp)
+{
+	mutex_lock(&gxp->power_mgr->pm_lock);
+	if (gxp->power_mgr->curr_state == AUR_READY)
+		set_cmu_noc_user_mux_state(gxp, AUR_CMU_MUX_NORMAL);
+	gxp->power_mgr->force_noc_mux_normal_count++;
+	mutex_unlock(&gxp->power_mgr->pm_lock);
+}
+
+void gxp_pm_check_cmu_noc_user_mux(struct gxp_dev *gxp)
+{
+	mutex_lock(&gxp->power_mgr->pm_lock);
+	gxp->power_mgr->force_noc_mux_normal_count--;
+	if (gxp->power_mgr->force_noc_mux_normal_count == 0)
+		if (gxp->power_mgr->curr_state == AUR_READY)
+			set_cmu_noc_user_mux_state(gxp, AUR_CMU_MUX_LOW);
+	mutex_unlock(&gxp->power_mgr->pm_lock);
 }
 
 static void gxp_pm_blk_set_state_acpm_async(struct work_struct *work)
@@ -132,6 +155,8 @@ static void gxp_pm_blk_set_state_acpm_async(struct work_struct *work)
 		container_of(work, struct gxp_set_acpm_state_work, work);
 
 	mutex_lock(&set_acpm_state_work->gxp->power_mgr->pm_lock);
+	if (set_acpm_state_work->gxp->power_mgr->curr_state == AUR_OFF)
+		goto out;
 	/*
 	 * This prev_state may be out of date with the manager's current state,
 	 * but we don't need curr_state here. curr_state is the last scheduled
@@ -139,13 +164,20 @@ static void gxp_pm_blk_set_state_acpm_async(struct work_struct *work)
 	 * true because all request are executed synchronously and executed in
 	 * FIFO order.
 	 */
-	if (set_acpm_state_work->prev_state == AUR_READY)
-		set_cmu_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_NORMAL);
-	else if (set_acpm_state_work->state == AUR_READY)
-		set_cmu_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_LOW);
+	if (set_acpm_state_work->prev_state == AUR_READY) {
+		set_cmu_pll_aur_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_NORMAL);
+		set_cmu_noc_user_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_NORMAL);
+	} else if (set_acpm_state_work->state == AUR_READY) {
+		set_cmu_pll_aur_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_LOW);
+		/* Switch NOC_USER mux to low state only if no core is starting the firmware */
+		if (set_acpm_state_work->gxp->power_mgr->force_noc_mux_normal_count == 0)
+			set_cmu_noc_user_mux_state(set_acpm_state_work->gxp, AUR_CMU_MUX_LOW);
+	}
 	gxp_pm_blk_set_state_acpm(set_acpm_state_work->gxp,
 				  set_acpm_state_work->state,
 				  set_acpm_state_work->aggressor_vote);
+out:
+	set_acpm_state_work->using = false;
 	mutex_unlock(&set_acpm_state_work->gxp->power_mgr->pm_lock);
 }
 
@@ -203,12 +235,11 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 		mutex_unlock(&gxp->power_mgr->pm_lock);
 		return ret;
 	}
-	/*
-	 * Before the block is off, CMUMUX cannot be low. Otherwise, powering on
-	 * cores will fail later.
-	 */
-	if (gxp->power_mgr->curr_state == AUR_READY)
-		set_cmu_mux_state(gxp, AUR_CMU_MUX_NORMAL);
+	/* Reset MUX frequency from AUR_READY state */
+	if (gxp->power_mgr->curr_state == AUR_READY) {
+		set_cmu_pll_aur_mux_state(gxp, AUR_CMU_MUX_NORMAL);
+		set_cmu_noc_user_mux_state(gxp, AUR_CMU_MUX_NORMAL);
+	}
 
 	/* Shutdown TOP's PSM */
 	gxp_lpm_destroy(gxp);
@@ -279,6 +310,8 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 				   enum aur_power_state state,
 				   bool aggressor_vote)
 {
+	uint i;
+
 	if (state > AUR_MAX_ALLOW_STATE) {
 		dev_err(gxp->dev, "Invalid state %d\n", state);
 		return -EINVAL;
@@ -289,14 +322,32 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 			dev_warn(gxp->dev,
 				 "It is not supported to request AUR_OFF\n");
 		} else {
-			gxp->power_mgr->set_acpm_state_work.gxp = gxp;
-			gxp->power_mgr->set_acpm_state_work.state = state;
-			gxp->power_mgr->set_acpm_state_work.aggressor_vote =
+			for (i = 0; i < AUR_NUM_POWER_STATE_WORKER; i++) {
+				if (!gxp->power_mgr->set_acpm_state_work[i]
+					     .using)
+					break;
+			}
+			/* The workqueue stucks, wait for it  */
+			if (i == AUR_NUM_POWER_STATE_WORKER) {
+				dev_warn(
+					gxp->dev,
+					"The workqueue for power state transition is full");
+				flush_workqueue(gxp->power_mgr->wq);
+				/*
+				 * All set_acpm_state_work should be available
+				 * now, pick the first one.
+				 */
+				i = 0;
+			}
+			gxp->power_mgr->set_acpm_state_work[i].state = state;
+			gxp->power_mgr->set_acpm_state_work[i].aggressor_vote =
 				aggressor_vote;
-			gxp->power_mgr->set_acpm_state_work.prev_state =
+			gxp->power_mgr->set_acpm_state_work[i].prev_state =
 				gxp->power_mgr->curr_state;
-			queue_work(gxp->power_mgr->wq,
-				   &gxp->power_mgr->set_acpm_state_work.work);
+			gxp->power_mgr->set_acpm_state_work[i].using = true;
+			queue_work(
+				gxp->power_mgr->wq,
+				&gxp->power_mgr->set_acpm_state_work[i].work);
 		}
 		gxp->power_mgr->curr_state = state;
 		gxp->power_mgr->curr_aggressor_vote = aggressor_vote;
@@ -416,28 +467,47 @@ static void gxp_pm_req_pm_qos_async(struct work_struct *work)
 		container_of(work, struct gxp_req_pm_qos_work, work);
 
 	mutex_lock(&req_pm_qos_work->gxp->power_mgr->pm_lock);
-	gxp_pm_req_pm_qos(req_pm_qos_work->gxp, req_pm_qos_work->int_val,
-			  req_pm_qos_work->mif_val);
+	if (req_pm_qos_work->gxp->power_mgr->curr_state != AUR_OFF)
+		gxp_pm_req_pm_qos(req_pm_qos_work->gxp,
+				  req_pm_qos_work->int_val,
+				  req_pm_qos_work->mif_val);
+	req_pm_qos_work->using = false;
 	mutex_unlock(&req_pm_qos_work->gxp->power_mgr->pm_lock);
 }
 
 static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp, enum aur_memory_power_state state)
 {
 	s32 int_val = 0, mif_val = 0;
+	uint i;
 
 	if (state > AUR_MAX_ALLOW_MEMORY_STATE) {
 		dev_err(gxp->dev, "Invalid memory state %d\n", state);
 		return -EINVAL;
 	}
 	if (state != gxp->power_mgr->curr_memory_state) {
+		for (i = 0; i < AUR_NUM_POWER_STATE_WORKER; i++) {
+			if (!gxp->power_mgr->req_pm_qos_work[i].using)
+				break;
+		}
+		/* The workqueue stucks, wait for it  */
+		if (i == AUR_NUM_POWER_STATE_WORKER) {
+			dev_warn(
+				gxp->dev,
+				"The workqueue for memory power state transition is full");
+			flush_workqueue(gxp->power_mgr->wq);
+			/*
+			 * All req_pm_qos_work should be available
+			 * now, pick the first one.
+			 */
+			i = 0;
+		}
 		gxp->power_mgr->curr_memory_state = state;
 		int_val = aur_memory_state2int_table[state];
 		mif_val = aur_memory_state2mif_table[state];
-		gxp->power_mgr->req_pm_qos_work.gxp = gxp;
-		gxp->power_mgr->req_pm_qos_work.int_val = int_val;
-		gxp->power_mgr->req_pm_qos_work.mif_val = mif_val;
-		queue_work(gxp->power_mgr->wq,
-			   &gxp->power_mgr->req_pm_qos_work.work);
+		gxp->power_mgr->req_pm_qos_work[i].int_val = int_val;
+		gxp->power_mgr->req_pm_qos_work[i].mif_val = mif_val;
+		gxp->power_mgr->req_pm_qos_work[i].using = true;
+		queue_work(gxp->power_mgr->wq, &gxp->power_mgr->req_pm_qos_work[i].work);
 	}
 
 	return 0;
@@ -542,6 +612,7 @@ int gxp_pm_release_blk_wakelock(struct gxp_dev *gxp)
 int gxp_pm_init(struct gxp_dev *gxp)
 {
 	struct gxp_power_manager *mgr;
+	uint i;
 
 	mgr = devm_kzalloc(gxp->dev, sizeof(*mgr), GFP_KERNEL);
 	if (!mgr)
@@ -554,10 +625,19 @@ int gxp_pm_init(struct gxp_dev *gxp)
 	refcount_set(&(mgr->blk_wake_ref), 0);
 	mgr->ops = &gxp_aur_ops;
 	gxp->power_mgr = mgr;
-	INIT_WORK(&mgr->set_acpm_state_work.work, gxp_pm_blk_set_state_acpm_async);
-	INIT_WORK(&mgr->req_pm_qos_work.work, gxp_pm_req_pm_qos_async);
+	for (i = 0; i < AUR_NUM_POWER_STATE_WORKER; i++) {
+		mgr->set_acpm_state_work[i].gxp = gxp;
+		mgr->set_acpm_state_work[i].using = false;
+		mgr->req_pm_qos_work[i].gxp = gxp;
+		mgr->req_pm_qos_work[i].using = false;
+		INIT_WORK(&mgr->set_acpm_state_work[i].work,
+			  gxp_pm_blk_set_state_acpm_async);
+		INIT_WORK(&mgr->req_pm_qos_work[i].work,
+			  gxp_pm_req_pm_qos_async);
+	}
 	gxp->power_mgr->wq =
 		create_singlethread_workqueue("gxp_power_work_queue");
+	gxp->power_mgr->force_noc_mux_normal_count = 0;
 
 #if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	pm_runtime_enable(gxp->dev);

@@ -106,11 +106,25 @@ void gxp_dma_exit(struct gxp_dev *gxp)
 /* Offset from mailbox base to the device interface that needs to be mapped */
 #define MAILBOX_DEVICE_INTERFACE_OFFSET 0x10000
 
-int gxp_dma_map_resources(struct gxp_dev *gxp)
+void gxp_dma_init_default_resources(struct gxp_dev *gxp)
+{
+	unsigned int core;
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		gxp->mbx[core].daddr = GXP_IOVA_MAILBOX(core);
+		gxp->fwbufs[core].daddr = GXP_IOVA_FIRMWARE(core);
+	}
+	gxp->regs.daddr = GXP_IOVA_AURORA_TOP;
+	gxp->coredumpbuf.daddr = GXP_IOVA_CORE_DUMP;
+	gxp->fwdatabuf.daddr = GXP_IOVA_FW_DATA;
+}
+
+int gxp_dma_map_core_resources(struct gxp_dev *gxp,
+			       struct gxp_virtual_device *vd, uint virt_core,
+			       uint core)
 {
 	struct gxp_dma_iommu_manager *mgr = container_of(
 		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
-	unsigned int core;
 	int ret = 0;
 
 	ret = iommu_map(mgr->default_domain, GXP_IOVA_AURORA_TOP,
@@ -147,30 +161,23 @@ int gxp_dma_map_resources(struct gxp_dev *gxp)
 			IOMMU_READ | IOMMU_WRITE);
 	if (ret)
 		goto err;
-	for (core = 0; core < GXP_NUM_CORES; core++) {
-		ret = iommu_map(mgr->default_domain, GXP_IOVA_MAILBOX(core),
-				gxp->mbx[core].paddr +
-					MAILBOX_DEVICE_INTERFACE_OFFSET,
-				gxp->mbx[core].size, IOMMU_READ | IOMMU_WRITE);
+	ret = iommu_map(mgr->default_domain, GXP_IOVA_MAILBOX(core),
+			gxp->mbx[core].paddr +
+				MAILBOX_DEVICE_INTERFACE_OFFSET,
+			gxp->mbx[core].size, IOMMU_READ | IOMMU_WRITE);
+	if (ret)
+		goto err;
+	/* Only map the TPU mailboxes if they were found on probe */
+	if (gxp->tpu_dev.mbx_paddr) {
+		ret = iommu_map(
+			mgr->default_domain,
+			GXP_IOVA_EXT_TPU_MBX + core * EXT_TPU_MBX_SIZE,
+			gxp->tpu_dev.mbx_paddr +
+				core * EXT_TPU_MBX_SIZE,
+			EXT_TPU_MBX_SIZE, IOMMU_READ | IOMMU_WRITE);
 		if (ret)
 			goto err;
-		/* Only map the TPU mailboxes if they were found on probe */
-		if (gxp->tpu_dev.mbx_paddr) {
-			ret = iommu_map(
-				mgr->default_domain,
-				GXP_IOVA_EXT_TPU_MBX + core * EXT_TPU_MBX_SIZE,
-				gxp->tpu_dev.mbx_paddr +
-					core * EXT_TPU_MBX_SIZE,
-				EXT_TPU_MBX_SIZE, IOMMU_READ | IOMMU_WRITE);
-			if (ret)
-				goto err;
-		}
-		gxp->mbx[core].daddr = GXP_IOVA_MAILBOX(core);
-		gxp->fwbufs[core].daddr = GXP_IOVA_FIRMWARE(core);
 	}
-	gxp->regs.daddr = GXP_IOVA_AURORA_TOP;
-	gxp->coredumpbuf.daddr = GXP_IOVA_CORE_DUMP;
-	gxp->fwdatabuf.daddr = GXP_IOVA_FW_DATA;
 
 	return ret;
 
@@ -180,15 +187,16 @@ err:
 	 * Any resource that hadn't been mapped yet will cause `iommu_unmap()`
 	 * to return immediately, so its safe to try to unmap everything.
 	 */
-	gxp_dma_unmap_resources(gxp);
+	gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
 	return ret;
 }
 
-void gxp_dma_unmap_resources(struct gxp_dev *gxp)
+void gxp_dma_unmap_core_resources(struct gxp_dev *gxp,
+				  struct gxp_virtual_device *vd, uint virt_core,
+				  uint core)
 {
 	struct gxp_dma_iommu_manager *mgr = container_of(
 		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
-	unsigned int core;
 
 	iommu_unmap(mgr->default_domain, GXP_IOVA_AURORA_TOP, gxp->regs.size);
 	iommu_unmap(mgr->default_domain, GXP_IOVA_SYNC_BARRIERS,
@@ -203,16 +211,14 @@ void gxp_dma_unmap_resources(struct gxp_dev *gxp)
 	iommu_unmap(mgr->default_domain, GXP_IOVA_CORE_DUMP,
 		    gxp->coredumpbuf.size);
 	iommu_unmap(mgr->default_domain, GXP_IOVA_FW_DATA, gxp->fwdatabuf.size);
-	for (core = 0; core < GXP_NUM_CORES; core++) {
-		iommu_unmap(mgr->default_domain, GXP_IOVA_MAILBOX(core),
-			    gxp->mbx[core].size);
-		/* Only unmap the TPU mailboxes if they were found on probe */
-		if (gxp->tpu_dev.mbx_paddr) {
-			iommu_unmap(mgr->default_domain,
-				    GXP_IOVA_EXT_TPU_MBX +
-					    core * EXT_TPU_MBX_SIZE,
-				    EXT_TPU_MBX_SIZE);
-		}
+	iommu_unmap(mgr->default_domain, GXP_IOVA_MAILBOX(core),
+		    gxp->mbx[core].size);
+	/* Only unmap the TPU mailboxes if they were found on probe */
+	if (gxp->tpu_dev.mbx_paddr) {
+		iommu_unmap(mgr->default_domain,
+			    GXP_IOVA_EXT_TPU_MBX +
+				    core * EXT_TPU_MBX_SIZE,
+			    EXT_TPU_MBX_SIZE);
 	}
 }
 
@@ -285,21 +291,24 @@ static inline struct sg_table *alloc_sgt_for_buffer(void *ptr, size_t size,
 }
 
 #if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
-int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
+int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			   uint virt_core_list, uint core_list
 			   struct edgetpu_ext_mailbox_info *mbx_info)
 {
 	struct gxp_dma_iommu_manager *mgr = container_of(
 		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
-	uint orig_core_list = core_list;
+	uint orig_virt_core_list = virt_core_list;
 	u64 queue_iova;
 	int core;
 	int ret;
 	int i = 0;
 
-	while (core_list) {
+	while (virt_core_list) {
 		phys_addr_t cmdq_pa = mbx_info->mailboxes[i].cmdq_pa;
 		phys_addr_t respq_pa = mbx_info->mailboxes[i++].respq_pa;
 
+		virt_core = ffs(virt_core_list) - 1;
+		virt_core_list &= ~BIT(virt_core);
 		core = ffs(core_list) - 1;
 		core_list &= ~BIT(core);
 		queue_iova = GXP_IOVA_TPU_MBX_BUFFER(core);
@@ -319,8 +328,10 @@ int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, uint core_list,
 	return 0;
 
 error:
-	core_list ^= orig_core_list;
-	while (core_list) {
+	virt_core_list ^= orig_virt_core_list;
+	while (virt_core_list) {
+		virt_core = ffs(virt_core_list) - 1;
+		virt_core_list &= ~BIT(virt_core);
 		core = ffs(core_list) - 1;
 		core_list &= ~BIT(core);
 		queue_iova = GXP_IOVA_TPU_MBX_BUFFER(core);
@@ -334,15 +345,20 @@ error:
 }
 
 void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
+			      struct gxp_virtual_device *vd,
 			      struct gxp_tpu_mbx_desc mbx_desc)
 {
 	struct gxp_dma_iommu_manager *mgr = container_of(
 		gxp->dma_mgr, struct gxp_dma_iommu_manager, dma_mgr);
+	uint virt_core_list = mbx_desc.virt_core_list;
 	uint core_list = mbx_desc.phys_core_list;
 	u64 queue_iova;
 	int core;
+	uint virt_core;
 
-	while (core_list) {
+	while (virt_core_list) {
+		virt_core = ffs(virt_core_list) - 1;
+		virt_core_list &= ~BIT(virt_core);
 		core = ffs(core_list) - 1;
 		core_list &= ~BIT(core);
 		queue_iova = GXP_IOVA_TPU_MBX_BUFFER(core);
@@ -355,7 +371,40 @@ void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 }
 #endif // CONFIG_ANDROID && !CONFIG_GXP_GEM5
 
-void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
+int gxp_dma_domain_attach_device(struct gxp_dev *gxp,
+				 struct gxp_virtual_device *vd, uint virt_core,
+				 uint core)
+{
+	/* NO-OP when aux domains are not supported */
+	return 0;
+}
+
+void gxp_dma_domain_detach_device(struct gxp_dev *gxp,
+				  struct gxp_virtual_device *vd, uint virt_core)
+{
+	/* NO-OP when aux domains are not supported */
+}
+
+int gxp_dma_map_allocated_coherent_buffer(struct gxp_dev *gxp, void *buf,
+					  struct gxp_virtual_device *vd,
+					  uint virt_core_list, size_t size,
+					  dma_addr_t dma_handle,
+					  uint gxp_dma_flags)
+{
+	/* NO-OP when aux domains are not supported */
+	return 0;
+}
+
+void gxp_dma_unmap_allocated_coherent_buffer(struct gxp_dev *gxp,
+					     struct gxp_virtual_device *vd,
+					     uint virt_core_list, size_t size,
+					     dma_addr_t dma_handle)
+{
+	/* NO-OP when aux domains are not supported */
+}
+
+void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			     uint virt_core_list, size_t size,
 			     dma_addr_t *dma_handle, gfp_t flag,
 			     uint gxp_dma_flags)
 {
@@ -380,16 +429,18 @@ void *gxp_dma_alloc_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
 	return buf;
 }
 
-void gxp_dma_free_coherent(struct gxp_dev *gxp, uint core_list, size_t size,
-			   void *cpu_addr, dma_addr_t dma_handle)
+void gxp_dma_free_coherent(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			   uint virt_core_list, size_t size, void *cpu_addr,
+			   dma_addr_t dma_handle)
 {
 	size = size < PAGE_SIZE ? PAGE_SIZE : size;
 
 	dma_free_coherent(gxp->dev, size, cpu_addr, dma_handle);
 }
 
-dma_addr_t gxp_dma_map_single(struct gxp_dev *gxp, uint core_list,
-			      void *cpu_addr, size_t size,
+dma_addr_t gxp_dma_map_single(struct gxp_dev *gxp,
+			      struct gxp_virtual_device *vd,
+			      uint virt_core_list, void *cpu_addr, size_t size,
 			      enum dma_data_direction direction,
 			      unsigned long attrs, uint gxp_dma_flags)
 {
@@ -403,17 +454,18 @@ dma_addr_t gxp_dma_map_single(struct gxp_dev *gxp, uint core_list,
 	return daddr;
 }
 
-void gxp_dma_unmap_single(struct gxp_dev *gxp, uint core_list,
-			  dma_addr_t dma_addr, size_t size,
+void gxp_dma_unmap_single(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			  uint virt_core_list, dma_addr_t dma_addr, size_t size,
 			  enum dma_data_direction direction,
 			  unsigned long attrs)
 {
 	dma_unmap_single_attrs(gxp->dev, dma_addr, size, direction, attrs);
 }
 
-dma_addr_t gxp_dma_map_page(struct gxp_dev *gxp, uint core_list,
-			    struct page *page, unsigned long offset,
-			    size_t size, enum dma_data_direction direction,
+dma_addr_t gxp_dma_map_page(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			    uint virt_core_list, struct page *page,
+			    unsigned long offset, size_t size,
+			    enum dma_data_direction direction,
 			    unsigned long attrs, uint gxp_dma_flags)
 {
 	dma_addr_t daddr;
@@ -426,16 +478,17 @@ dma_addr_t gxp_dma_map_page(struct gxp_dev *gxp, uint core_list,
 	return daddr;
 }
 
-void gxp_dma_unmap_page(struct gxp_dev *gxp, uint core_list,
-			dma_addr_t dma_addr, size_t size,
+void gxp_dma_unmap_page(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			uint virt_core_list, dma_addr_t dma_addr, size_t size,
 			enum dma_data_direction direction, unsigned long attrs)
 {
 	dma_unmap_page_attrs(gxp->dev, dma_addr, size, direction, attrs);
 }
 
-dma_addr_t gxp_dma_map_resource(struct gxp_dev *gxp, uint core_list,
-				phys_addr_t phys_addr, size_t size,
-				enum dma_data_direction direction,
+dma_addr_t gxp_dma_map_resource(struct gxp_dev *gxp,
+				struct gxp_virtual_device *vd,
+				uint virt_core_list, phys_addr_t phys_addr,
+				size_t size, enum dma_data_direction direction,
 				unsigned long attrs, uint gxp_dma_flags)
 {
 	dma_addr_t daddr;
@@ -447,23 +500,24 @@ dma_addr_t gxp_dma_map_resource(struct gxp_dev *gxp, uint core_list,
 	return daddr;
 }
 
-void gxp_dma_unmap_resource(struct gxp_dev *gxp, uint core_list,
-			    dma_addr_t dma_addr, size_t size,
-			    enum dma_data_direction direction,
+void gxp_dma_unmap_resource(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+			    uint virt_core_list, dma_addr_t dma_addr,
+			    size_t size, enum dma_data_direction direction,
 			    unsigned long attrs)
 {
 	dma_unmap_resource(gxp->dev, dma_addr, size, direction, attrs);
 }
 
-int gxp_dma_map_sg(struct gxp_dev *gxp, uint core_list, struct scatterlist *sg,
-		   int nents, enum dma_data_direction direction,
-		   unsigned long attrs, uint gxp_dma_flags)
+int gxp_dma_map_sg(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		   int virt_core_list, struct scatterlist *sg, int nents,
+		   enum dma_data_direction direction, unsigned long attrs,
+		   uint gxp_dma_flags)
 {
 	return dma_map_sg_attrs(gxp->dev, sg, nents, direction, attrs);
 }
 
-void gxp_dma_unmap_sg(struct gxp_dev *gxp, uint core_list,
-		      struct scatterlist *sg, int nents,
+void gxp_dma_unmap_sg(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		      uint virt_core_list, struct scatterlist *sg, int nents,
 		      enum dma_data_direction direction, unsigned long attrs)
 {
 	dma_unmap_sg_attrs(gxp->dev, sg, nents, direction, attrs);
@@ -498,15 +552,17 @@ void gxp_dma_sync_sg_for_device(struct gxp_dev *gxp, struct scatterlist *sg,
 	dma_sync_sg_for_device(gxp->dev, sg, nents, direction);
 }
 
-struct sg_table *
-gxp_dma_map_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
-			      struct dma_buf_attachment *attachment,
-			      enum dma_data_direction direction)
+struct sg_table *gxp_dma_map_dmabuf_attachment(
+	struct gxp_dev *gxp, struct gxp_virtual_device *vd, uint virt_core_list,
+	struct dma_buf_attachment *attachment,
+	enum dma_data_direction direction)
 {
 	return dma_buf_map_attachment(attachment, direction);
 }
 
-void gxp_dma_unmap_dmabuf_attachment(struct gxp_dev *gxp, uint core_list,
+void gxp_dma_unmap_dmabuf_attachment(struct gxp_dev *gxp,
+				     struct gxp_virtual_device *vd,
+				     uint virt_core_list,
 				     struct dma_buf_attachment *attachment,
 				     struct sg_table *sgt,
 				     enum dma_data_direction direction)

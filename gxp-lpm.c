@@ -18,7 +18,6 @@
 #include "gxp-doorbell.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
-#include "gxp-tmp.h"
 
 static void enable_state(struct gxp_dev *gxp, uint psm, uint state)
 {
@@ -50,6 +49,17 @@ bool gxp_lpm_is_initialized(struct gxp_dev *gxp, uint psm)
 	return false;
 }
 
+bool gxp_lpm_is_powered(struct gxp_dev *gxp, uint psm)
+{
+	u32 status = lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET);
+	u32 state;
+
+	if (!(status & PSM_STATE_VALID_MASK))
+		return false;
+	state = status & PSM_CURR_STATE_MASK;
+	return state == LPM_ACTIVE_STATE || state == LPM_CG_STATE;
+}
+
 static uint get_state(struct gxp_dev *gxp, uint psm)
 {
 	u32 status = lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET);
@@ -73,7 +83,7 @@ static int set_state_internal(struct gxp_dev *gxp, uint psm, uint target_state)
 	/* Wait for LPM init done (0x60041688) */
 	while (i && !(lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET)
 		      & PSM_INIT_DONE_MASK)) {
-		cpu_relax();
+		udelay(1 * GXP_TIME_DELAY_FACTOR);
 		i--;
 	}
 
@@ -132,12 +142,11 @@ static int psm_enable(struct gxp_dev *gxp, uint psm)
 
 	/* Write PSM start bit */
 	lpm_write_32_psm(gxp, psm, PSM_START_OFFSET, PSM_START);
-	msleep(20 * GXP_TIME_DELAY_FACTOR);
 
 	/* Wait for LPM init done (0x60041688) */
 	while (i && !(lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET)
 		      & PSM_INIT_DONE_MASK)) {
-		cpu_relax();
+		udelay(1 * GXP_TIME_DELAY_FACTOR);
 		i--;
 	}
 
@@ -188,15 +197,6 @@ int gxp_lpm_up(struct gxp_dev *gxp, uint core)
 	enable_state(gxp, core, LPM_CG_STATE);
 
 	gxp_bpm_start(gxp, core);
-
-#ifdef CONFIG_GXP_USE_SW_MAILBOX
-	/*
-	 * Enable doorbells [28-31] for SW mailbox.
-	 * TODO (b/182526648): Enable doorbells required for SW mailbox in the
-	 * driver's alloc function.
-	 */
-	gxp_write_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0, BIT(31 - core));
-#endif  // CONFIG_GXP_USE_SW_MAILBOX
 
 	return 0;
 }

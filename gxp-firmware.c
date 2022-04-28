@@ -26,7 +26,7 @@
 #include "gxp-notification.h"
 #include "gxp-pm.h"
 #include "gxp-telemetry.h"
-#include "gxp-tmp.h"
+#include "gxp-vd.h"
 
 /* TODO (b/176984045): Clean up gxp-firmware.c */
 
@@ -303,10 +303,8 @@ out_firmware_unload:
 static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 {
 	u32 offset;
-	u32 psm_status;
 	u32 expected_top_value;
-	void __iomem *core_psm_base, *core_scratchpad_base, *addr;
-	uint state;
+	void __iomem *core_scratchpad_base;
 	int ctr;
 
 	/* Raise wakeup doorbell */
@@ -316,21 +314,12 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL);
 
 	/* Wait for core to come up */
-	dev_notice(gxp->dev, "Waiting for core %u to power up...\n",
-		   core);
-	core_psm_base =
-		((u8 *)gxp->regs.vaddr) + LPM_BLOCK + CORE_PSM_BASE(core);
+	dev_notice(gxp->dev, "Waiting for core %u to power up...\n", core);
 	ctr = 1000;
 	while (ctr) {
-		addr = core_psm_base + PSM_STATUS_OFFSET;
-		psm_status = (u32) readl(addr); /* 0x60041688 */
-		if (psm_status & PSM_STATE_VALID_MASK) {
-			state = psm_status & PSM_CURR_STATE_MASK;
-			if ((state == PSM_STATE_ACTIVE)
-			    || (state == PSM_STATE_CLK_GATED))
-				break;
-		}
-		cpu_relax();
+		if (gxp_lpm_is_powered(gxp, core))
+			break;
+		udelay(1 * GXP_TIME_DELAY_FACTOR);
 		ctr--;
 	}
 
@@ -346,18 +335,20 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 
 	core_scratchpad_base = gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF;
 
-	ctr = 500;
-	offset = SCRATCHPAD_MSG_OFFSET(MSG_CORE_ALIVE);
-	while (ctr--) {
-		if (readl(core_scratchpad_base + offset) == Q7_ALIVE_MAGIC)
-			break;
-		msleep(1 * GXP_TIME_DELAY_FACTOR);
-	}
 	/*
 	 * Currently, the hello_world FW writes a magic number
 	 * (Q7_ALIVE_MAGIC) to offset MSG_CORE_ALIVE in the scratchpad
 	 * space as an alive message
 	 */
+	ctr = 5000;
+	offset = SCRATCHPAD_MSG_OFFSET(MSG_CORE_ALIVE);
+	usleep_range(500 * GXP_TIME_DELAY_FACTOR, 1000 * GXP_TIME_DELAY_FACTOR);
+	while (ctr--) {
+		if (readl(core_scratchpad_base + offset) == Q7_ALIVE_MAGIC)
+			break;
+		usleep_range(1 * GXP_TIME_DELAY_FACTOR,
+			     10 * GXP_TIME_DELAY_FACTOR);
+	}
 	if (readl(core_scratchpad_base + offset) != Q7_ALIVE_MAGIC) {
 		dev_err(gxp->dev, "Core %u did not respond!\n", core);
 		return -EIO;
@@ -377,11 +368,14 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	 * handshaking in Gem5.
 	 */
 	/* TODO (b/182528386): Fix handshake for verifying TOP access */
+	ctr = 1000;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_TOP_ACCESS_OK);
 	expected_top_value = BIT(0);
-#ifdef CONFIG_GXP_USE_SW_MAILBOX
-	expected_top_value |= BIT(31 - core);
-#endif  // CONFIG_GXP_USE_SW_MAILBOX
+	while (ctr--) {
+		if (readl(core_scratchpad_base + offset) == expected_top_value)
+			break;
+		udelay(1 * GXP_TIME_DELAY_FACTOR);
+	}
 	if (readl(core_scratchpad_base + offset) != expected_top_value) {
 		dev_err(gxp->dev, "TOP access from core %u failed!\n", core);
 		return -EIO;
@@ -479,7 +473,8 @@ void gxp_fw_destroy(struct gxp_dev *gxp)
 	 */
 }
 
-int gxp_firmware_run(struct gxp_dev *gxp, uint core)
+int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		     uint virt_core, uint core)
 {
 	int ret = 0;
 	struct work_struct *work;
@@ -503,21 +498,24 @@ int gxp_firmware_run(struct gxp_dev *gxp, uint core)
 		goto out_firmware_unload;
 	}
 
+	/* Switch PLL_CON0_NOC_USER MUX to the normal state to guarantee LPM works */
+	gxp_pm_force_cmu_noc_user_mux_normal(gxp);
 	ret = gxp_firmware_handshake(gxp, core);
 	if (ret) {
 		dev_err(gxp->dev, "Firmware handshake failed on core %u\n",
 			core);
 		gxp_pm_core_off(gxp, core);
-		goto out_firmware_unload;
+		goto out_check_noc_user_mux;
 	}
-
-	/* Initialize ioctl response queues */
-	INIT_LIST_HEAD(&(gxp->mailbox_resp_queues[core]));
-	init_waitqueue_head(&(gxp->mailbox_resp_waitqs[core]));
+	/*
+	 * Check if we need to set PLL_CON0_NOC_USER MUX to low state for
+	 * AUR_READY requested state.
+	 */
+	gxp_pm_check_cmu_noc_user_mux(gxp);
 
 	/* Initialize mailbox */
-	gxp->mailbox_mgr->mailboxes[core] = gxp_mailbox_alloc(gxp->mailbox_mgr,
-							      core);
+	gxp->mailbox_mgr->mailboxes[core] =
+		gxp_mailbox_alloc(gxp->mailbox_mgr, vd, virt_core, core);
 	if (IS_ERR(gxp->mailbox_mgr->mailboxes[core])) {
 		dev_err(gxp->dev,
 			"Unable to allocate mailbox (core=%u, ret=%ld)\n", core,
@@ -541,16 +539,16 @@ int gxp_firmware_run(struct gxp_dev *gxp, uint core)
 
 	return ret;
 
+out_check_noc_user_mux:
+	gxp_pm_check_cmu_noc_user_mux(gxp);
 out_firmware_unload:
 	gxp_firmware_unload(gxp, core);
 	return ret;
 }
 
-void gxp_firmware_stop(struct gxp_dev *gxp, uint core)
+void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		       uint virt_core, uint core)
 {
-	struct gxp_async_response *cur, *nxt;
-	unsigned long flags;
-
 	if (!(gxp->firmware_running & BIT(core)))
 		dev_err(gxp->dev, "Firmware is not running on core %u\n", core);
 
@@ -561,24 +559,9 @@ void gxp_firmware_stop(struct gxp_dev *gxp, uint core)
 	gxp_notification_unregister_handler(gxp, core,
 					    HOST_NOTIF_TELEMETRY_STATUS);
 
-	gxp_mailbox_release(gxp->mailbox_mgr,
+	gxp_mailbox_release(gxp->mailbox_mgr, vd, virt_core,
 			    gxp->mailbox_mgr->mailboxes[core]);
 	dev_notice(gxp->dev, "Mailbox %u released\n", core);
-
-	/*
-	 * TODO(b/226211187) response queues should be owned by VDs
-	 * This step should not be necessary until a VD is destroyed once the
-	 * queues are owned directly by the VD and not shared by all users of
-	 * a physical core.
-	 */
-	/* Flush and free any abandoned responses left in the queue */
-	spin_lock_irqsave(&gxp->mailbox_resps_lock, flags);
-	list_for_each_entry_safe(cur, nxt, &gxp->mailbox_resp_queues[core],
-				 list_entry) {
-		list_del(&cur->list_entry);
-		kfree(cur);
-	}
-	spin_unlock_irqrestore(&gxp->mailbox_resps_lock, flags);
 
 	gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);

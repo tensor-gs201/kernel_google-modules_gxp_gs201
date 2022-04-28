@@ -15,6 +15,7 @@
 #include "gxp-host-device-structs.h"
 #include "gxp-notification.h"
 #include "gxp-telemetry.h"
+#include "gxp-vd.h"
 
 static inline bool is_core_telemetry_enabled(struct gxp_dev *gxp, uint core,
 					     u8 type)
@@ -109,6 +110,8 @@ static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 	struct buffer_data *data;
 	u8 type;
 	int i;
+	uint virt_core;
+	struct gxp_virtual_device *vd;
 
 	gxp = ((struct telemetry_vma_data *)vma->vm_private_data)->gxp;
 	data = ((struct telemetry_vma_data *)vma->vm_private_data)->data;
@@ -116,14 +119,26 @@ static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
 
+	down_read(&gxp->vd_semaphore);
 	if (refcount_dec_and_test(&data->ref_count)) {
 		if (data->host_status & GXP_TELEMETRY_HOST_STATUS_ENABLED)
 			telemetry_disable_locked(gxp, type);
 
-		for (i = 0; i < GXP_NUM_CORES; i++)
-			gxp_dma_free_coherent(gxp, BIT(i), data->size,
-					      data->buffers[i],
-					      data->buffer_daddrs[i]);
+		for (i = 0; i < GXP_NUM_CORES; i++) {
+			vd = gxp->core_to_vd[i];
+			if (vd != NULL) {
+				virt_core =
+					gxp_vd_phys_core_to_virt_core(vd, i);
+				gxp_dma_free_coherent(gxp, vd, BIT(virt_core),
+						      data->size,
+						      data->buffers[i],
+						      data->buffer_daddrs[i]);
+			} else {
+				gxp_dma_free_coherent(gxp, NULL, 0, data->size,
+						      data->buffers[i],
+						      data->buffer_daddrs[i]);
+			}
+		}
 		switch (type) {
 		case GXP_TELEMETRY_TYPE_LOGGING:
 			gxp->telemetry_mgr->logging_buff_data = NULL;
@@ -138,6 +153,7 @@ static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 		kfree(data);
 		kfree(vma->vm_private_data);
 	}
+	up_read(&gxp->vd_semaphore);
 
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 }
@@ -186,6 +202,7 @@ static int check_telemetry_type_availability(struct gxp_dev *gxp, u8 type)
  * @size: The size of buffer to allocate for each core
  *
  * Caller must hold the telemetry_manager's lock.
+ * Caller must hold gxp->vd_semaphore for reading.
  *
  * Return: A pointer to the `struct buffer_data` if successful, NULL otherwise
  */
@@ -194,6 +211,8 @@ static struct buffer_data *allocate_telemetry_buffers(struct gxp_dev *gxp,
 {
 	struct buffer_data *data;
 	int i;
+	uint virt_core;
+	struct gxp_virtual_device *vd;
 
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -201,10 +220,22 @@ static struct buffer_data *allocate_telemetry_buffers(struct gxp_dev *gxp,
 
 	/* Allocate cache-coherent buffers for logging/tracing to */
 	for (i = 0; i < GXP_NUM_CORES; i++) {
-		data->buffers[i] =
-			gxp_dma_alloc_coherent(gxp, BIT(i), size,
-					       &data->buffer_daddrs[i],
-					       GFP_KERNEL, 0);
+		/*
+		 * If the core is not allocated, we cannot map the buffer on
+		 * that core.
+		 */
+		vd = gxp->core_to_vd[i];
+		if (vd != NULL) {
+			virt_core = gxp_vd_phys_core_to_virt_core(vd, i);
+			data->buffers[i] = gxp_dma_alloc_coherent(
+				gxp, vd, BIT(virt_core), size,
+				&data->buffer_daddrs[i], GFP_KERNEL, 0);
+		} else {
+			data->buffers[i] =
+				gxp_dma_alloc_coherent(gxp, NULL, 0, size,
+						       &data->buffer_daddrs[i],
+						       GFP_KERNEL, 0);
+		}
 		if (!data->buffers[i])
 			goto err_alloc;
 	}
@@ -215,9 +246,17 @@ static struct buffer_data *allocate_telemetry_buffers(struct gxp_dev *gxp,
 
 err_alloc:
 	for (; i > 0; i--) {
-		gxp_dma_free_coherent(gxp, BIT(i - 1), size,
-				      data->buffers[i - 1],
-				      data->buffer_daddrs[i - 1]);
+		vd = gxp->core_to_vd[i-1];
+		if (vd != NULL) {
+			virt_core = gxp_vd_phys_core_to_virt_core(vd, i);
+			gxp_dma_free_coherent(gxp, vd, BIT(virt_core), size,
+					      data->buffers[i - 1],
+					      data->buffer_daddrs[i - 1]);
+		} else {
+			gxp_dma_free_coherent(gxp, NULL, 0, size,
+					      data->buffers[i - 1],
+					      data->buffer_daddrs[i - 1]);
+		}
 	}
 	kfree(data);
 
@@ -294,6 +333,8 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 	size_t size = total_size / GXP_NUM_CORES;
 	struct buffer_data *data;
 	int i;
+	struct gxp_virtual_device *vd;
+	uint virt_core;
 
 	if (!gxp->telemetry_mgr)
 		return -ENODEV;
@@ -303,6 +344,7 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 		return -EINVAL;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
+	down_read(&gxp->vd_semaphore);
 
 	ret = check_telemetry_type_availability(gxp, type);
 	if (ret)
@@ -335,20 +377,32 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 	else /* type == GXP_TELEMETRY_TYPE_TRACING */
 		gxp->telemetry_mgr->tracing_buff_data = data;
 
+	up_read(&gxp->vd_semaphore);
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 
 	return 0;
 
 err_free_buffers:
-	for (i = 0; i < GXP_NUM_CORES; i++)
-		gxp_dma_free_coherent(gxp, BIT(i), data->size, data->buffers[i],
-				      data->buffer_daddrs[i]);
+	for (i = 0; i < GXP_NUM_CORES; i++) {
+		vd = gxp->core_to_vd[i];
+		if (vd != NULL) {
+			virt_core = gxp_vd_phys_core_to_virt_core(vd, i);
+			gxp_dma_free_coherent(gxp, vd, BIT(virt_core),
+					      data->size, data->buffers[i],
+					      data->buffer_daddrs[i]);
+		} else {
+			gxp_dma_free_coherent(gxp, NULL, 0, data->size,
+					      data->buffers[i],
+					      data->buffer_daddrs[i]);
+		}
+	}
 	kfree(data);
 
 err_free_vma_data:
 	kfree(vma_data);
 
 err:
+	up_read(&gxp->vd_semaphore);
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 	return ret;
 }
