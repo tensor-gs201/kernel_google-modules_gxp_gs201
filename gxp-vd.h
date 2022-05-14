@@ -9,11 +9,14 @@
 
 #include <linux/iommu.h>
 #include <linux/list.h>
+#include <linux/rbtree.h>
+#include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 
 #include "gxp-internal.h"
+#include "gxp-mapping.h"
 
 struct mailbox_resp_queue {
 	/* Queue of `struct gxp_async_response`s */
@@ -42,6 +45,8 @@ struct gxp_virtual_device {
 	void *fw_app;
 	struct iommu_domain **core_domains;
 	struct mailbox_resp_queue *mailbox_resp_queues;
+	struct rb_root mappings_root;
+	struct rw_semaphore mappings_semaphore;
 	enum gxp_virtual_device_state state;
 	/*
 	 * Record the gxp->power_mgr->blk_switch_count when the vd was
@@ -77,6 +82,7 @@ void gxp_vd_destroy(struct gxp_dev *gxp);
  * Return: The virtual address of the virtual device or an ERR_PTR on failure
  * * -EINVAL - The number of requested cores was invalid
  * * -ENOMEM - Unable to allocate the virtual device
+ * * -EBUSY  - Not enough iommu domains available
  */
 struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp, u16 requested_cores);
 
@@ -135,6 +141,71 @@ uint gxp_vd_virt_core_list_to_phys_core_list(struct gxp_virtual_device *vd,
  * The caller must have locked gxp->vd_semaphore for reading.
  */
 int gxp_vd_phys_core_to_virt_core(struct gxp_virtual_device *vd, u16 phys_core);
+
+/**
+ * gxp_vd_mapping_store() - Store a mapping in a virtual device's records
+ * @vd: The virtual device @map was created for and will be stored in
+ * @map: The mapping to store
+ *
+ * Acquires a reference to @map if it was successfully stored
+ *
+ * Return:
+ * * 0: Success
+ * * -EINVAL: @map is already stored in @vd's records
+ */
+int gxp_vd_mapping_store(struct gxp_virtual_device *vd,
+			 struct gxp_mapping *map);
+
+/**
+ * gxp_vd_mapping_remove() - Remove a mapping from a virtual device's records
+ * @vd: The VD to remove @map from
+ * @map: The mapping to remove
+ *
+ * Releases a reference to @map if it was successfully removed
+ */
+void gxp_vd_mapping_remove(struct gxp_virtual_device *vd,
+			   struct gxp_mapping *map);
+
+/**
+ * gxp_vd_mapping_search() - Obtain a reference to the mapping starting at the
+ *                           specified device address
+ * @vd: The virtual device to search for the mapping
+ * @device_address: The starting device address of the mapping to find
+ *
+ * Obtains a reference to the returned mapping
+ *
+ * Return: A pointer to the mapping if found; NULL otherwise
+ */
+struct gxp_mapping *gxp_vd_mapping_search(struct gxp_virtual_device *vd,
+					  dma_addr_t device_address);
+
+/**
+ * gxp_vd_mapping_search_in_range() - Obtain a reference to the mapping which
+ *                                    contains the specified device address
+ * @vd: The virtual device to search for the mapping
+ * @device_address: A device address contained in the buffer the mapping to
+ *                  find describes.
+ *
+ * Obtains a reference to the returned mapping
+ *
+ * Return: A pointer to the mapping if found; NULL otherwise
+ */
+struct gxp_mapping *
+gxp_vd_mapping_search_in_range(struct gxp_virtual_device *vd,
+			       dma_addr_t device_address);
+
+/**
+ * gxp_vd_mapping_search_host() - Obtain a reference to the mapping starting at
+ *                                the specified user-space address
+ * @vd: The virtual device to search for the mapping
+ * @host_address: The starting user-space address of the mapping to find
+ *
+ * Obtains a reference to the returned mapping
+ *
+ * Return: A pointer to the mapping if found; NULL otherwise
+ */
+struct gxp_mapping *gxp_vd_mapping_search_host(struct gxp_virtual_device *vd,
+					       u64 host_address);
 
 /**
  * gxp_vd_suspend() - Suspend a running virtual device

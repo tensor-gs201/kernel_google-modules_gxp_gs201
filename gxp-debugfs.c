@@ -5,23 +5,22 @@
  * Copyright (C) 2021 Google LLC
  */
 
-#ifdef CONFIG_GXP_CLOUDRIPPER
 #include <linux/acpm_dvfs.h>
-#endif
 
-#include "gxp.h"
 #include "gxp-client.h"
 #include "gxp-debug-dump.h"
 #include "gxp-debugfs.h"
-#include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
+#include "gxp-firmware.h"
 #include "gxp-internal.h"
-#include "gxp-pm.h"
-#include "gxp-mailbox.h"
-#include "gxp-telemetry.h"
+#include "gxp-notification.h"
 #include "gxp-lpm.h"
+#include "gxp-mailbox.h"
+#include "gxp-pm.h"
+#include "gxp-telemetry.h"
 #include "gxp-vd.h"
 #include "gxp-wakelock.h"
+#include "gxp.h"
 
 static int gxp_debugfs_lpm_test(void *data, u64 val)
 {
@@ -73,53 +72,17 @@ static int gxp_debugfs_mailbox(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_mailbox_fops, NULL, gxp_debugfs_mailbox, "%llu\n");
 
-static int gxp_debugfs_pingpong(void *data, u64 val)
-{
-	int core;
-	struct gxp_command cmd;
-	struct gxp_response resp;
-	struct gxp_dev *gxp = (struct gxp_dev *)data;
-
-	core = val / 1000;
-	if (core >= GXP_NUM_CORES) {
-		dev_notice(gxp->dev,
-			   "Mailbox for core %d doesn't exist.\n", core);
-		return -EINVAL;
-	}
-
-	if (gxp->mailbox_mgr == NULL ||
-	    gxp->mailbox_mgr->mailboxes[core] == NULL) {
-		dev_notice(
-			gxp->dev,
-			"Unable to send mailbox pingpong -- mailbox %d not ready\n",
-			core);
-		return -EINVAL;
-	}
-
-	cmd.code = GXP_MBOX_CODE_PINGPONG;
-	cmd.priority = 0;
-	cmd.buffer_descriptor.address = 0;
-	cmd.buffer_descriptor.size = 0;
-	cmd.buffer_descriptor.flags = (u32) val;
-
-	down_read(&gxp->vd_semaphore);
-	gxp_mailbox_execute_cmd(gxp->mailbox_mgr->mailboxes[core], &cmd, &resp);
-	up_read(&gxp->vd_semaphore);
-
-	dev_info(
-		gxp->dev,
-		"Mailbox Pingpong Sent to core %d: val=%d, resp.status=%d, resp.retval=%d\n",
-		core, cmd.buffer_descriptor.flags, resp.status, resp.retval);
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(gxp_pingpong_fops, NULL, gxp_debugfs_pingpong,
-			 "%llu\n");
-
 static int gxp_firmware_run_set(void *data, u64 val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *) data;
 	struct gxp_client *client;
 	int ret = 0;
+
+	ret = gxp_firmware_request_if_needed(gxp);
+	if (ret) {
+		dev_err(gxp->dev, "Unable to request dsp firmware files\n");
+		return ret;
+	}
 
 	mutex_lock(&gxp->debugfs_client_lock);
 
@@ -157,8 +120,10 @@ static int gxp_firmware_run_set(void *data, u64 val)
 			goto err_wakelock;
 		}
 		gxp->debugfs_client->has_block_wakelock = true;
-		gxp_pm_update_requested_power_state(gxp, AUR_OFF, true, AUR_UUD,
-						    true);
+		gxp_pm_update_requested_power_states(gxp, AUR_OFF, true,
+						     AUR_UUD, true,
+						     AUR_MEM_UNDEFINED,
+						     AUR_MEM_UNDEFINED);
 
 		down_write(&gxp->vd_semaphore);
 		ret = gxp_vd_start(gxp->debugfs_client->vd);
@@ -181,8 +146,10 @@ static int gxp_firmware_run_set(void *data, u64 val)
 		 */
 		gxp_client_destroy(gxp->debugfs_client);
 		gxp->debugfs_client = NULL;
-		gxp_pm_update_requested_power_state(gxp, AUR_UUD, true, AUR_OFF,
-						    true);
+		gxp_pm_update_requested_power_states(gxp, AUR_UUD, true,
+						     AUR_OFF, true,
+						     AUR_MEM_UNDEFINED,
+						     AUR_MEM_UNDEFINED);
 	}
 
 out:
@@ -192,7 +159,9 @@ out:
 
 err_start:
 	gxp_wakelock_release(gxp);
-	gxp_pm_update_requested_power_state(gxp, AUR_UUD, true, AUR_OFF, true);
+	gxp_pm_update_requested_power_states(gxp, AUR_UUD, true, AUR_OFF, true,
+					     AUR_MEM_UNDEFINED,
+					     AUR_MEM_UNDEFINED);
 err_wakelock:
 	/* Destroying a client cleans up any VDss or wakelocks it held. */
 	gxp_client_destroy(gxp->debugfs_client);
@@ -205,7 +174,10 @@ static int gxp_firmware_run_get(void *data, u64 *val)
 {
 	struct gxp_dev *gxp = (struct gxp_dev *) data;
 
+	down_read(&gxp->vd_semaphore);
 	*val = gxp->firmware_running;
+	up_read(&gxp->vd_semaphore);
+
 	return 0;
 }
 
@@ -236,8 +208,10 @@ static int gxp_wakelock_set(void *data, u64 val)
 			goto out;
 		}
 		gxp->debugfs_wakelock_held = true;
-		gxp_pm_update_requested_power_state(gxp, AUR_OFF, true, AUR_UUD,
-						    true);
+		gxp_pm_update_requested_power_states(gxp, AUR_OFF, true,
+						     AUR_UUD, true,
+						     AUR_MEM_UNDEFINED,
+						     AUR_MEM_UNDEFINED);
 	} else {
 		/* Wakelock Release */
 		if (!gxp->debugfs_wakelock_held) {
@@ -248,8 +222,10 @@ static int gxp_wakelock_set(void *data, u64 val)
 
 		gxp_wakelock_release(gxp);
 		gxp->debugfs_wakelock_held = false;
-		gxp_pm_update_requested_power_state(gxp, AUR_UUD, true, AUR_OFF,
-						    true);
+		gxp_pm_update_requested_power_states(gxp, AUR_UUD, true,
+						     AUR_OFF, true,
+						     AUR_MEM_UNDEFINED,
+						     AUR_MEM_UNDEFINED);
 	}
 
 out:
@@ -301,8 +277,22 @@ DEFINE_DEBUGFS_ATTRIBUTE(gxp_blk_powerstate_fops, gxp_blk_powerstate_get,
 
 static int gxp_debugfs_coredump(void *data, u64 val)
 {
-	return gxp_debugfs_mailbox(data, GXP_MBOX_CODE_COREDUMP);
+	struct gxp_dev *gxp = (struct gxp_dev *)data;
+	int core;
+
+	down_read(&gxp->vd_semaphore);
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp_is_fw_running(gxp, core))
+			gxp_notification_send(gxp, core,
+					      CORE_NOTIF_GENERATE_DEBUG_DUMP);
+	}
+
+	up_read(&gxp->vd_semaphore);
+
+	return 0;
 }
+
 DEFINE_DEBUGFS_ATTRIBUTE(gxp_coredump_fops, NULL, gxp_debugfs_coredump,
 			 "%llu\n");
 
@@ -475,8 +465,6 @@ void gxp_create_debugfs(struct gxp_dev *gxp)
 			    &gxp_lpm_test_fops);
 	debugfs_create_file("mailbox", 0200, gxp->d_entry, gxp,
 			    &gxp_mailbox_fops);
-	debugfs_create_file("pingpong", 0200, gxp->d_entry, gxp,
-			    &gxp_pingpong_fops);
 	debugfs_create_file("firmware_run", 0600, gxp->d_entry, gxp,
 			    &gxp_firmware_run_fops);
 	debugfs_create_file("wakelock", 0200, gxp->d_entry, gxp,

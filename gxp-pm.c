@@ -5,15 +5,11 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#include <linux/acpm_dvfs.h>
 #include <linux/io.h>
 #include <linux/pm_runtime.h>
-#include <linux/refcount.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
-
-#ifdef CONFIG_GXP_CLOUDRIPPER
-#include <linux/acpm_dvfs.h>
-#endif
 #include <soc/google/exynos_pm_qos.h>
 
 #include "gxp-bpm.h"
@@ -58,7 +54,6 @@ static int gxp_pm_blkpwr_up(struct gxp_dev *gxp)
 {
 	int ret = 0;
 
-#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	/*
 	 * This function is equivalent to pm_runtime_get_sync, but will prevent
 	 * the pm_runtime refcount from increasing if the call fails. It also
@@ -68,7 +63,6 @@ static int gxp_pm_blkpwr_up(struct gxp_dev *gxp)
 	if (ret)
 		dev_err(gxp->dev, "%s: pm_runtime_resume_and_get returned %d\n",
 			__func__, ret);
-#endif
 	return ret;
 }
 
@@ -76,7 +70,6 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 {
 	int ret = 0;
 
-#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	/*
 	 * Need to put TOP LPM into active state before blk off
 	 * b/189396709
@@ -93,7 +86,6 @@ static int gxp_pm_blkpwr_down(struct gxp_dev *gxp)
 		 */
 		dev_err(gxp->dev, "%s: pm_runtime_put_sync returned %d\n",
 			__func__, ret);
-#endif
 	/* Remove our vote for INT/MIF state (if any) */
 	exynos_pm_qos_update_request(&gxp->power_mgr->int_min, 0);
 	exynos_pm_qos_update_request(&gxp->power_mgr->mif_min, 0);
@@ -105,6 +97,12 @@ static int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state, b
 	unsigned long rate;
 
 	rate = aur_power_state2rate[state];
+	if (gxp->power_mgr->thermal_limit &&
+	    gxp->power_mgr->thermal_limit < rate)
+		dev_warn(
+			gxp->dev,
+			"Requesting power state higher than current thermal limit (%lu)\n",
+			rate);
 	if (!aggressor)
 		rate |= BIT(AUR_NON_AGGRESSOR_BIT);
 	return gxp_pm_blk_set_rate_acpm(gxp, rate);
@@ -112,12 +110,9 @@ static int gxp_pm_blk_set_state_acpm(struct gxp_dev *gxp, unsigned long state, b
 
 int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate)
 {
-	int ret = 0;
+	int ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, rate);
 
-#if defined(CONFIG_GXP_CLOUDRIPPER)
-	ret = exynos_acpm_set_rate(AUR_DVFS_DOMAIN, rate);
 	dev_dbg(gxp->dev, "%s: rate %lu, ret %d\n", __func__, rate, ret);
-#endif
 	return ret;
 }
 
@@ -192,12 +187,9 @@ out:
 
 int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp)
 {
-	int ret = 0;
+	int ret = exynos_acpm_get_rate(AUR_DVFS_DOMAIN, AUR_DEBUG_CORE_FREQ);
 
-#if defined(CONFIG_GXP_CLOUDRIPPER)
-	ret = exynos_acpm_get_rate(AUR_DVFS_DOMAIN, AUR_DEBUG_CORE_FREQ);
 	dev_dbg(gxp->dev, "%s: state %d\n", __func__, ret);
-#endif
 	return ret;
 }
 
@@ -210,6 +202,7 @@ int gxp_pm_blk_on(struct gxp_dev *gxp)
 		return -ENODEV;
 	}
 
+	dev_info(gxp->dev, "Powering on BLK ...\n");
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	ret = gxp_pm_blkpwr_up(gxp);
 	if (!ret) {
@@ -235,12 +228,8 @@ int gxp_pm_blk_off(struct gxp_dev *gxp)
 		dev_err(gxp->dev, "%s: No PM found\n", __func__);
 		return -ENODEV;
 	}
+	dev_info(gxp->dev, "Powering off BLK ...\n");
 	mutex_lock(&gxp->power_mgr->pm_lock);
-	if (refcount_read(&(gxp->power_mgr->blk_wake_ref))) {
-		dev_err(gxp->dev, "%s: Wake lock not released\n", __func__);
-		mutex_unlock(&gxp->power_mgr->pm_lock);
-		return -EBUSY;
-	}
 	/*
 	 * Shouldn't happen unless this function has been called twice without blk_on
 	 * first.
@@ -326,9 +315,6 @@ int gxp_pm_core_off(struct gxp_dev *gxp, uint core)
 	mutex_lock(&gxp->power_mgr->pm_lock);
 	gxp_lpm_down(gxp, core);
 	mutex_unlock(&gxp->power_mgr->pm_lock);
-	/*
-	 * TODO: b/199467568 If all cores are off shutdown blk
-	 */
 	dev_notice(gxp->dev, "%s: Core %d down\n", __func__, core);
 	return 0;
 }
@@ -343,6 +329,11 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 		dev_err(gxp->dev, "Invalid state %d\n", state);
 		return -EINVAL;
 	}
+	if (gxp->power_mgr->curr_state == AUR_OFF) {
+		dev_err(gxp->dev,
+			"Cannot request power state when BLK is off\n");
+		return -EBUSY;
+	}
 	if (state != gxp->power_mgr->curr_state ||
 	    aggressor_vote != gxp->power_mgr->curr_aggressor_vote) {
 		if (state != AUR_OFF) {
@@ -353,7 +344,7 @@ static int gxp_pm_req_state_locked(struct gxp_dev *gxp,
 					     .using)
 					break;
 			}
-			/* The workqueue stucks, wait for it  */
+			/* The workqueue is full, wait for it  */
 			if (i == AUR_NUM_POWER_STATE_WORKER) {
 				dev_warn(
 					gxp->dev,
@@ -477,22 +468,26 @@ static void gxp_pm_get_max_voted_power_state(struct gxp_dev *gxp,
 	}
 }
 
-int gxp_pm_update_requested_power_state(struct gxp_dev *gxp,
-					enum aur_power_state origin_state,
-					bool origin_requested_aggressor,
-					enum aur_power_state requested_state,
-					bool requested_aggressor)
+static int gxp_pm_update_requested_power_state(
+	struct gxp_dev *gxp, enum aur_power_state origin_state,
+	bool origin_requested_aggressor, enum aur_power_state requested_state,
+	bool requested_aggressor)
 {
 	int ret;
 	unsigned long max_state = AUR_OFF;
 	bool aggressor_vote = false;
 
-	mutex_lock(&gxp->power_mgr->pm_lock);
+	lockdep_assert_held(&gxp->power_mgr->pm_lock);
+	if (gxp->power_mgr->curr_state == AUR_OFF &&
+	    requested_state != AUR_OFF) {
+		dev_warn(gxp->dev,
+			 "The client vote power state %d when BLK is off\n",
+			 requested_state);
+	}
 	gxp_pm_revoke_power_state_vote(gxp, origin_state, origin_requested_aggressor);
 	gxp_pm_vote_power_state(gxp, requested_state, requested_aggressor);
 	gxp_pm_get_max_voted_power_state(gxp, &max_state, &aggressor_vote);
 	ret = gxp_pm_req_state_locked(gxp, max_state, aggressor_vote);
-	mutex_unlock(&gxp->power_mgr->pm_lock);
 	return ret;
 }
 
@@ -527,6 +522,11 @@ static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp,
 		dev_err(gxp->dev, "Invalid memory state %d\n", state);
 		return -EINVAL;
 	}
+	if (gxp->power_mgr->curr_state == AUR_OFF) {
+		dev_err(gxp->dev,
+			"Cannot request memory power state when BLK is off\n");
+		return -EBUSY;
+	}
 	if (state != gxp->power_mgr->curr_memory_state) {
 		mutex_lock(&gxp->power_mgr->req_pm_qos_work_lock);
 
@@ -534,7 +534,7 @@ static int gxp_pm_req_memory_state_locked(struct gxp_dev *gxp,
 			if (!gxp->power_mgr->req_pm_qos_work[i].using)
 				break;
 		}
-		/* The workqueue stucks, wait for it  */
+		/* The workqueue is full, wait for it  */
 		if (i == AUR_NUM_POWER_STATE_WORKER) {
 			dev_warn(
 				gxp->dev,
@@ -625,46 +625,44 @@ static unsigned long gxp_pm_get_max_voted_memory_power_state(struct gxp_dev *gxp
 	return state;
 }
 
-int gxp_pm_update_requested_memory_power_state(
+static int gxp_pm_update_requested_memory_power_state(
 	struct gxp_dev *gxp, enum aur_memory_power_state origin_state,
 	enum aur_memory_power_state requested_state)
 {
 	int ret;
 	unsigned long max_state;
 
-	mutex_lock(&gxp->power_mgr->pm_lock);
+	lockdep_assert_held(&gxp->power_mgr->pm_lock);
 	gxp_pm_revoke_memory_power_state_vote(gxp, origin_state);
 	gxp_pm_vote_memory_power_state(gxp, requested_state);
 	max_state = gxp_pm_get_max_voted_memory_power_state(gxp);
 	ret = gxp_pm_req_memory_state_locked(gxp, max_state);
-	mutex_unlock(&gxp->power_mgr->pm_lock);
 	return ret;
 }
 
-int gxp_pm_acquire_blk_wakelock(struct gxp_dev *gxp)
+int gxp_pm_update_requested_power_states(
+	struct gxp_dev *gxp, enum aur_power_state origin_state,
+	bool origin_requested_aggressor, enum aur_power_state requested_state,
+	bool requested_aggressor, enum aur_memory_power_state origin_mem_state,
+	enum aur_memory_power_state requested_mem_state)
 {
-	mutex_lock(&gxp->power_mgr->pm_lock);
-	refcount_inc(&(gxp->power_mgr->blk_wake_ref));
-	dev_dbg(gxp->dev, "Blk wakelock ref count: %d\n",
-		refcount_read(&(gxp->power_mgr->blk_wake_ref)));
-	mutex_unlock(&gxp->power_mgr->pm_lock);
-	return 0;
-}
+	int ret = 0;
 
-int gxp_pm_release_blk_wakelock(struct gxp_dev *gxp)
-{
 	mutex_lock(&gxp->power_mgr->pm_lock);
-	if (refcount_read(&(gxp->power_mgr->blk_wake_ref))) {
-		refcount_dec(&(gxp->power_mgr->blk_wake_ref));
-	} else {
-		dev_err(gxp->dev, "Blk wakelock is already zero\n");
-		WARN_ON(1);
-		mutex_unlock(&gxp->power_mgr->pm_lock);
-		return -EIO;
+	if (origin_state != requested_state ||
+	    origin_requested_aggressor != requested_aggressor) {
+		ret = gxp_pm_update_requested_power_state(
+			gxp, origin_state, origin_requested_aggressor,
+			requested_state, requested_aggressor);
+		if (ret)
+			goto out;
 	}
+	if (origin_mem_state != requested_mem_state)
+		ret = gxp_pm_update_requested_memory_power_state(
+			gxp, origin_mem_state, requested_mem_state);
+out:
 	mutex_unlock(&gxp->power_mgr->pm_lock);
-	dev_notice(gxp->dev, "Release blk wakelock\n");
-	return 0;
+	return ret;
 }
 
 int gxp_pm_init(struct gxp_dev *gxp)
@@ -680,7 +678,6 @@ int gxp_pm_init(struct gxp_dev *gxp)
 	mgr->curr_state = AUR_OFF;
 	mgr->curr_memory_state = AUR_MEM_UNDEFINED;
 	mgr->curr_aggressor_vote = true;
-	refcount_set(&(mgr->blk_wake_ref), 0);
 	mgr->ops = &gxp_aur_ops;
 	gxp->power_mgr = mgr;
 	for (i = 0; i < AUR_NUM_POWER_STATE_WORKER; i++) {
@@ -700,9 +697,7 @@ int gxp_pm_init(struct gxp_dev *gxp)
 	gxp->power_mgr->force_noc_mux_normal_count = 0;
 	gxp->power_mgr->blk_switch_count = 0l;
 
-#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
 	pm_runtime_enable(gxp->dev);
-#endif
 	exynos_pm_qos_add_request(&mgr->int_min, PM_QOS_DEVICE_THROUGHPUT, 0);
 	exynos_pm_qos_add_request(&mgr->mif_min, PM_QOS_BUS_THROUGHPUT, 0);
 
@@ -714,12 +709,35 @@ int gxp_pm_destroy(struct gxp_dev *gxp)
 	struct gxp_power_manager *mgr;
 
 	mgr = gxp->power_mgr;
-	exynos_pm_qos_remove_request(&mgr->int_min);
 	exynos_pm_qos_remove_request(&mgr->mif_min);
-#if defined(CONFIG_GXP_CLOUDRIPPER) && !defined(CONFIG_GXP_TEST)
+	exynos_pm_qos_remove_request(&mgr->int_min);
 	pm_runtime_disable(gxp->dev);
-#endif
+	flush_workqueue(mgr->wq);
 	destroy_workqueue(mgr->wq);
 	mutex_destroy(&mgr->pm_lock);
 	return 0;
+}
+
+void gxp_pm_set_thermal_limit(struct gxp_dev *gxp, unsigned long thermal_limit)
+{
+	mutex_lock(&gxp->power_mgr->pm_lock);
+
+	if (thermal_limit >= aur_power_state2rate[AUR_NOM]) {
+		dev_warn(gxp->dev, "Thermal limit on DVFS removed\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_UD]) {
+		dev_warn(gxp->dev, "Thermals limited to UD\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_SUD]) {
+		dev_warn(gxp->dev, "Thermal limited to SUD\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_UUD]) {
+		dev_warn(gxp->dev, "Thermal limited to UUD\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_READY]) {
+		dev_warn(gxp->dev, "Thermal limited to READY\n");
+	} else {
+		dev_warn(gxp->dev,
+			 "Thermal limit disallows all valid DVFS states\n");
+	}
+
+	gxp->power_mgr->thermal_limit = thermal_limit;
+
+	mutex_unlock(&gxp->power_mgr->pm_lock);
 }

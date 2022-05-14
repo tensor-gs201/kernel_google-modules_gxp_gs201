@@ -29,6 +29,26 @@ struct gxp_dmabuf_mapping {
 	struct sg_table *sgt;
 };
 
+/* Mapping destructor for gxp_mapping_put() to call */
+static void destroy_dmabuf_mapping(struct gxp_mapping *mapping)
+{
+	struct gxp_dmabuf_mapping *dmabuf_mapping;
+	struct gxp_dev *gxp = mapping->gxp;
+	struct gxp_virtual_device *vd = mapping->vd;
+
+	/* Unmap and detach the dma-buf */
+	dmabuf_mapping =
+		container_of(mapping, struct gxp_dmabuf_mapping, mapping);
+
+	gxp_dma_unmap_dmabuf_attachment(gxp, vd, mapping->virt_core_list,
+					dmabuf_mapping->attachment,
+					dmabuf_mapping->sgt, mapping->dir);
+	dma_buf_detach(dmabuf_mapping->dmabuf, dmabuf_mapping->attachment);
+	dma_buf_put(dmabuf_mapping->dmabuf);
+
+	kfree(dmabuf_mapping);
+}
+
 struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
 				   struct gxp_virtual_device *vd,
 				   uint virt_core_list, int fd, u32 flags,
@@ -39,6 +59,9 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
 	struct sg_table *sgt;
 	struct gxp_dmabuf_mapping *dmabuf_mapping;
 	int ret = 0;
+
+	if (!valid_dma_direction(dir))
+		return ERR_PTR(-EINVAL);
 
 	dmabuf = dma_buf_get(fd);
 	if (IS_ERR(dmabuf)) {
@@ -71,24 +94,20 @@ struct gxp_mapping *gxp_dmabuf_map(struct gxp_dev *gxp,
 	}
 
 	/* dma-buf mappings are indicated by a host_address of 0 */
+	refcount_set(&dmabuf_mapping->mapping.refcount, 1);
+	dmabuf_mapping->mapping.destructor = destroy_dmabuf_mapping;
 	dmabuf_mapping->mapping.host_address = 0;
+	dmabuf_mapping->mapping.gxp = gxp;
 	dmabuf_mapping->mapping.virt_core_list = virt_core_list;
+	dmabuf_mapping->mapping.vd = vd;
 	dmabuf_mapping->mapping.device_address = sg_dma_address(sgt->sgl);
 	dmabuf_mapping->mapping.dir = dir;
 	dmabuf_mapping->dmabuf = dmabuf;
 	dmabuf_mapping->attachment = attachment;
 	dmabuf_mapping->sgt = sgt;
-	ret = gxp_mapping_put(gxp, &dmabuf_mapping->mapping);
-	if (ret) {
-		dev_err(gxp->dev,
-			"Failed to store mapping for dma-buf (ret=%d)\n", ret);
-		goto err_put_mapping;
-	}
 
 	return &dmabuf_mapping->mapping;
 
-err_put_mapping:
-	kfree(dmabuf_mapping);
 err_alloc_mapping:
 	gxp_dma_unmap_dmabuf_attachment(gxp, vd, virt_core_list, attachment, sgt, dir);
 err_map_attachment:
@@ -96,36 +115,4 @@ err_map_attachment:
 err_attach:
 	dma_buf_put(dmabuf);
 	return ERR_PTR(ret);
-}
-
-void gxp_dmabuf_unmap(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
-		      dma_addr_t device_address)
-{
-	struct gxp_dmabuf_mapping *dmabuf_mapping;
-	struct gxp_mapping *mapping;
-
-	/*
-	 * Fetch and remove the internal mapping records.
-	 * If host_address is not 0, the provided device_address belongs to a
-	 * non-dma-buf mapping.
-	 */
-	mapping = gxp_mapping_get(gxp, device_address);
-	if (IS_ERR_OR_NULL(mapping) || mapping->host_address) {
-		dev_warn(gxp->dev, "No dma-buf mapped for given IOVA\n");
-		return;
-	}
-
-	gxp_mapping_remove(gxp, mapping);
-
-	/* Unmap and detach the dma-buf */
-	dmabuf_mapping =
-		container_of(mapping, struct gxp_dmabuf_mapping, mapping);
-
-	gxp_dma_unmap_dmabuf_attachment(gxp, vd, mapping->virt_core_list,
-					dmabuf_mapping->attachment,
-					dmabuf_mapping->sgt, mapping->dir);
-	dma_buf_detach(dmabuf_mapping->dmabuf, dmabuf_mapping->attachment);
-	dma_buf_put(dmabuf_mapping->dmabuf);
-
-	kfree(dmabuf_mapping);
 }

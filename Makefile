@@ -11,6 +11,7 @@ gxp-objs +=	\
 		gxp-debug-dump.o \
 		gxp-debugfs.o \
 		gxp-dmabuf.o \
+		gxp-domain-pool.o \
 		gxp-doorbell.o \
 		gxp-eventfd.o \
 		gxp-firmware.o \
@@ -48,11 +49,7 @@ endif
 #     - IP_ZEBU
 # Defaults to building for CLOUDRIPPER if not otherwise specified.
 GXP_PLATFORM ?= CLOUDRIPPER
-
-# Test against the build closet to production mode, choose CLOUDRIPPER.
-ifdef CONFIG_GXP_TEST
-	GXP_PLATFORM = CLOUDRIPPER
-endif
+GXP_CHIP ?= AMALTHEA
 
 # Setup which version of the gxp-dma interface is used.
 # For gem5, need to adopt dma interface without aux domain.
@@ -62,9 +59,10 @@ else
 	gxp-objs += gxp-dma-iommu.o
 endif
 
-ccflags-y += -DCONFIG_GXP_$(GXP_PLATFORM)
+ccflags-y += -DCONFIG_GXP_$(GXP_PLATFORM) -DCONFIG_$(GXP_CHIP)=1 \
+	     -I$(M)/include -I$(srctree)/drivers/gxp/include
 
-KBUILD_OPTIONS += CONFIG_GXP=m
+KBUILD_OPTIONS += CONFIG_GXP=m GXP_CHIP=AMALTHEA
 
 ifdef CONFIG_GXP_TEST
 subdir-ccflags-y        += -Wall -Werror -I$(srctree)/drivers/gxp/include

@@ -8,12 +8,22 @@
 #ifndef __GXP_CONFIG_H__
 #define __GXP_CONFIG_H__
 
-#define GXP_DRIVER_NAME "gxp_platform"
-#ifndef CONFIG_GXP_GEM5
-#define GXP_NUM_CORES 4
-#else
+#if IS_ENABLED(CONFIG_AMALTHEA)
+
+#include "amalthea/config.h"
+
+#else /* unknown */
+
+#error "Unknown GXP config"
+
+#endif /* unknown */
+
+#ifdef CONFIG_GXP_GEM5
+#undef GXP_NUM_CORES
 #define GXP_NUM_CORES 1
 #endif
+
+#define GXP_NUM_PREALLOCATED_DOMAINS GXP_NUM_CORES
 
 #if defined(CONFIG_GXP_ZEBU) || defined(CONFIG_GXP_IP_ZEBU)
 #define GXP_TIME_DELAY_FACTOR 20
@@ -24,8 +34,6 @@
 #define DOORBELL_COUNT 32
 
 #define SYNC_BARRIER_COUNT 16
-
-#include "gxp-csrs.h"
 
 /* Core address space starts at Inst_BPM block */
 #define GXP_CORE_0_BASE GXP_REG_CORE_0_INST_BPM

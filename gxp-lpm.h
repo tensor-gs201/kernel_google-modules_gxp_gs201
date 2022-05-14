@@ -97,7 +97,8 @@ bool gxp_lpm_wait_state_eq(struct gxp_dev *gxp, uint psm, uint state);
 /*
  * Force a state transition on the specified PSM.
  */
-int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state);
+int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state,
+		      bool verbose);
 
 /*
  * Get current LPM state of the specified PSM.

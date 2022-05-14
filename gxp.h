@@ -809,4 +809,21 @@ struct gxp_tpu_mbx_queue_ioctl {
 #define GXP_UNMAP_TPU_MBX_QUEUE \
 	_IOW(GXP_IOCTL_BASE, 14, struct gxp_tpu_mbx_queue_ioctl)
 
+/*
+ * Triggers a debug dump to be generated for cores.
+ *
+ * The cores requested to generate a debug dump are indicated by the bitmap of
+ * the argument. For example, an argument of 'b1001 represents a request to
+ * generate debug dumps for core 0 and 3.
+ *
+ * Returns 0 if all the debug dumps for the requested cores are successfully
+ * triggered. If a debug dump fails to be triggered for one or more requested
+ * cores, -EINVAL will be returned.
+ *
+ * The client must hold a VIRTUAL_DEVICE wakelock.
+ *
+ * Note: Root access is required to use this IOCTL.
+ */
+#define GXP_TRIGGER_DEBUG_DUMP _IOW(GXP_IOCTL_BASE, 27, __u32)
+
 #endif /* __GXP_H__ */

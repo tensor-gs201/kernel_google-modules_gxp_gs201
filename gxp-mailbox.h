@@ -7,15 +7,18 @@
 #ifndef __GXP_MAILBOX_H__
 #define __GXP_MAILBOX_H__
 
+#include <linux/kthread.h>
+
 #include "gxp-client.h"
 #include "gxp-internal.h"
 
 /* Command/Response Structures */
 
 enum gxp_mailbox_command_code {
+	/* A user-space initiated dispatch message. */
 	GXP_MBOX_CODE_DISPATCH = 0,
-	GXP_MBOX_CODE_COREDUMP = 1,
-	GXP_MBOX_CODE_PINGPONG = 2,
+	/* A kernel initiated core suspend request. */
+	GXP_MBOX_CODE_SUSPEND_REQUEST = 1,
 };
 
 /* Basic Buffer descriptor struct for message payloads. */
@@ -156,8 +159,10 @@ struct gxp_mailbox {
 	struct mutex wait_list_lock; /* protects wait_list */
 	/* queue for waiting for the wait_list to be consumed */
 	wait_queue_head_t wait_list_waitq;
-	struct workqueue_struct *response_wq;
-	struct work_struct response_work;
+	/* to create our own realtime worker for handling responses */
+	struct kthread_worker response_worker;
+	struct task_struct *response_thread;
+	struct kthread_work response_work;
 };
 
 typedef void __iomem *(*get_mailbox_base_t)(struct gxp_dev *gxp, uint index);
@@ -171,6 +176,9 @@ struct gxp_mailbox_manager {
 };
 
 /* Mailbox APIs */
+
+extern int gxp_mbx_timeout;
+#define MAILBOX_TIMEOUT (gxp_mbx_timeout * GXP_TIME_DELAY_FACTOR)
 
 struct gxp_mailbox_manager *gxp_mailbox_create_manager(struct gxp_dev *gxp,
 						       uint num_cores);

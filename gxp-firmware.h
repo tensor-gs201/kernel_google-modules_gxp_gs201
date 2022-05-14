@@ -34,6 +34,7 @@ enum aurora_msg {
 	MSG_SCRATCHPAD_MAX,
 };
 
+/* The caller must have locked gxp->vd_semaphore for reading. */
 static inline bool gxp_is_fw_running(struct gxp_dev *gxp, uint core)
 {
 	return (gxp->firmware_running & BIT(core)) != 0;
@@ -45,11 +46,23 @@ static inline bool gxp_is_fw_running(struct gxp_dev *gxp, uint core)
  * The function needs to be called once after a block power up event.
  */
 int gxp_fw_init(struct gxp_dev *gxp);
+
 /*
  * Tears down the firmware loading/unloading subsystem in preparation for a
  * block-level shutdown event. To be called once before a block shutdown.
  */
 void gxp_fw_destroy(struct gxp_dev *gxp);
+
+/*
+ * Check if the DSP firmware files have been requested yet, and if not, request
+ * them.
+ *
+ * Returns 0 if the files have already been requested or were successfully
+ * requested by this call; Returns an errno if this call attempted to request
+ * the files and it failed.
+ */
+int gxp_firmware_request_if_needed(struct gxp_dev *gxp);
+
 /*
  * Loads the firmware for the specified core in system memory and powers up the
  * core to start FW execution.

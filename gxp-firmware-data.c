@@ -70,7 +70,7 @@ struct gxp_fw_data_manager {
 	/* Doorbells allocator and reserved doorbell IDs */
 	struct range_alloc *doorbell_allocator;
 	int cores_wakeup_doorbell;
-	int semaphore_doorbells[NUM_CORES];
+	int semaphore_doorbells[GXP_NUM_CORES];
 
 	/* Sync barriers allocator and reserved sync barrier IDs */
 	struct range_alloc *sync_barrier_allocator;
@@ -110,8 +110,8 @@ struct app_metadata {
 	struct fw_memory sync_barriers_mem;
 	struct fw_memory semaphores_mem;
 	struct fw_memory cores_mem;
-	struct fw_memory core_cmd_queues_mem[NUM_CORES];
-	struct fw_memory core_rsp_queues_mem[NUM_CORES];
+	struct fw_memory core_cmd_queues_mem[GXP_NUM_CORES];
+	struct fw_memory core_rsp_queues_mem[GXP_NUM_CORES];
 	struct fw_memory app_mem;
 };
 
@@ -316,7 +316,7 @@ static struct fw_memory init_app_semaphores(struct app_metadata *app)
 	sm_region->protection_barrier = app->mgr->semaphores_regions_barrier;
 
 	core = 0;
-	for (i = 0; i < NUM_CORES; i++) {
+	for (i = 0; i < GXP_NUM_CORES; i++) {
 		if (app->core_list & BIT(i))
 			sm_region->wakeup_doorbells[core++] =
 				app->mgr->semaphore_doorbells[i];
@@ -498,7 +498,7 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 		goto err;
 
 	/* Semaphores operation doorbells */
-	for (i = 0; i < NUM_CORES; i++) {
+	for (i = 0; i < GXP_NUM_CORES; i++) {
 		range_alloc_get_any(mgr->doorbell_allocator,
 				    &mgr->semaphore_doorbells[i]);
 	}
@@ -538,7 +538,6 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 		goto err;
 
 	/* Semaphore regions for all apps */
-	// TODO: make this per-app to improve performance?
 	res = range_alloc_get_any(mgr->sync_barrier_allocator,
 				  &mgr->semaphores_regions_barrier);
 	if (res)
@@ -618,7 +617,7 @@ void *gxp_fw_data_create_app(struct gxp_dev *gxp, uint core_list)
 
 	/* Application region. */
 	app->app_mem = init_application(app);
-	for (i = 0; i < NUM_CORES; i++) {
+	for (i = 0; i < GXP_NUM_CORES; i++) {
 		if (core_list & BIT(i)) {
 			mgr->system_desc->app_descriptor_dev_addr[i] =
 				app->app_mem.device_addr;
@@ -662,6 +661,9 @@ void gxp_fw_data_destroy(struct gxp_dev *gxp)
 {
 	struct gxp_fw_data_manager *mgr = gxp->data_mgr;
 
+	if (!mgr)
+		return;
+
 	mem_alloc_free(mgr->allocator, &mgr->telemetry_mem);
 	mem_alloc_free(mgr->allocator, &mgr->wdog_mem);
 	mem_alloc_free(mgr->allocator, &mgr->sys_desc_mem);
@@ -700,12 +702,12 @@ int gxp_fw_data_set_telemetry_descriptors(struct gxp_dev *gxp, u8 type,
 		return -EINVAL;
 
 	/* Validate that the provided IOVAs are addressable (i.e. 32-bit) */
-	for (core = 0; core < NUM_CORES; core++) {
+	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (buffer_addrs[core] > U32_MAX)
 			return -EINVAL;
 	}
 
-	for (core = 0; core < NUM_CORES; core++) {
+	for (core = 0; core < GXP_NUM_CORES; core++) {
 		core_descriptors[core].host_status = host_status;
 		core_descriptors[core].buffer_addr = (u32)buffer_addrs[core];
 		core_descriptors[core].buffer_size = per_buffer_size;

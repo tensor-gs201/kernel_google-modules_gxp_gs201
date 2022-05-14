@@ -340,7 +340,7 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 		return -ENODEV;
 
 	/* Total size must divide evenly into 1 page-aligned buffer per core */
-	if (!total_size || !IS_ALIGNED(total_size, PAGE_SIZE * GXP_NUM_CORES))
+	if (!total_size || total_size % (PAGE_SIZE * GXP_NUM_CORES))
 		return -EINVAL;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
@@ -628,11 +628,13 @@ int gxp_telemetry_unregister_eventfd(struct gxp_dev *gxp, u8 type)
 
 	switch (type) {
 	case GXP_TELEMETRY_TYPE_LOGGING:
-		eventfd_ctx_put(gxp->telemetry_mgr->logging_efd);
+		if (gxp->telemetry_mgr->logging_efd)
+			eventfd_ctx_put(gxp->telemetry_mgr->logging_efd);
 		gxp->telemetry_mgr->logging_efd = NULL;
 		break;
 	case GXP_TELEMETRY_TYPE_TRACING:
-		eventfd_ctx_put(gxp->telemetry_mgr->tracing_efd);
+		if (gxp->telemetry_mgr->tracing_efd)
+			eventfd_ctx_put(gxp->telemetry_mgr->tracing_efd);
 		gxp->telemetry_mgr->tracing_efd = NULL;
 		break;
 	default:

@@ -14,7 +14,7 @@
 #ifndef __GXP_HOST_DEVICE_STRUCTURES_H__
 #define __GXP_HOST_DEVICE_STRUCTURES_H__
 
-#define NUM_CORES 4
+#define MAX_NUM_CORES 4
 #define NUM_SYSTEM_SEMAPHORES 64
 
 /* Bit masks for the status fields in the telemetry structures. */
@@ -156,7 +156,7 @@ struct gxp_telemetry_descriptor {
 		uint32_t buffer_size;
 		/* The watermark interrupt threshold (in bytes) */
 		uint32_t watermark_level;
-	} per_core_loggers[NUM_CORES], per_core_tracers[NUM_CORES];
+	} per_core_loggers[MAX_NUM_CORES], per_core_tracers[MAX_NUM_CORES];
 };
 
 /*
@@ -173,12 +173,12 @@ struct gxp_semaphores_descriptor {
 	 * bit map describing of all the semaphores in the list below that have
 	 * been unlocked but haven't been processed yet by the receiptient core.
 	 */
-	uint64_t woken_pending_semaphores[NUM_CORES];
+	uint64_t woken_pending_semaphores[MAX_NUM_CORES];
 	/*
 	 * A mapping of which doorbells to use as a wakeup signal source per
 	 * core.
 	 */
-	uint32_t wakeup_doorbells[NUM_CORES];
+	uint32_t wakeup_doorbells[MAX_NUM_CORES];
 	/* The number of items described in this region. */
 	uint32_t num_items;
 	/* The list of semaphores available for usage. */
@@ -260,7 +260,7 @@ struct gxp_cores_descriptor {
  */
 struct gxp_system_descriptor {
 	/* A device address for the application data descriptor. */
-	uint32_t app_descriptor_dev_addr[NUM_CORES];
+	uint32_t app_descriptor_dev_addr[MAX_NUM_CORES];
 	/* A device address for the watchdog descriptor. */
 	uint32_t watchdog_dev_addr;
 	/* A device address for the telemetry descriptor */

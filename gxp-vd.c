@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 
 #include "gxp-dma.h"
+#include "gxp-domain-pool.h"
 #include "gxp-firmware.h"
 #include "gxp-firmware-data.h"
 #include "gxp-host-device-structs.h"
@@ -57,7 +58,7 @@ struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 {
 	struct gxp_virtual_device *vd;
 	int i;
-	int err = 0;
+	int err;
 
 	/* Assumes 0 < requested_cores <= GXP_NUM_CORES */
 	if (requested_cores == 0 || requested_cores > GXP_NUM_CORES)
@@ -78,9 +79,11 @@ struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 		goto error_free_vd;
 	}
 	for (i = 0; i < requested_cores; i++) {
-		vd->core_domains[i] = iommu_domain_alloc(gxp->dev->bus);
-		if (!vd->core_domains[i])
+		vd->core_domains[i] = gxp_domain_pool_alloc(gxp->domain_pool);
+		if (!vd->core_domains[i]) {
+			err = -EBUSY;
 			goto error_free_domains;
+		}
 	}
 
 	vd->mailbox_resp_queues = kcalloc(
@@ -96,16 +99,19 @@ struct gxp_virtual_device *gxp_vd_allocate(struct gxp_dev *gxp,
 		init_waitqueue_head(&vd->mailbox_resp_queues[i].waitq);
 	}
 
+	vd->mappings_root = RB_ROOT;
+	init_rwsem(&vd->mappings_semaphore);
+
 	return vd;
 
 error_free_domains:
 	for (i -= 1; i >= 0; i--)
-		iommu_domain_free(vd->core_domains[i]);
+		gxp_domain_pool_free(gxp->domain_pool, vd->core_domains[i]);
 	kfree(vd->core_domains);
 error_free_vd:
 	kfree(vd);
 
-	return err ? ERR_PTR(err) : NULL;
+	return ERR_PTR(err);
 }
 
 void gxp_vd_release(struct gxp_virtual_device *vd)
@@ -113,6 +119,8 @@ void gxp_vd_release(struct gxp_virtual_device *vd)
 	struct gxp_async_response *cur, *nxt;
 	int i;
 	unsigned long flags;
+	struct rb_node *node;
+	struct gxp_mapping *mapping;
 
 	/* Cleanup any unconsumed responses */
 	for (i = 0; i < vd->num_cores; i++) {
@@ -130,8 +138,21 @@ void gxp_vd_release(struct gxp_virtual_device *vd)
 		spin_unlock_irqrestore(&vd->mailbox_resp_queues[i].lock, flags);
 	}
 
+	/*
+	 * Release any un-mapped mappings
+	 * Once again, it's not necessary to lock the mappings_semaphore here
+	 * but do it anyway for consistency.
+	 */
+	down_write(&vd->mappings_semaphore);
+	while ((node = rb_first(&vd->mappings_root))) {
+		mapping = rb_entry(node, struct gxp_mapping, node);
+		rb_erase(node, &vd->mappings_root);
+		gxp_mapping_put(mapping);
+	}
+	up_write(&vd->mappings_semaphore);
+
 	for (i = 0; i < vd->num_cores; i++)
-		iommu_domain_free(vd->core_domains[i]);
+		gxp_domain_pool_free(vd->gxp->domain_pool, vd->core_domains[i]);
 	kfree(vd->core_domains);
 	kfree(vd->mailbox_resp_queues);
 	kfree(vd);
@@ -294,7 +315,7 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 		}
 	}
 
-	if (vd->fw_app) {
+	if (!IS_ERR_OR_NULL(vd->fw_app)) {
 		gxp_fw_data_destroy_app(gxp, vd->fw_app);
 		vd->fw_app = NULL;
 	}
@@ -312,6 +333,7 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 	uint virt_core;
 
 	lockdep_assert_held_write(&gxp->vd_semaphore);
+	dev_info(gxp->dev, "Suspending VD ...\n");
 	if (vd->state == GXP_VD_SUSPENDED) {
 		dev_err(gxp->dev,
 			"Attempt to suspend a virtual device twice\n");
@@ -398,6 +420,7 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 	uint failed_cores = 0;
 
 	lockdep_assert_held_write(&gxp->vd_semaphore);
+	dev_info(gxp->dev, "Resuming VD ...\n");
 	if (vd->state != GXP_VD_SUSPENDED) {
 		dev_err(gxp->dev,
 			"Attempt to resume a virtual device which was not suspended\n");
@@ -419,7 +442,7 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 			 */
 			if (vd->blk_switch_count_when_suspended != curr_blk_switch_count) {
 				ret = gxp_firmware_setup_hw_after_block_off(
-					gxp, core, false);
+					gxp, core, /*verbose=*/false);
 				if (ret) {
 					vd->state = GXP_VD_UNAVAILABLE;
 					failed_cores |= BIT(core);
@@ -435,7 +458,8 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 			 * Power on the core by explicitly switching its PSM to
 			 * PS0 (LPM_ACTIVE_STATE).
 			 */
-			gxp_lpm_set_state(gxp, core, LPM_ACTIVE_STATE);
+			gxp_lpm_set_state(gxp, core, LPM_ACTIVE_STATE,
+					  /*verbose=*/false);
 			virt_core++;
 		}
 	}
@@ -559,4 +583,145 @@ int gxp_vd_phys_core_to_virt_core(struct gxp_virtual_device *vd,
 	}
 out:
 	return virt_core;
+}
+
+int gxp_vd_mapping_store(struct gxp_virtual_device *vd,
+			 struct gxp_mapping *map)
+{
+	struct rb_node **link;
+	struct rb_node *parent = NULL;
+	dma_addr_t device_address = map->device_address;
+	struct gxp_mapping *mapping;
+
+	link = &vd->mappings_root.rb_node;
+
+	down_write(&vd->mappings_semaphore);
+
+	/* Figure out where to put the new node */
+	while (*link) {
+		parent = *link;
+		mapping = rb_entry(parent, struct gxp_mapping, node);
+
+		if (mapping->device_address > device_address)
+			link = &(*link)->rb_left;
+		else if (mapping->device_address < device_address)
+			link = &(*link)->rb_right;
+		else
+			goto out;
+	}
+
+	/* Add new node and rebalance the tree. */
+	rb_link_node(&map->node, parent, link);
+	rb_insert_color(&map->node, &vd->mappings_root);
+
+	/* Acquire a reference to the mapping */
+	gxp_mapping_get(map);
+
+	up_write(&vd->mappings_semaphore);
+
+	return 0;
+
+out:
+	up_write(&vd->mappings_semaphore);
+	dev_err(vd->gxp->dev, "Duplicate mapping: %pad\n",
+		&map->device_address);
+	return -EEXIST;
+}
+
+void gxp_vd_mapping_remove(struct gxp_virtual_device *vd,
+			   struct gxp_mapping *map)
+{
+	down_write(&vd->mappings_semaphore);
+
+	/* Drop the mapping from this virtual device's records */
+	rb_erase(&map->node, &vd->mappings_root);
+
+	/* Release the reference obtained in gxp_vd_mapping_store() */
+	gxp_mapping_put(map);
+
+	up_write(&vd->mappings_semaphore);
+}
+
+static bool is_device_address_in_mapping(struct gxp_mapping *mapping,
+					 dma_addr_t device_address)
+{
+	return ((device_address >= mapping->device_address) &&
+		(device_address < (mapping->device_address + mapping->size)));
+}
+
+static struct gxp_mapping *
+gxp_vd_mapping_internal_search(struct gxp_virtual_device *vd,
+			       dma_addr_t device_address, bool check_range)
+{
+	struct rb_node *node;
+	struct gxp_mapping *mapping;
+
+	down_read(&vd->mappings_semaphore);
+
+	node = vd->mappings_root.rb_node;
+
+	while (node) {
+		mapping = rb_entry(node, struct gxp_mapping, node);
+		if ((mapping->device_address == device_address) ||
+		    (check_range &&
+		     is_device_address_in_mapping(mapping, device_address))) {
+			gxp_mapping_get(mapping);
+			up_read(&vd->mappings_semaphore);
+			return mapping; /* Found it */
+		} else if (mapping->device_address > device_address) {
+			node = node->rb_left;
+		} else {
+			node = node->rb_right;
+		}
+	}
+
+	up_read(&vd->mappings_semaphore);
+
+	return NULL;
+}
+
+struct gxp_mapping *gxp_vd_mapping_search(struct gxp_virtual_device *vd,
+					  dma_addr_t device_address)
+{
+	return gxp_vd_mapping_internal_search(vd, device_address, false);
+}
+
+struct gxp_mapping *
+gxp_vd_mapping_search_in_range(struct gxp_virtual_device *vd,
+			       dma_addr_t device_address)
+{
+	return gxp_vd_mapping_internal_search(vd, device_address, true);
+}
+
+struct gxp_mapping *gxp_vd_mapping_search_host(struct gxp_virtual_device *vd,
+					       u64 host_address)
+{
+	struct rb_node *node;
+	struct gxp_mapping *mapping;
+
+	/*
+	 * dma-buf mappings can not be looked-up by host address since they are
+	 * not mapped from a user-space address.
+	 */
+	if (!host_address) {
+		dev_dbg(vd->gxp->dev,
+			"Unable to get dma-buf mapping by host address\n");
+		return NULL;
+	}
+
+	down_read(&vd->mappings_semaphore);
+
+	/* Iterate through the elements in the rbtree */
+	for (node = rb_first(&vd->mappings_root); node; node = rb_next(node)) {
+		mapping = rb_entry(node, struct gxp_mapping, node);
+		if (mapping->host_address == host_address) {
+			gxp_mapping_get(mapping);
+			up_read(&vd->mappings_semaphore);
+			return mapping;
+		}
+	}
+
+	up_read(&vd->mappings_semaphore);
+
+	return NULL;
 }

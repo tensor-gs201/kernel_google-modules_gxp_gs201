@@ -9,7 +9,6 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/elf.h>
-#include <linux/firmware.h>
 #include <linux/gsa/gsa_image_auth.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -29,21 +28,54 @@
 #include "gxp-telemetry.h"
 #include "gxp-vd.h"
 
-/* TODO (b/176984045): Clean up gxp-firmware.c */
-
 /* Files need to be copied to /lib/firmware */
-#define Q7_ELF_FILE0	"gxp_fw_core0"
-#define Q7_ELF_FILE1	"gxp_fw_core1"
-#define Q7_ELF_FILE2	"gxp_fw_core2"
-#define Q7_ELF_FILE3	"gxp_fw_core3"
+#define DSP_FIRMWARE_DEFAULT_PREFIX	"gxp_fw_core"
 
 #define FW_HEADER_SIZE		(0x1000)
 #define FW_IMAGE_TYPE_OFFSET	(0x400)
 
-static const struct firmware *fw[GXP_NUM_CORES];
+static int
+request_dsp_firmware(struct gxp_dev *gxp, char *name_prefix,
+		     const struct firmware *out_firmwares[GXP_NUM_CORES])
+{
+	char *name_buf;
+	/* 1 for NULL-terminator and up to 4 for core number */
+	size_t name_len = strlen(name_prefix) + 5;
+	int core;
+	int ret = 0;
 
-static char *fw_elf[] = {Q7_ELF_FILE0, Q7_ELF_FILE1, Q7_ELF_FILE2,
-			 Q7_ELF_FILE3};
+	name_buf = kzalloc(name_len, GFP_KERNEL);
+	if (!name_buf)
+		return -ENOMEM;
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		ret = snprintf(name_buf, name_len, "%s%d", name_prefix, core);
+		if (ret <= 0 || ret >= name_len) {
+			ret = -EINVAL;
+			goto err;
+		}
+
+		dev_notice(gxp->dev, "Requesting dsp core %d firmware file: %s\n",
+			   core, name_buf);
+		ret = request_firmware(&out_firmwares[core], name_buf, NULL);
+		if (ret < 0) {
+			dev_err(gxp->dev,
+				"Requesting dsp core %d firmware failed (ret=%d)\n",
+				core, ret);
+			goto err;
+		}
+		dev_dbg(gxp->dev, "dsp core %d firmware file obtained\n", core);
+	}
+
+	kfree(name_buf);
+	return ret;
+
+err:
+	for (core -= 1; core >= 0; core--)
+		release_firmware(out_firmwares[core]);
+	kfree(name_buf);
+	return ret;
+}
 
 static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
 			     size_t size,
@@ -240,44 +272,9 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 	void __iomem *core_scratchpad_base;
 	int ret;
 
-	dev_notice(gxp->dev, "Loading Q7 ELF file %s\n", fw_elf[core]);
-	ret = request_firmware(&fw[core], fw_elf[core], NULL);
-	if (ret < 0) {
-		dev_err(gxp->dev, "Loading ELF failed (ret=%d)\n", ret);
-		return ret;
-	}
-	dev_notice(gxp->dev, "Q7 ELF file loaded\n");
-
-	/*
-	 * Currently, the Q7 FW needs to be statically linked to a base
-	 * address where it would be loaded in memory. This requires the
-	 * address (where the FW is to be loaded in DRAM) to be
-	 * pre-defined, and hence not allocate-able dynamically (using
-	 * the kernel's memory management system). Therefore, we are
-	 * memremapping a static address and loading the FW there, while
-	 * also having compiled the FW with this as the base address
-	 * (used by the linker).
-	 *
-	 * FIXME: This should be fixed by compiling the FW in a
-	 * re-locateable way so that it is independent of the load
-	 * address, and then using the standard kernel APIs
-	 * (kmalloc/dma_alloc_coherrent) to allocate memory and load the
-	 * FW.
-	 */
-	/*
-	 * TODO (b/193069216) allocate a dynamic buffer and let
-	 * `gxp_dma_map_resources()` map it to the expected paddr
-	 */
-	gxp->fwbufs[core].vaddr = memremap(gxp->fwbufs[core].paddr,
-					   gxp->fwbufs[core].size, MEMREMAP_WC);
-	if (!(gxp->fwbufs[core].vaddr)) {
-		dev_err(gxp->dev, "FW buf memremap failed\n");
-		ret = -EINVAL;
-		goto out_firmware_unload;
-	}
-
 	/* Authenticate and load firmware to System RAM */
-	ret = gxp_firmware_load_authenticated(gxp, fw[core], &gxp->fwbufs[core]);
+	ret = gxp_firmware_load_authenticated(gxp, gxp->firmwares[core],
+					      &gxp->fwbufs[core]);
 	if (ret) {
 		dev_err(gxp->dev, "Unable to load elf file\n");
 		goto out_firmware_unload;
@@ -319,7 +316,9 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	/* Raise wakeup doorbell */
 	dev_notice(gxp->dev, "Raising doorbell %d interrupt\n",
 		   CORE_WAKEUP_DOORBELL);
+#ifndef CONFIG_GXP_GEM5
 	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
+#endif
 	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL);
 
 	/* Wait for core to come up */
@@ -376,7 +375,6 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	 * affect the order of reading/writing INT_MASK0, so ignore this
 	 * handshaking in Gem5.
 	 */
-	/* TODO (b/182528386): Fix handshake for verifying TOP access */
 	ctr = 1000;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_TOP_ACCESS_OK);
 	expected_top_value = BIT(0);
@@ -404,16 +402,108 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 
 static void gxp_firmware_unload(struct gxp_dev *gxp, uint core)
 {
-	if (gxp->fwbufs[core].vaddr) {
-		memunmap(gxp->fwbufs[core].vaddr);
-		gxp->fwbufs[core].vaddr = NULL;
+	/* NO-OP for now. */
+}
+
+/* Helper function to parse name written to sysfs "load_dsp_firmware" node */
+static char *fw_name_from_attr_buf(const char *buf)
+{
+	size_t len;
+	char *name;
+
+	len = strlen(buf);
+	if (len == 0 || buf[len - 1] != '\n')
+		return ERR_PTR(-EINVAL);
+
+	name = kstrdup(buf, GFP_KERNEL);
+	if (!name)
+		return ERR_PTR(-ENOMEM);
+
+	name[len - 1] = '\0';
+	return name;
+}
+
+/* sysfs node for loading custom firmware */
+
+static ssize_t load_dsp_firmware_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct gxp_dev *gxp = dev_get_drvdata(dev);
+	ssize_t ret;
+
+	mutex_lock(&gxp->dsp_firmware_lock);
+
+	ret = scnprintf(buf, PAGE_SIZE, "%s\n",
+			gxp->firmware_name ? gxp->firmware_name :
+					     DSP_FIRMWARE_DEFAULT_PREFIX);
+
+	mutex_unlock(&gxp->dsp_firmware_lock);
+
+	return ret;
+}
+
+static ssize_t load_dsp_firmware_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct gxp_dev *gxp = dev_get_drvdata(dev);
+	const struct firmware *firmwares[GXP_NUM_CORES];
+	char *name_buf = NULL;
+	int ret;
+	int core;
+
+	name_buf = fw_name_from_attr_buf(buf);
+	if (IS_ERR(name_buf)) {
+		dev_err(gxp->dev, "Invalid firmware prefix requested: %s\n",
+			buf);
+		return PTR_ERR(name_buf);
 	}
 
-	if (fw[core]) {
-		release_firmware(fw[core]);
-		fw[core] = NULL;
+	mutex_lock(&gxp->dsp_firmware_lock);
+
+	dev_notice(gxp->dev, "Requesting firmware be reloaded: %s\n", name_buf);
+
+	ret = request_dsp_firmware(gxp, name_buf, firmwares);
+	if (ret) {
+		mutex_unlock(&gxp->dsp_firmware_lock);
+		dev_err(gxp->dev,
+			"Failed to request firmwares with names \"%sX\" (ret=%d)\n",
+			name_buf, ret);
+		kfree(name_buf);
+		return ret;
 	}
+
+	/*
+	 * Lock the VD semaphore to make sure no new firmware is started while
+	 * changing out the images in `gxp->firmwares`
+	 */
+	down_read(&gxp->vd_semaphore);
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->firmwares[core])
+			release_firmware(gxp->firmwares[core]);
+		gxp->firmwares[core] = firmwares[core];
+	}
+
+	kfree(gxp->firmware_name);
+	gxp->firmware_name = name_buf;
+
+	up_read(&gxp->vd_semaphore);
+	mutex_unlock(&gxp->dsp_firmware_lock);
+
+	return count;
 }
+
+static DEVICE_ATTR_RW(load_dsp_firmware);
+
+static struct attribute *dev_attrs[] = {
+	&dev_attr_load_dsp_firmware.attr,
+	NULL,
+};
+
+static const struct attribute_group gxp_firmware_attr_group = {
+	.attrs = dev_attrs,
+};
 
 int gxp_fw_init(struct gxp_dev *gxp)
 {
@@ -468,18 +558,76 @@ int gxp_fw_init(struct gxp_dev *gxp)
 	 * initialized.
 	 */
 
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		/*
+		 * Currently, the Q7 FW needs to be statically linked to a base
+		 * address where it would be loaded in memory. This requires the
+		 * address (where the FW is to be loaded in DRAM) to be
+		 * pre-defined, and hence not allocate-able dynamically (using
+		 * the kernel's memory management system). Therefore, we are
+		 * memremapping a static address and loading the FW there, while
+		 * also having compiled the FW with this as the base address
+		 * (used by the linker).
+		 */
+		gxp->fwbufs[core].vaddr =
+			memremap(gxp->fwbufs[core].paddr,
+				 gxp->fwbufs[core].size, MEMREMAP_WC);
+		if (!(gxp->fwbufs[core].vaddr)) {
+			dev_err(gxp->dev, "FW buf %d memremap failed\n", core);
+			ret = -EINVAL;
+			goto out_fw_destroy;
+		}
+	}
+
+	ret = device_add_group(gxp->dev, &gxp_firmware_attr_group);
+	if (ret)
+		goto out_fw_destroy;
+
 	gxp->firmware_running = 0;
 	return 0;
+
+out_fw_destroy:
+	gxp_fw_destroy(gxp);
+	return ret;
 }
 
 void gxp_fw_destroy(struct gxp_dev *gxp)
 {
-	/* NO-OP for now. */
-	/*
-	 * TODO(b/214124218): Revisit if the firmware subsystem still needs a
-	 * "destroy" method now that power management is decoupled from the
-	 * firmware subsystem's lifecycle.
-	 */
+	uint core;
+
+	device_remove_group(gxp->dev, &gxp_firmware_attr_group);
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (gxp->fwbufs[core].vaddr) {
+			memunmap(gxp->fwbufs[core].vaddr);
+			gxp->fwbufs[core].vaddr = NULL;
+		}
+
+		if (gxp->firmwares[core]) {
+			release_firmware(gxp->firmwares[core]);
+			gxp->firmwares[core] = NULL;
+		}
+	}
+
+	kfree(gxp->firmware_name);
+}
+
+int gxp_firmware_request_if_needed(struct gxp_dev *gxp)
+{
+	int ret = 0;
+
+	mutex_lock(&gxp->dsp_firmware_lock);
+
+	if (!gxp->is_firmware_requested) {
+		ret = request_dsp_firmware(gxp, DSP_FIRMWARE_DEFAULT_PREFIX,
+					   gxp->firmwares);
+		if (!ret)
+			gxp->is_firmware_requested = true;
+	}
+
+	mutex_unlock(&gxp->dsp_firmware_lock);
+
+	return ret;
 }
 
 int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
@@ -504,7 +652,14 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 	gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
 			  GXP_BOOT_MODE_REQUEST_COLD_BOOT);
 
+#ifdef CONFIG_GXP_GEM5
+	/*
+	 * GEM5 starts firmware after LPM is programmed, so we need to call
+	 * gxp_doorbell_set_listening_core here to set GXP_REG_COMMON_INT_MASK_0
+	 * first to enable the firmware hadnshaking.
+	 */
 	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
+#endif
 	ret = gxp_firmware_setup_hw_after_block_off(gxp, core,
 						    /*verbose=*/true);
 	if (ret) {

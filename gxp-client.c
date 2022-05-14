@@ -63,11 +63,10 @@ void gxp_client_destroy(struct gxp_client *client)
 
 	if (client->has_block_wakelock) {
 		gxp_wakelock_release(client->gxp);
-		gxp_pm_update_requested_power_state(
+		gxp_pm_update_requested_power_states(
 			gxp, client->requested_power_state,
-			client->requested_aggressor, AUR_OFF, true);
-		gxp_pm_update_requested_memory_power_state(
-			gxp, client->requested_memory_power_state,
+			client->requested_aggressor, AUR_OFF, true,
+			client->requested_memory_power_state,
 			AUR_MEM_UNDEFINED);
 	}
 

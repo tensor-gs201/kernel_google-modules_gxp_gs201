@@ -5,6 +5,7 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#include <linux/acpm_dvfs.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/gfp.h>
@@ -16,10 +17,6 @@
 #include <linux/slab.h>
 #include <linux/thermal.h>
 #include <linux/version.h>
-
-#ifdef CONFIG_GXP_CLOUDRIPPER
-#include <linux/acpm_dvfs.h>
-#endif
 
 #include "gxp-internal.h"
 #include "gxp-pm.h"
@@ -91,6 +88,7 @@ static int gxp_set_cur_state(struct thermal_cooling_device *cdev,
 			goto out;
 		}
 		thermal->cooling_state = cooling_state;
+		gxp_pm_set_thermal_limit(thermal->gxp, pwr_state);
 	} else {
 		ret = -EALREADY;
 	}
@@ -136,17 +134,13 @@ static int gxp_state2power_internal(unsigned long state, u32 *power,
 }
 
 static int gxp_get_requested_power(struct thermal_cooling_device *cdev,
-				       u32 *power)
+				   u32 *power)
 {
-	/* Use ACTIVE_NOM as default value */
-	unsigned long power_state = AUR_NOM;
+	unsigned long power_state;
 	struct gxp_thermal_manager *cooling = cdev->devdata;
-#ifdef CONFIG_GXP_CLOUDRIPPER
 
 	power_state = exynos_acpm_get_rate(AUR_DVFS_DOMAIN, 0);
-#endif
-	return gxp_state2power_internal(power_state, power,
-					    cooling);
+	return gxp_state2power_internal(power_state, power, cooling);
 }
 
 /* TODO(b/213272324): Move state2power table to dts */

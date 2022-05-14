@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * GXP CSR definitions.
+ * Amalthea CSR definitions.
  *
- * Copyright (C) 2021 Google LLC
+ * Copyright (C) 2021-2022 Google LLC
  */
-#ifndef __GXP_CSRS_H__
-#define __GXP_CSRS_H__
+
+#ifndef __AMALTHEA_CSRS_H__
+#define __AMALTHEA_CSRS_H__
 
 #define GXP_REG_DOORBELLS_SET_WRITEMASK 0x1
 #define GXP_REG_DOORBELLS_CLEAR_WRITEMASK 0x1
@@ -119,4 +120,4 @@ enum gxp_core_csrs {
 #define PSM_GPOUT_HI_RD_OFFSET		0x6B4
 #define PSM_DEBUG_STATUS_OFFSET		0x6B8
 
-#endif /* __GXP_CSRS_H__ */
+#endif /* __AMALTHEA_CSRS_H__ */

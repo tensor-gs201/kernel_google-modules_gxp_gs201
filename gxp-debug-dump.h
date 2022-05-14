@@ -20,6 +20,7 @@
 #define GXP_NUM_COMMON_SEGMENTS 2
 #define GXP_NUM_CORE_SEGMENTS 8
 #define GXP_CORE_DRAM_SEGMENT_IDX 7
+#define GXP_NUM_BUFFER_MAPPINGS 32
 #define GXP_DEBUG_DUMP_CORE_SEGMENT_IDX_START (GXP_NUM_COMMON_SEGMENTS + 1)
 #define GXP_DEBUG_DUMP_DRAM_SEGMENT_IDX                                        \
 	(GXP_DEBUG_DUMP_CORE_SEGMENT_IDX_START + GXP_CORE_DRAM_SEGMENT_IDX)
@@ -44,6 +45,17 @@
 #define GXP_DEBUG_DUMP_INT 0x1
 #define GXP_DEBUG_DUMP_INT_MASK BIT(GXP_DEBUG_DUMP_INT)
 #define GXP_DEBUG_DUMP_RETRY_NUM 5
+
+/*
+ * For debug dump, the kernel driver header file version must be the same as
+ * the firmware header file version. In other words,
+ * GXP_DEBUG_DUMP_HEADER_VERSION must be the same value as the value of
+ * kGxpDebugDumpHeaderVersion in firmware.
+ * Note: This needs to be updated when there are updates to gxp_core_dump and
+ * gxp_core_dump_header (or anything within the struct that may cause a mismatch
+ * with the firmware version of the debug dump header file).
+ */
+#define GXP_DEBUG_DUMP_HEADER_VERSION 0
 
 struct gxp_timer_registers {
 	u32 comparator;
@@ -110,13 +122,19 @@ struct gxp_lpm_registers {
 	struct gxp_lpm_psm_registers psm_regs[PSM_COUNT];
 };
 
+struct gxp_user_buffer {
+	u64 device_addr; /* Device address of user buffer */
+	u32 size; /* Size of user buffer */
+};
+
 struct gxp_core_header {
 	u32 core_id; /* Aurora core ID */
 	u32 dump_available; /* Dump data is available for core*/
 	u32 dump_req_reason; /* Code indicating reason for debug dump request */
-	u32 crash_reason; /* Error code identifying crash reason */
+	u32 header_version; /* Header file version */
 	u32 fw_version; /* Firmware version */
 	u32 core_dump_size; /* Size of core dump */
+	struct gxp_user_buffer user_bufs[GXP_NUM_BUFFER_MAPPINGS];
 };
 
 struct gxp_seg_header {
@@ -163,12 +181,6 @@ struct gxp_debug_dump_manager {
 	void *sscd_dev;
 	void *sscd_pdata;
 	dma_addr_t debug_dump_dma_handle; /* dma handle for debug dump */
-	/* Lock protects kernel_init_dump_pending and kernel_init_dump_waitq */
-	struct mutex lock;
-	/* Keep track of which cores have kernel-initiated core dump ready */
-	int kernel_init_dump_pending;
-	wait_queue_head_t kernel_init_dump_waitq;
-	struct work_struct wait_kernel_init_dump_work;
 	/*
 	 * Debug dump lock to ensure only one debug dump is being processed at a
 	 * time

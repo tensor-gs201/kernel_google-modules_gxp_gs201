@@ -5,14 +5,11 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#include <linux/acpm_dvfs.h>
 #include <linux/bitops.h>
 #include <linux/io.h>
-#include <linux/types.h>
 #include <linux/pm_runtime.h>
-
-#ifdef CONFIG_GXP_CLOUDRIPPER
-#include <linux/acpm_dvfs.h>
-#endif
+#include <linux/types.h>
 
 #include "gxp-bpm.h"
 #include "gxp-doorbell.h"
@@ -111,16 +108,19 @@ static int set_state_internal(struct gxp_dev *gxp, uint psm, uint target_state)
 	return 0;
 }
 
-int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state)
+int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state,
+		      bool verbose)
 {
 	uint curr_state = gxp_lpm_get_state(gxp, psm);
 
 	if (curr_state == target_state)
 		return 0;
 
-	dev_warn(gxp->dev, "Forcing a transition to PS%u on core%u, status: %x\n",
-		 target_state, psm,
-		 lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET));
+	if (verbose)
+		dev_warn(gxp->dev,
+			 "Forcing a transition to PS%u on core%u, status: %x\n",
+			 target_state, psm,
+			 lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET));
 
 	gxp_lpm_enable_state(gxp, psm, target_state);
 
@@ -132,9 +132,12 @@ int gxp_lpm_set_state(struct gxp_dev *gxp, uint psm, uint target_state)
 
 	set_state_internal(gxp, psm, target_state);
 
-	dev_warn(gxp->dev, "Finished forced transition on core %u.  target: PS%u, actual: PS%u, status: %x\n",
-		 psm, target_state, gxp_lpm_get_state(gxp, psm),
-		 lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET));
+	if (verbose)
+		dev_warn(
+			gxp->dev,
+			"Finished forced transition on core %u.  target: PS%u, actual: PS%u, status: %x\n",
+			psm, target_state, gxp_lpm_get_state(gxp, psm),
+			lpm_read_32_psm(gxp, psm, PSM_STATUS_OFFSET));
 
 	/* Set HW sequencing mode */
 	lpm_write_32_psm(gxp, psm, PSM_CFG_OFFSET, LPM_HW_MODE);
@@ -150,7 +153,8 @@ static int psm_enable(struct gxp_dev *gxp, uint psm)
 	if (gxp_lpm_is_initialized(gxp, psm)) {
 		if (psm != LPM_TOP_PSM) {
 			/* Ensure core is in PS3 */
-			return gxp_lpm_set_state(gxp, psm, LPM_PG_STATE);
+			return gxp_lpm_set_state(gxp, psm, LPM_PG_STATE,
+						 /*verbose=*/true);
 		}
 
 		return 0;
@@ -178,12 +182,8 @@ static int psm_enable(struct gxp_dev *gxp, uint psm)
 void gxp_lpm_init(struct gxp_dev *gxp)
 {
 	/* Enable Top PSM */
-	dev_notice(gxp->dev, "Enabling Top PSM...\n");
-	if (psm_enable(gxp, LPM_TOP_PSM)) {
-		dev_notice(gxp->dev, "Timed out!\n");
-		return;
-	}
-	dev_notice(gxp->dev, "Enabled\n");
+	if (psm_enable(gxp, LPM_TOP_PSM))
+		dev_err(gxp->dev, "Timed out when enabling Top PSM!\n");
 }
 
 void gxp_lpm_destroy(struct gxp_dev *gxp)
@@ -202,12 +202,11 @@ int gxp_lpm_up(struct gxp_dev *gxp, uint core)
 	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL);
 
 	/* Enable core PSM */
-	dev_notice(gxp->dev, "Enabling Core%u PSM...\n", core);
 	if (psm_enable(gxp, core)) {
-		dev_notice(gxp->dev, "Timed out!\n");
+		dev_err(gxp->dev, "Timed out when enabling Core%u PSM!\n",
+			core);
 		return -ETIMEDOUT;
 	}
-	dev_notice(gxp->dev, "Enabled\n");
 
 	/* Enable PS1 (Clk Gated) */
 	gxp_lpm_enable_state(gxp, core, LPM_CG_STATE);
@@ -237,7 +236,7 @@ void gxp_lpm_down(struct gxp_dev *gxp, uint core)
 	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL);
 
 	/* Ensure core is in PS3 */
-	gxp_lpm_set_state(gxp, core, LPM_PG_STATE);
+	gxp_lpm_set_state(gxp, core, LPM_PG_STATE, /*verbose=*/true);
 }
 
 bool gxp_lpm_wait_state_ne(struct gxp_dev *gxp, uint psm, uint state)

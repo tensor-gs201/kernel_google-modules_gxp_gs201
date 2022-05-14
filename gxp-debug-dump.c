@@ -21,9 +21,9 @@
 #include "gxp-doorbell.h"
 #include "gxp-internal.h"
 #include "gxp-lpm.h"
+#include "gxp-mapping.h"
+#include "gxp-vd.h"
 
-#define GXP_COREDUMP_PENDING 0xF
-#define KERNEL_INIT_DUMP_TIMEOUT (10000 * GXP_TIME_DELAY_FACTOR)
 #define SSCD_MSG_LENGTH 64
 
 #define SYNC_BARRIER_BLOCK	0x00100000
@@ -336,9 +336,13 @@ static void gxp_handle_debug_dump(struct gxp_dev *gxp, uint32_t core_id)
 
 	for (i = 0; i < GXP_NUM_CORE_SEGMENTS - 1; i++) {
 		mgr->segs[core_id][seg_idx].addr = data_addr;
-		mgr->segs[core_id][seg_idx].size =
-			core_dump_header->seg_header[i].size;
-		data_addr += mgr->segs[core_id][seg_idx].size;
+		mgr->segs[core_id][seg_idx].size = 0;
+		if (core_dump_header->seg_header[i].valid) {
+			mgr->segs[core_id][seg_idx].size =
+				core_dump_header->seg_header[i].size;
+		}
+
+		data_addr += core_dump_header->seg_header[i].size;
 		seg_idx++;
 	}
 
@@ -368,21 +372,39 @@ static void gxp_free_segments(struct gxp_dev *gxp)
 	kfree(gxp->debug_dump_mgr->common_dump);
 }
 
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
+static int gxp_get_mapping_count(struct gxp_dev *gxp, int core_id)
+{
+	struct gxp_core_dump *core_dump = gxp->debug_dump_mgr->core_dump;
+	struct gxp_core_header *core_header =
+		&core_dump->core_dump_header[core_id].core_header;
+	int i, count = 0;
+
+	for (i = 0; i < GXP_NUM_BUFFER_MAPPINGS; i++) {
+		if (core_header->user_bufs[i].size != 0)
+			count++;
+	}
+
+	return count;
+}
+#endif
+
 static int gxp_init_segments(struct gxp_dev *gxp)
 {
 #if !IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	return 0;
 #else
 	struct gxp_debug_dump_manager *mgr = gxp->debug_dump_mgr;
-	int segs_num = GXP_NUM_COMMON_SEGMENTS;
-	int core_id = 0;
-
 	/*
 	 * segs_num include the common segments, core segments for each core,
 	 * core header for each core
 	 */
-	segs_num += GXP_NUM_CORE_SEGMENTS + 1;
+	int segs_min_num = GXP_NUM_COMMON_SEGMENTS + GXP_NUM_CORE_SEGMENTS + 1;
+	int segs_num;
+	int core_id = 0;
+
 	for (core_id = 0; core_id < GXP_NUM_CORES; core_id++) {
+		segs_num = segs_min_num + gxp_get_mapping_count(gxp, core_id);
 		mgr->segs[core_id] = kmalloc_array(segs_num,
 						   sizeof(struct sscd_segment),
 						   GFP_KERNEL);
@@ -402,6 +424,130 @@ err_out:
 #endif
 }
 
+/*
+ * `user_bufs` is an input buffer containing up to GXP_NUM_BUFFER_MAPPINGS
+ * virtual addresses
+ */
+#if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
+static void gxp_add_user_buffer_to_segments(struct gxp_dev *gxp,
+					    struct gxp_core_header *core_header,
+					    int core_id, int seg_idx,
+					    void *user_bufs[])
+{
+	struct gxp_debug_dump_manager *mgr = gxp->debug_dump_mgr;
+	struct gxp_user_buffer user_buf;
+	int i;
+
+	for (i = 0; i < GXP_NUM_BUFFER_MAPPINGS ; i++) {
+		user_buf = core_header->user_bufs[i];
+		if (user_buf.size == 0)
+			continue;
+		mgr->segs[core_id][seg_idx].addr = user_bufs[i];
+		mgr->segs[core_id][seg_idx].size = user_buf.size;
+		seg_idx++;
+	}
+}
+
+static void gxp_user_buffers_vunmap(struct gxp_dev *gxp,
+				    struct gxp_core_header *core_header)
+{
+	struct gxp_virtual_device *vd;
+	struct gxp_user_buffer user_buf;
+	int i;
+	struct gxp_mapping *mapping;
+
+	down_read(&gxp->vd_semaphore);
+
+	vd = gxp->core_to_vd[core_header->core_id];
+	if (!vd) {
+		dev_err(gxp->dev, "Virtual device is not available for vunmap\n");
+		goto out;
+	}
+
+	for (i = 0; i < GXP_NUM_BUFFER_MAPPINGS; i++) {
+		user_buf = core_header->user_bufs[i];
+		if (user_buf.size == 0)
+			continue;
+
+		mapping = gxp_vd_mapping_search_in_range(
+			vd, (dma_addr_t)user_buf.device_addr);
+		if (!mapping) {
+			dev_err(gxp->dev,
+				"No mapping found for user buffer at device address %#llX\n",
+				user_buf.device_addr);
+			continue;
+		}
+
+		gxp_mapping_vunmap(mapping);
+		gxp_mapping_put(mapping);
+	}
+
+out:
+	up_read(&gxp->vd_semaphore);
+}
+
+static int gxp_user_buffers_vmap(struct gxp_dev *gxp,
+				 struct gxp_core_header *core_header,
+				 void *user_buf_vaddrs[])
+{
+	struct gxp_virtual_device *vd;
+	struct gxp_user_buffer user_buf;
+	int i, cnt = 0;
+	dma_addr_t daddr;
+	struct gxp_mapping *mapping;
+	void *vaddr;
+
+	down_read(&gxp->vd_semaphore);
+
+	vd = gxp->core_to_vd[core_header->core_id];
+	if (!vd) {
+		dev_err(gxp->dev, "Virtual device is not available for vmap\n");
+		goto out;
+	}
+
+	for (i = 0; i < GXP_NUM_BUFFER_MAPPINGS; i++) {
+		user_buf = core_header->user_bufs[i];
+		if (user_buf.size == 0)
+			continue;
+
+		/* Get mapping */
+		daddr = (dma_addr_t)user_buf.device_addr;
+		mapping = gxp_vd_mapping_search_in_range(vd, daddr);
+		if (!mapping) {
+			user_buf.size = 0;
+			continue;
+		}
+
+		/* Map the mapping into kernel space */
+		vaddr = gxp_mapping_vmap(mapping);
+
+		/*
+		 * Release the reference from searching for the mapping.
+		 * Either vmapping was successful and obtained a new reference
+		 * or vmapping failed, and the gxp_mapping is no longer needed.
+		 */
+		gxp_mapping_put(mapping);
+
+		if (IS_ERR(vaddr)) {
+			up_read(&gxp->vd_semaphore);
+			gxp_user_buffers_vunmap(gxp, core_header);
+			return 0;
+		}
+
+		/* Get kernel address of the user buffer inside the mapping */
+		user_buf_vaddrs[i] =
+			vaddr + daddr -
+			(mapping->device_address & ~(PAGE_SIZE - 1));
+		cnt++;
+	}
+
+out:
+	up_read(&gxp->vd_semaphore);
+
+	return cnt;
+}
+#endif
+
 static void gxp_handle_dram_dump(struct gxp_dev *gxp, uint32_t core_id)
 {
 	struct gxp_debug_dump_manager *mgr = gxp->debug_dump_mgr;
@@ -410,17 +556,29 @@ static void gxp_handle_dram_dump(struct gxp_dev *gxp, uint32_t core_id)
 	struct gxp_seg_header *dram_seg_header =
 		&core_dump_header->seg_header[GXP_CORE_DRAM_SEGMENT_IDX];
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
+	struct gxp_core_header *core_header = &core_dump_header->core_header;
 	struct sscd_segment *sscd_seg =
 		&mgr->segs[core_id][GXP_DEBUG_DUMP_DRAM_SEGMENT_IDX];
 	char sscd_msg[SSCD_MSG_LENGTH];
+	void *user_buf_vaddrs[GXP_NUM_BUFFER_MAPPINGS];
+	int user_buf_cnt;
 
 	sscd_seg->addr = gxp->fwbufs[core_id].vaddr;
 	sscd_seg->size = gxp->fwbufs[core_id].size;
 
+	user_buf_cnt = gxp_user_buffers_vmap(gxp, core_header, user_buf_vaddrs);
+	if (user_buf_cnt > 0) {
+		gxp_add_user_buffer_to_segments(
+			gxp, core_header, core_id,
+			GXP_DEBUG_DUMP_DRAM_SEGMENT_IDX + 1, user_buf_vaddrs);
+	}
+
 	dev_dbg(gxp->dev, "Passing dram data to SSCD daemon\n");
 	snprintf(sscd_msg, SSCD_MSG_LENGTH - 1,
 		 "gxp debug dump - dram data (core %0x)", core_id);
-	gxp_send_to_sscd(gxp, sscd_seg, 1, sscd_msg);
+	gxp_send_to_sscd(gxp, sscd_seg, user_buf_cnt + 1, sscd_msg);
+
+	gxp_user_buffers_vunmap(gxp, core_header);
 #endif
 	dram_seg_header->valid = 1;
 }
@@ -464,30 +622,6 @@ static int gxp_generate_coredump(struct gxp_dev *gxp, uint32_t core_id)
 	return 0;
 }
 
-static void gxp_wait_kernel_init_dump_work(struct work_struct *work)
-{
-	struct gxp_debug_dump_manager *mgr =
-		container_of(work, struct gxp_debug_dump_manager,
-			     wait_kernel_init_dump_work);
-	u32 core_bits;
-	int i;
-
-	wait_event_timeout(mgr->kernel_init_dump_waitq,
-			   mgr->kernel_init_dump_pending ==
-			   GXP_COREDUMP_PENDING,
-			   msecs_to_jiffies(KERNEL_INIT_DUMP_TIMEOUT));
-
-	mutex_lock(&mgr->lock);
-	core_bits = mgr->kernel_init_dump_pending;
-	for (i = 0; i < GXP_NUM_CORES; i++) {
-		if (!(core_bits & BIT(i)))
-			continue;
-		gxp_generate_coredump(mgr->gxp, i);
-	}
-	mgr->kernel_init_dump_pending = 0;
-	mutex_unlock(&mgr->lock);
-}
-
 void gxp_debug_dump_process_dump(struct work_struct *work)
 {
 	struct gxp_debug_dump_work *debug_dump_work =
@@ -495,43 +629,8 @@ void gxp_debug_dump_process_dump(struct work_struct *work)
 
 	uint core_id = debug_dump_work->core_id;
 	struct gxp_dev *gxp = debug_dump_work->gxp;
-	struct gxp_debug_dump_manager *mgr;
-	struct gxp_core_dump *core_dump;
-	struct gxp_core_dump_header *core_dump_header;
-	struct gxp_core_header *core_header;
-	int *kernel_init_dump_pending;
 
-	mgr = gxp->debug_dump_mgr;
-	if (!mgr) {
-		dev_err(gxp->dev,
-			"gxp->debug_dump_mgr has not been initialized\n");
-		return;
-	}
-
-	core_dump = mgr->core_dump;
-	if (!core_dump) {
-		dev_err(gxp->dev,
-			"mgr->core_dump has not been initialized\n");
-		return;
-	}
-
-	core_dump_header = &core_dump->core_dump_header[core_id];
-	core_header = &core_dump_header->core_header;
-	kernel_init_dump_pending = &mgr->kernel_init_dump_pending;
-
-	switch (core_header->dump_req_reason) {
-	case DEBUG_DUMP_FW_INIT:
-		gxp_generate_coredump(gxp, core_id);
-		break;
-	case DEBUG_DUMP_KERNEL_INIT:
-		mutex_lock(&mgr->lock);
-		if (*kernel_init_dump_pending == 0)
-			schedule_work(&mgr->wait_kernel_init_dump_work);
-		*kernel_init_dump_pending |= BIT(core_id);
-		wake_up(&mgr->kernel_init_dump_waitq);
-		mutex_unlock(&mgr->lock);
-		break;
-	}
+	gxp_generate_coredump(gxp, core_id);
 }
 
 struct work_struct *gxp_debug_dump_get_notification_handler(struct gxp_dev *gxp,
@@ -587,7 +686,8 @@ int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata)
 		core_dump_header->core_header.dump_available = 0;
 		for (i = 0; i < GXP_NUM_CORE_SEGMENTS; i++)
 			core_dump_header->seg_header[i].valid = 0;
-
+		for (i = 0; i < GXP_NUM_BUFFER_MAPPINGS; i++)
+			core_dump_header->core_header.user_bufs[i].size = 0;
 		mgr->debug_dump_works[core].gxp = gxp;
 		mgr->debug_dump_works[core].core_id = core;
 		INIT_WORK(&mgr->debug_dump_works[core].work,
@@ -598,16 +698,9 @@ int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata)
 
 	/* No need for a DMA handle since the carveout is coherent */
 	mgr->debug_dump_dma_handle = 0;
-	mgr->kernel_init_dump_pending = 0;
 	mgr->sscd_dev = sscd_dev;
 	mgr->sscd_pdata = sscd_pdata;
-	mutex_init(&mgr->lock);
 	mutex_init(&mgr->debug_dump_lock);
-
-	INIT_WORK(&mgr->wait_kernel_init_dump_work,
-		  gxp_wait_kernel_init_dump_work);
-
-	init_waitqueue_head(&mgr->kernel_init_dump_waitq);
 
 	return 0;
 }
@@ -621,12 +714,10 @@ void gxp_debug_dump_exit(struct gxp_dev *gxp)
 		return;
 	}
 
-	cancel_work_sync(&mgr->wait_kernel_init_dump_work);
 	gxp_free_segments(gxp);
 	/* TODO (b/200169232) Remove this once we're using devm_memremap */
 	memunmap(gxp->coredumpbuf.vaddr);
 
-	mutex_destroy(&mgr->lock);
 	mutex_destroy(&mgr->debug_dump_lock);
 	devm_kfree(mgr->gxp->dev, mgr);
 	gxp->debug_dump_mgr = NULL;

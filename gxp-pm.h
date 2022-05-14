@@ -7,9 +7,9 @@
 #ifndef __GXP_PM_H__
 #define __GXP_PM_H__
 
-#include "gxp-internal.h"
-#include <linux/refcount.h>
 #include <soc/google/exynos_pm_qos.h>
+
+#include "gxp-internal.h"
 
 #define AUR_DVFS_MIN_RATE 178000
 static const uint aur_power_state2rate[] = { 0,	     178000,  373000,
@@ -94,7 +94,6 @@ struct gxp_power_manager {
 	bool curr_aggressor_vote;
 	int curr_state;
 	int curr_memory_state;
-	refcount_t blk_wake_ref;
 	struct gxp_pm_device_ops *ops;
 	struct gxp_set_acpm_state_work
 		set_acpm_state_work[AUR_NUM_POWER_STATE_WORKER];
@@ -108,6 +107,8 @@ struct gxp_power_manager {
 	struct exynos_pm_qos_request int_min;
 	struct exynos_pm_qos_request mif_min;
 	int force_noc_mux_normal_count;
+	/* Max frequency that the thermal driver/ACPM will allow in Hz */
+	unsigned long thermal_limit;
 	u64 blk_switch_count;
 };
 
@@ -173,34 +174,6 @@ int gxp_pm_core_on(struct gxp_dev *gxp, uint core, bool verbose);
 int gxp_pm_core_off(struct gxp_dev *gxp, uint core);
 
 /**
- * gxp_pm_acquire_blk_wakelock() - Acquire blk wakelock to make sure block won't
- * shutdown.
- *
- * Can be called multiple times and it will increase
- * reference count.
- *
- * @gxp: The GXP device to operate
- *
- * Return:
- * * 0       - Wakelock acquired
- */
-int gxp_pm_acquire_blk_wakelock(struct gxp_dev *gxp);
-
-/**
- * gxp_pm_release_blk_wakelock() - Release blk wakelock.
- *
- * Can be called multiple times and it will decrease
- * reference count till 0.
- *
- * @gxp: The GXP device to operate
- *
- * Return:
- * * 0       - Wakelock released
- * * -EIO    - No wakelock is currently held
- */
-int gxp_pm_release_blk_wakelock(struct gxp_dev *gxp);
-
-/**
  * gxp_pm_init() - API for initialize PM interface for GXP, should only be
  * called once per probe
  * @gxp: The GXP device to operate
@@ -247,8 +220,8 @@ int gxp_pm_blk_set_rate_acpm(struct gxp_dev *gxp, unsigned long rate);
 int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
 
 /**
- * gxp_pm_update_requested_power_state() - API for a GXP client to vote for a
- * requested state.
+ * gxp_pm_update_requested_power_states() - API for a GXP client to vote for a
+ * requested power state and a requested memory power state.
  * @gxp: The GXP device to operate.
  * @origin_state: An existing old requested state, will be cleared. If this is
  *                the first vote, pass AUR_OFF.
@@ -258,32 +231,20 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
  * @requested_aggressor: Specify whether the new vote is requested with aggressor
  *                       flag. Will take no effect if the @requested state is
  *                       AUR_OFF.
- *
- * Return:
- * * 0       - Voting registered
- * * -EINVAL - Invalid original state or requested state
- */
-int gxp_pm_update_requested_power_state(struct gxp_dev *gxp,
-					enum aur_power_state origin_state,
-					bool origin_requested_aggressor,
-					enum aur_power_state requested_state,
-					bool requested_aggressor);
-
-/**
- * gxp_pm_update_requested_memory_power_state() - API for a GXP client to vote for a
- * requested memory power state.
- * @gxp: The GXP device to operate.
- * @origin_state: An existing old requested state, will be cleared. If this is
+ * @origin_mem_state: An existing old requested state, will be cleared. If this is
  *                the first vote, pass AUR_MEM_UNDEFINED.
- * @requested_state: The new requested state.
+ * @requested_mem_state: The new requested state.
  *
  * Return:
  * * 0       - Voting registered
  * * -EINVAL - Invalid original state or requested state
  */
-int gxp_pm_update_requested_memory_power_state(
-	struct gxp_dev *gxp, enum aur_memory_power_state origin_state,
-	enum aur_memory_power_state requested_state);
+
+int gxp_pm_update_requested_power_states(
+	struct gxp_dev *gxp, enum aur_power_state origin_state,
+	bool origin_requested_aggressor, enum aur_power_state requested_state,
+	bool requested_aggressor, enum aur_memory_power_state origin_mem_state,
+	enum aur_memory_power_state requested_mem_state);
 
 /*
  * gxp_pm_force_cmu_noc_user_mux_normal() - Force PLL_CON0_NOC_USER MUX switch to the
@@ -298,5 +259,14 @@ void gxp_pm_force_cmu_noc_user_mux_normal(struct gxp_dev *gxp);
  * AUR_READY, should set it to AUR_CMU_MUX_LOW.
  */
 void gxp_pm_check_cmu_noc_user_mux(struct gxp_dev *gxp);
+
+/**
+ * gxp_pm_set_thermal_limit() - Notify the power manager of a thermal limit
+ * @gxp: The GXP device the limit is set for
+ * @thermal_limit: The highest frequency, in Hz, the thermal limit allows
+ *
+ * The power management code will only use this information for logging.
+ */
+void gxp_pm_set_thermal_limit(struct gxp_dev *gxp, unsigned long thermal_limit);
 
 #endif /* __GXP_PM_H__ */

@@ -11,7 +11,7 @@
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/types.h>
-#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
+#if (IS_ENABLED(CONFIG_GXP_TEST) || IS_ENABLED(CONFIG_ANDROID)) && !IS_ENABLED(CONFIG_GXP_GEM5)
 #include <soc/google/tpu-ext.h>
 #endif
 
@@ -136,7 +136,7 @@ void gxp_dma_unmap_core_resources(struct gxp_dev *gxp,
 				  struct gxp_virtual_device *vd, uint virt_core,
 				  uint core);
 
-#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
+#if (IS_ENABLED(CONFIG_GXP_TEST) || IS_ENABLED(CONFIG_ANDROID)) && !IS_ENABLED(CONFIG_GXP_GEM5)
 /**
  * gxp_dma_map_tpu_buffer() - Map the tpu mbx queue buffers with fixed IOVAs
  * @gxp: The GXP device to set up the mappings for
@@ -169,7 +169,7 @@ int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 			      struct gxp_virtual_device *vd,
 			      struct gxp_tpu_mbx_desc mbx_desc);
-#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
+#endif  // (CONFIG_GXP_TEST || CONFIG_ANDROID) && !CONFIG_GXP_GEM5
 
 /**
  * gxp_dma_map_allocated_coherent_buffer() - Map a coherent buffer

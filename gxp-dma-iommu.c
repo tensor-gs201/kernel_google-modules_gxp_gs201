@@ -441,7 +441,7 @@ alloc_sgt_for_buffer(void *ptr, size_t size,
 	return sgt;
 }
 
-#if IS_ENABLED(CONFIG_ANDROID) && !IS_ENABLED(CONFIG_GXP_GEM5)
+#if (IS_ENABLED(CONFIG_GXP_TEST) || IS_ENABLED(CONFIG_ANDROID)) && !IS_ENABLED(CONFIG_GXP_GEM5)
 int gxp_dma_map_tpu_buffer(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 			   uint virt_core_list, uint core_list,
 			   struct edgetpu_ext_mailbox_info *mbx_info)
@@ -515,7 +515,7 @@ void gxp_dma_unmap_tpu_buffer(struct gxp_dev *gxp,
 			    mbx_desc.cmdq_size, mbx_desc.respq_size);
 	}
 }
-#endif  // CONFIG_ANDROID && !CONFIG_GXP_GEM5
+#endif  // (CONFIG_GXP_TEST || CONFIG_ANDROID) && !CONFIG_GXP_GEM5
 
 int gxp_dma_map_allocated_coherent_buffer(struct gxp_dev *gxp, void *buf,
 					  struct gxp_virtual_device *vd,

@@ -11,8 +11,8 @@
 #include <linux/refcount.h>
 #include <linux/types.h>
 
-#include "gxp.h"
 #include "gxp-internal.h"
+#include "gxp.h"
 
 struct gxp_telemetry_work {
 	struct work_struct work;

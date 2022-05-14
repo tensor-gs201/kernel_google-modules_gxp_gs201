@@ -7,8 +7,8 @@
 #ifndef __GXP_WAKELOCK_H__
 #define __GXP_WAKELOCK_H__
 
-#include "gxp.h"
 #include "gxp-internal.h"
+#include "gxp.h"
 
 struct gxp_wakelock_manager {
 	/* Protects count and suspended */

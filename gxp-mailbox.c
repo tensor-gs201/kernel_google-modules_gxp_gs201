@@ -12,6 +12,7 @@
 #include <linux/kthread.h>
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
+#include <uapi/linux/sched/types.h>
 
 #include "gxp-dma.h"
 #include "gxp-internal.h"
@@ -20,10 +21,8 @@
 #include "gxp-pm.h"
 
 /* Timeout of 8s by default to account for slower emulation platforms */
-static int mbx_timeout = 8000;
-module_param(mbx_timeout, int, 0660);
-
-#define MAILBOX_TIMEOUT (mbx_timeout * GXP_TIME_DELAY_FACTOR)
+int gxp_mbx_timeout = 8000;
+module_param_named(mbx_timeout, gxp_mbx_timeout, int, 0660);
 
 /* Utilities of circular queue operations */
 
@@ -95,12 +94,16 @@ static void gxp_mailbox_set_resp_queue_head(struct gxp_mailbox *mailbox,
  * -EBUSY is returned and all fields remain unchanged. The caller should
  * handle this case and implement a mechanism to wait until the consumer
  * consumes commands.
+ *
+ * Caller must hold cmd_queue_lock.
  */
 static int gxp_mailbox_inc_cmd_queue_tail(struct gxp_mailbox *mailbox, u32 inc)
 {
 	u32 head;
 	u32 remain_size;
 	u32 new_tail;
+
+	lockdep_assert_held(&mailbox->cmd_queue_lock);
 
 	if (inc > mailbox->cmd_queue_size)
 		return -EINVAL;
@@ -132,12 +135,16 @@ static int gxp_mailbox_inc_cmd_queue_tail(struct gxp_mailbox *mailbox, u32 inc)
  * Returns 0 on success.
  * -EINVAL is returned if the queue head will exceed tail of queue, and no
  * fields or CSR is updated in this case.
+ *
+ * Caller must hold resp_queue_lock.
  */
 static int gxp_mailbox_inc_resp_queue_head(struct gxp_mailbox *mailbox, u32 inc)
 {
 	u32 tail;
 	u32 size;
 	u32 new_head;
+
+	lockdep_assert_held(&mailbox->resp_queue_lock);
 
 	if (inc > mailbox->resp_queue_size)
 		return -EINVAL;
@@ -224,18 +231,13 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 						     resp);
 
 				cancel_delayed_work(&async_resp->timeout_work);
-				if (async_resp->memory_power_state !=
-				    AUR_MEM_UNDEFINED)
-					gxp_pm_update_requested_memory_power_state(
-						async_resp->mailbox->gxp,
-						async_resp->memory_power_state,
-						AUR_MEM_UNDEFINED);
-				if (async_resp->gxp_power_state != AUR_OFF)
-					gxp_pm_update_requested_power_state(
-						async_resp->mailbox->gxp,
-						async_resp->gxp_power_state,
-						async_resp->requested_aggressor,
-						AUR_OFF, true);
+				gxp_pm_update_requested_power_states(
+					async_resp->mailbox->gxp,
+					async_resp->gxp_power_state,
+					async_resp->requested_aggressor,
+					AUR_OFF, true,
+					async_resp->memory_power_state,
+					AUR_MEM_UNDEFINED);
 
 				spin_lock_irqsave(async_resp->dest_queue_lock,
 						  flags);
@@ -358,7 +360,7 @@ gxp_mailbox_fetch_responses(struct gxp_mailbox *mailbox, u32 *total_ptr)
  * or race-condition bugs, gxp_mailbox_release() must be called before free the
  * mailbox.
  */
-static void gxp_mailbox_consume_responses_work(struct work_struct *work)
+static void gxp_mailbox_consume_responses_work(struct kthread_work *work)
 {
 	struct gxp_mailbox *mailbox =
 		container_of(work, struct gxp_mailbox, response_work);
@@ -366,10 +368,6 @@ static void gxp_mailbox_consume_responses_work(struct work_struct *work)
 	u32 i;
 	u32 count = 0;
 
-	/*
-	 * TODO(b/177692488) Review if changes in edgetpu's consume response
-	 * logic should be ported to the GXP driver as well.
-	 */
 	/* fetch responses and bump RESP_QUEUE_HEAD */
 	responses = gxp_mailbox_fetch_responses(mailbox, &count);
 	if (IS_ERR(responses)) {
@@ -395,11 +393,33 @@ static void gxp_mailbox_consume_responses_work(struct work_struct *work)
  */
 static inline void gxp_mailbox_handle_irq(struct gxp_mailbox *mailbox)
 {
-	queue_work(mailbox->response_wq, &mailbox->response_work);
+	kthread_queue_work(&mailbox->response_worker, &mailbox->response_work);
 }
 
-#define _RESPONSE_WORKQUEUE_NAME(_x_) "gxp_responses_" #_x_
-#define RESPONSE_WORKQUEUE_NAME(_x_) _RESPONSE_WORKQUEUE_NAME(_x_)
+/* Priority level for realtime worker threads */
+#define GXP_RT_THREAD_PRIORITY 2
+static struct task_struct *
+create_response_rt_thread(struct device *dev, void *data, int core_id)
+{
+	static const struct sched_param param = {
+		.sched_priority = GXP_RT_THREAD_PRIORITY,
+	};
+	struct task_struct *task = kthread_create(kthread_worker_fn, data,
+						  "gxp_response_%d", core_id);
+
+	if (!IS_ERR(task)) {
+		wake_up_process(task);
+		if (sched_setscheduler(task, SCHED_FIFO, &param))
+			dev_warn(dev, "response task %d not set to RT prio",
+				 core_id);
+		else
+			dev_dbg(dev, "response task %d set to RT prio: %i",
+				core_id, param.sched_priority);
+	}
+
+	return task;
+}
+
 static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 					  struct gxp_virtual_device *vd,
 					  uint virt_core, u8 core_id)
@@ -455,17 +475,18 @@ static struct gxp_mailbox *create_mailbox(struct gxp_mailbox_manager *mgr,
 	mailbox->descriptor->cmd_queue_size = mailbox->cmd_queue_size;
 	mailbox->descriptor->resp_queue_size = mailbox->resp_queue_size;
 
-	mailbox->response_wq =
-		create_singlethread_workqueue(RESPONSE_WORKQUEUE_NAME(i));
-	if (!mailbox->response_wq)
-		goto err_workqueue;
+	kthread_init_worker(&mailbox->response_worker);
+	mailbox->response_thread = create_response_rt_thread(
+		mailbox->gxp->dev, &mailbox->response_worker, core_id);
+	if (IS_ERR(mailbox->response_thread))
+		goto err_thread;
 
 	/* Initialize driver before interacting with its registers */
 	gxp_mailbox_driver_init(mailbox);
 
 	return mailbox;
 
-err_workqueue:
+err_thread:
 	gxp_dma_free_coherent(mailbox->gxp, vd, BIT(virt_core),
 			      sizeof(struct gxp_mailbox_descriptor),
 			      mailbox->descriptor,
@@ -488,7 +509,6 @@ err_mailbox:
 
 static void enable_mailbox(struct gxp_mailbox *mailbox)
 {
-	gxp_mailbox_driver_init(mailbox);
 	gxp_mailbox_write_descriptor(mailbox, mailbox->descriptor_device_addr);
 	gxp_mailbox_write_cmd_queue_head(mailbox, 0);
 	gxp_mailbox_write_cmd_queue_tail(mailbox, 0);
@@ -500,7 +520,7 @@ static void enable_mailbox(struct gxp_mailbox *mailbox)
 	init_waitqueue_head(&mailbox->wait_list_waitq);
 	INIT_LIST_HEAD(&mailbox->wait_list);
 	mutex_init(&mailbox->wait_list_lock);
-	INIT_WORK(&mailbox->response_work, gxp_mailbox_consume_responses_work);
+	kthread_init_work(&mailbox->response_work, gxp_mailbox_consume_responses_work);
 
 	/* Only enable interrupts once everything has been setup */
 	gxp_mailbox_driver_enable_interrupts(mailbox);
@@ -550,7 +570,7 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 	gxp_mailbox_driver_disable_interrupts(mailbox);
 
 	/* Halt and flush any traffic */
-	cancel_work_sync(&mailbox->response_work);
+	kthread_cancel_work_sync(&mailbox->response_work);
 	for (i = 0; i < GXP_MAILBOX_INT_BIT_COUNT; i++) {
 		if (mailbox->interrupt_handlers[i])
 			cancel_work_sync(mailbox->interrupt_handlers[i]);
@@ -629,7 +649,8 @@ void gxp_mailbox_release(struct gxp_mailbox_manager *mgr,
 			      sizeof(struct gxp_mailbox_descriptor),
 			      mailbox->descriptor,
 			      mailbox->descriptor_device_addr);
-	destroy_workqueue(mailbox->response_wq);
+	kthread_flush_worker(&mailbox->response_worker);
+	kthread_stop(mailbox->response_thread);
 	kfree(mailbox);
 }
 
@@ -805,16 +826,10 @@ static void async_cmd_timeout_work(struct work_struct *work)
 		list_add_tail(&async_resp->list_entry, async_resp->dest_queue);
 		spin_unlock_irqrestore(async_resp->dest_queue_lock, flags);
 
-		if (async_resp->memory_power_state != AUR_MEM_UNDEFINED)
-			gxp_pm_update_requested_memory_power_state(
-				async_resp->mailbox->gxp,
-				async_resp->memory_power_state,
-				AUR_MEM_UNDEFINED);
-		if (async_resp->gxp_power_state != AUR_OFF)
-			gxp_pm_update_requested_power_state(
-				async_resp->mailbox->gxp,
-				async_resp->gxp_power_state,
-				async_resp->requested_aggressor, AUR_OFF, true);
+		gxp_pm_update_requested_power_states(
+			async_resp->mailbox->gxp, async_resp->gxp_power_state,
+			async_resp->requested_aggressor, AUR_OFF, true,
+			async_resp->memory_power_state, AUR_MEM_UNDEFINED);
 
 		if (async_resp->eventfd) {
 			gxp_eventfd_signal(async_resp->eventfd);
@@ -859,13 +874,9 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	schedule_delayed_work(&async_resp->timeout_work,
 			      msecs_to_jiffies(MAILBOX_TIMEOUT));
 
-	if (gxp_power_state != AUR_OFF)
-		gxp_pm_update_requested_power_state(mailbox->gxp, AUR_OFF, true,
-						    gxp_power_state,
-						    requested_aggressor);
-	if (memory_power_state != AUR_MEM_UNDEFINED)
-		gxp_pm_update_requested_memory_power_state(
-			mailbox->gxp, AUR_MEM_UNDEFINED, memory_power_state);
+	gxp_pm_update_requested_power_states(
+		mailbox->gxp, AUR_OFF, true, gxp_power_state,
+		requested_aggressor, AUR_MEM_UNDEFINED, memory_power_state);
 	ret = gxp_mailbox_enqueue_cmd(mailbox, cmd, &async_resp->resp,
 				      /* resp_is_async = */ true);
 	if (ret)
@@ -874,14 +885,10 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	return 0;
 
 err_free_resp:
-	if (memory_power_state != AUR_MEM_UNDEFINED)
-		gxp_pm_update_requested_memory_power_state(
-			mailbox->gxp, memory_power_state, AUR_MEM_UNDEFINED);
-	if (gxp_power_state != AUR_OFF)
-		gxp_pm_update_requested_power_state(mailbox->gxp,
-						    gxp_power_state,
-						    requested_aggressor,
-						    AUR_OFF, true);
+	gxp_pm_update_requested_power_states(mailbox->gxp, gxp_power_state,
+					     requested_aggressor, AUR_OFF, true,
+					     memory_power_state,
+					     AUR_MEM_UNDEFINED);
 	cancel_delayed_work_sync(&async_resp->timeout_work);
 	kfree(async_resp);
 	return ret;

@@ -9,6 +9,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/list.h>
@@ -46,7 +47,7 @@ struct gxp_tpu_dev {
 struct gxp_client;
 struct gxp_mailbox_manager;
 struct gxp_debug_dump_manager;
-struct gxp_mapping_root;
+struct gxp_domain_pool;
 struct gxp_dma_manager;
 struct gxp_fw_data_manager;
 struct gxp_power_manager;
@@ -67,8 +68,18 @@ struct gxp_dev {
 	struct gxp_mailbox_manager *mailbox_mgr;
 	struct gxp_power_manager *power_mgr;
 	struct gxp_debug_dump_manager *debug_dump_mgr;
-	struct gxp_mapping_root *mappings;	/* tree of user mappings */
-	u32 firmware_running;		 /* firmware status bitmap */
+	const struct firmware *firmwares[GXP_NUM_CORES];
+	char *firmware_name;
+	bool is_firmware_requested;
+	/* Protects `firmwares` and `firmware_name` */
+	struct mutex dsp_firmware_lock;
+	/* Firmware status bitmap. Accessors must hold `vd_semaphore` */
+	u32 firmware_running;
+	/*
+	 * Lock to ensure only one thread at a time is ever calling
+	 * `pin_user_pages_fast()` during mapping, otherwise it will fail.
+	 */
+	struct mutex pin_user_pages_lock;
 	/*
 	 * Reader/writer lock protecting usage of virtual cores assigned to
 	 * physical cores.
@@ -76,12 +87,8 @@ struct gxp_dev {
 	 * running or stopping one on a physical core.
 	 * A reader is any function making use of or interacting with a virtual
 	 * core without starting or stopping it on a physical core.
-	 */
-	/*
-	 * TODO(b/216862052) vd_semaphore also currently protects client state.
-	 *                   A separate per-client lock should be introduced
-	 *                   instead, as part of support for creating VDs
-	 *                   without running them on physical cores.
+	 * The fields `core_to_vd[]` and `firmware_running` are also protected
+	 * by this lock.
 	 */
 	struct rw_semaphore vd_semaphore;
 	struct gxp_virtual_device *core_to_vd[GXP_NUM_CORES];
@@ -100,6 +107,7 @@ struct gxp_dev {
 	 */
 	struct device *gsa_dev;
 	u32 memory_per_core;
+	struct gxp_domain_pool *domain_pool;
 	struct list_head client_list;
 	struct mutex client_list_lock;
 };
