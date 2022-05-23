@@ -460,6 +460,7 @@ out:
  * @core: The core in @gxp to notify of the telemetry state change
  * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
  *
+ * Caller must hold `telemetry_mgr->lock`.
  * Caller must hold @gxp's virtual device lock
  *
  * Return:
@@ -516,6 +517,7 @@ static int notify_core_and_wait_for_disable(struct gxp_dev *gxp, uint core,
  * @type: Either `GXP_TELEMETRY_TYPE_LOGGING` or `GXP_TELEMETRY_TYPE_TRACING`
  *
  * Caller must hold `telemetry_mgr->lock`.
+ * Caller must hold `gxp->vd_semaphore` for reading.
  *
  * Return:
  * * 0       - Success
@@ -553,7 +555,6 @@ static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type)
 					      null_daddrs, 0);
 
 	/* Notify any running cores that firmware-data was updated */
-	down_read(&gxp->vd_semaphore);
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp_is_fw_running(gxp, core)) {
 			ret = notify_core_and_wait_for_disable(gxp, core, type);
@@ -564,7 +565,6 @@ static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type)
 					__func__, core, type, ret);
 		}
 	}
-	up_read(&gxp->vd_semaphore);
 
 	return 0;
 }
@@ -574,9 +574,11 @@ int gxp_telemetry_disable(struct gxp_dev *gxp, u8 type)
 	int ret;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
+	down_read(&gxp->vd_semaphore);
 
 	ret = telemetry_disable_locked(gxp, type);
 
+	up_read(&gxp->vd_semaphore);
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 
 	return ret;

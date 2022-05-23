@@ -283,8 +283,7 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 	memset(gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF, 0,
 	       AURORA_SCRATCHPAD_LEN);
 
-	core_scratchpad_base = gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF +
-			       CORE_SCRATCHPAD_BASE(core);
+	core_scratchpad_base = gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_CORE_ALIVE);
 	writel(0, core_scratchpad_base + offset);
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_TOP_ACCESS_OK);
@@ -649,8 +648,7 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 	}
 
 	/* Mark this as a cold boot */
-	gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
-			  GXP_BOOT_MODE_REQUEST_COLD_BOOT);
+	gxp_firmware_set_boot_mode(gxp, core, GXP_BOOT_MODE_REQUEST_COLD_BOOT);
 
 #ifdef CONFIG_GXP_GEM5
 	/*
@@ -742,4 +740,32 @@ void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 	if (vd->state == GXP_VD_RUNNING)
 		gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);
+}
+
+void gxp_firmware_set_boot_mode(struct gxp_dev *gxp, uint core, u32 mode)
+{
+	void __iomem *boot_mode_addr;
+
+	/* Callers shouldn't call the function under this condition. */
+	if (!gxp->fwbufs[core].vaddr)
+		return;
+
+	boot_mode_addr = gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF +
+			 SCRATCHPAD_MSG_OFFSET(MSG_BOOT_MODE);
+
+	writel(mode, boot_mode_addr);
+}
+
+u32 gxp_firmware_get_boot_mode(struct gxp_dev *gxp, uint core)
+{
+	void __iomem *boot_mode_addr;
+
+	/* Callers shouldn't call the function under this condition. */
+	if (!gxp->fwbufs[core].vaddr)
+		return 0;
+
+	boot_mode_addr = gxp->fwbufs[core].vaddr + AURORA_SCRATCHPAD_OFF +
+			 SCRATCHPAD_MSG_OFFSET(MSG_BOOT_MODE);
+
+	return readl(boot_mode_addr);
 }
