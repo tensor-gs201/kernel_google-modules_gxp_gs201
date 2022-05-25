@@ -8,6 +8,7 @@
 #define __GXP_CLIENT_H__
 
 #include <linux/rwsem.h>
+#include <linux/sched.h>
 #include <linux/types.h>
 
 #include "gxp-internal.h"
@@ -40,6 +41,9 @@ struct gxp_client {
 
 	struct gxp_eventfd *mb_eventfds[GXP_NUM_CORES];
 
+	/* client process thread group ID is really the main process ID. */
+	pid_t tgid;
+	/* client process ID is really the thread ID, may be transient. */
 	pid_t pid;
 };
 
