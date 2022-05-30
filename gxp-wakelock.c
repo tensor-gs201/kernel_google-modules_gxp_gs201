@@ -118,16 +118,16 @@ int gxp_wakelock_suspend(struct gxp_dev *gxp)
 		if (!down_read_trylock(&client->semaphore)) {
 			dev_warn_ratelimited(
 				gxp->dev,
-				"Unable to acquire client lock (pid=%d)\n",
-				client->pid);
+				"Unable to acquire client lock (tgid=%d pid=%d)\n",
+				client->tgid, client->pid);
 			continue;
 		}
 
 		if (client->has_block_wakelock)
 			dev_warn_ratelimited(
 				gxp->dev,
-				"Cannot suspend with client holding wakelock (pid=%d)\n",
-				client->pid);
+				"Cannot suspend with client holding wakelock (tgid=%d pid=%d)\n",
+				client->tgid, client->pid);
 
 		up_read(&client->semaphore);
 	}

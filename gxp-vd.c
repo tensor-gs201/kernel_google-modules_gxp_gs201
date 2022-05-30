@@ -354,8 +354,8 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 				continue;
 			}
 			/* Mark the boot mode as a suspend event */
-			gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
-					  GXP_BOOT_MODE_REQUEST_SUSPEND);
+			gxp_firmware_set_boot_mode(gxp, core,
+				GXP_BOOT_MODE_REQUEST_SUSPEND);
 			/*
 			 * Request a suspend event by sending a mailbox
 			 * notification.
@@ -371,8 +371,8 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 			if (!(failed_cores & BIT(core))) {
 				if (!gxp_lpm_wait_state_eq(gxp, core,
 							   LPM_PG_STATE)) {
-					boot_state = gxp_read_32_core(
-						gxp, core, GXP_REG_BOOT_MODE);
+					boot_state = gxp_firmware_get_boot_mode(
+							gxp, core);
 					if (boot_state !=
 					    GXP_BOOT_MODE_STATUS_SUSPEND_COMPLETED) {
 						dev_err(gxp->dev,
@@ -452,8 +452,8 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 				}
 			}
 			/* Mark this as a resume power-up event. */
-			gxp_write_32_core(gxp, core, GXP_REG_BOOT_MODE,
-					  GXP_BOOT_MODE_REQUEST_RESUME);
+			gxp_firmware_set_boot_mode(gxp, core,
+				GXP_BOOT_MODE_REQUEST_RESUME);
 			/*
 			 * Power on the core by explicitly switching its PSM to
 			 * PS0 (LPM_ACTIVE_STATE).
@@ -470,8 +470,8 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 				/* in microseconds */
 				timeout = 1000000;
 				while (--timeout) {
-					boot_state = gxp_read_32_core(
-						gxp, core, GXP_REG_BOOT_MODE);
+					boot_state = gxp_firmware_get_boot_mode(
+						gxp, core);
 					if (boot_state ==
 					    GXP_BOOT_MODE_STATUS_RESUME_COMPLETED)
 						break;

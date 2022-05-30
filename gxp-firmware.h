@@ -25,12 +25,12 @@
 
 #define Q7_ALIVE_MAGIC	0x55555555
 
-#define CORE_SCRATCHPAD_BASE(_core_) (_core_ << 16)
 #define SCRATCHPAD_MSG_OFFSET(_msg_) (_msg_  <<  2)
 
 enum aurora_msg {
 	MSG_CORE_ALIVE,
 	MSG_TOP_ACCESS_OK,
+	MSG_BOOT_MODE,
 	MSG_SCRATCHPAD_MAX,
 };
 
@@ -80,5 +80,17 @@ void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
  */
 int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
 					  bool verbose);
+
+/*
+ * Sets the specified core's boot mode or suspend request value.
+ * This function should be called only after the firmware has been run.
+ */
+void gxp_firmware_set_boot_mode(struct gxp_dev *gxp, uint core, u32 mode);
+
+/*
+ * Returns the specified core's boot mode or boot status.
+ * This function should be called only after the firmware has been run.
+ */
+u32 gxp_firmware_get_boot_mode(struct gxp_dev *gxp, uint core);
 
 #endif /* __GXP_FIRMWARE_H__ */

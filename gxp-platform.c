@@ -22,6 +22,7 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
 #if (IS_ENABLED(CONFIG_GXP_TEST) || IS_ENABLED(CONFIG_ANDROID)) && !IS_ENABLED(CONFIG_GXP_GEM5)
@@ -159,6 +160,7 @@ static int gxp_open(struct inode *inode, struct file *file)
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
+	client->tgid = current->tgid;
 	client->pid = current->pid;
 
 	file->private_data = client;
@@ -1277,9 +1279,10 @@ static int gxp_acquire_wake_lock_compat(
 		client->has_block_wakelock = true;
 
 		/*
-		 * Update client's PID in case the process that opened /dev/gxp
-		 * is not the one that called this IOCTL.
+		 * Update client's TGID/PID in case the process that opened
+		 * /dev/gxp is not the one that called this IOCTL.
 		 */
+		client->tgid = current->tgid;
 		client->pid = current->pid;
 	}
 
