@@ -12,6 +12,7 @@
 #include <linux/gsa/gsa_image_auth.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -33,6 +34,9 @@
 
 #define FW_HEADER_SIZE		(0x1000)
 #define FW_IMAGE_TYPE_OFFSET	(0x400)
+
+static int gxp_dsp_fw_auth_disable;
+module_param_named(dsp_fw_auth_disable, gxp_dsp_fw_auth_disable, int, 0660);
 
 static int
 request_dsp_firmware(struct gxp_dev *gxp, char *name_prefix,
@@ -115,7 +119,7 @@ static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
 
 		if (!((da >= (u32)buffer->daddr) &&
 		   ((da + memsz) <= ((u32)buffer->daddr +
-				     (u32)buffer->size - 1)))) {
+				     (u32)buffer->size)))) {
 			/*
 			 * Some BSS data may be referenced from TCM, and can be
 			 * skipped while loading
@@ -165,15 +169,6 @@ static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
 	return ret;
 }
 
-/* TODO (b/220246540): remove after unsigned firmware support is phased out */
-static bool gxp_firmware_image_is_signed(const u8 *data)
-{
-	return data[FW_IMAGE_TYPE_OFFSET + 0] == 'D' &&
-	       data[FW_IMAGE_TYPE_OFFSET + 1] == 'S' &&
-	       data[FW_IMAGE_TYPE_OFFSET + 2] == 'P' &&
-	       data[FW_IMAGE_TYPE_OFFSET + 3] == 'F';
-}
-
 static int
 gxp_firmware_load_authenticated(struct gxp_dev *gxp, const struct firmware *fw,
 				const struct gxp_mapped_resource *buffer)
@@ -184,10 +179,11 @@ gxp_firmware_load_authenticated(struct gxp_dev *gxp, const struct firmware *fw,
 	dma_addr_t header_dma_addr;
 	int ret;
 
-	/* TODO (b/220246540): remove after unsigned firmware support is phased out */
-	if (!gxp_firmware_image_is_signed(data)) {
-		dev_info(gxp->dev, "Loading unsigned firmware\n");
-		return elf_load_segments(gxp, data, size, buffer);
+	if (gxp_dsp_fw_auth_disable) {
+		dev_warn(gxp->dev,
+			 "DSP FW authentication disabled, skipping\n");
+		return elf_load_segments(gxp, data + FW_HEADER_SIZE,
+					 size - FW_HEADER_SIZE, buffer);
 	}
 
 	if (!gxp->gsa_dev) {
@@ -271,6 +267,9 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 	u32 offset;
 	void __iomem *core_scratchpad_base;
 	int ret;
+
+	if (!gxp->firmwares[core])
+		return -ENODEV;
 
 	/* Authenticate and load firmware to System RAM */
 	ret = gxp_firmware_load_authenticated(gxp, gxp->firmwares[core],

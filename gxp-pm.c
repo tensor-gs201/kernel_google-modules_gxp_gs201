@@ -23,9 +23,10 @@
  * The order of this array decides the voting priority, should be increasing in
  * frequencies.
  */
-static const enum aur_power_state aur_state_array[] = { AUR_OFF, AUR_READY,
-							AUR_UUD, AUR_SUD,
-							AUR_UD,	 AUR_NOM };
+static const enum aur_power_state aur_state_array[] = {
+	AUR_OFF,      AUR_READY, AUR_UUD,     AUR_UUD_PLUS, AUR_SUD,
+	AUR_SUD_PLUS, AUR_UD,	 AUR_UD_PLUS, AUR_NOM
+};
 static const uint aur_memory_state_array[] = {
 	AUR_MEM_UNDEFINED, AUR_MEM_MIN,	      AUR_MEM_VERY_LOW, AUR_MEM_LOW,
 	AUR_MEM_HIGH,	   AUR_MEM_VERY_HIGH, AUR_MEM_MAX
@@ -724,10 +725,16 @@ void gxp_pm_set_thermal_limit(struct gxp_dev *gxp, unsigned long thermal_limit)
 
 	if (thermal_limit >= aur_power_state2rate[AUR_NOM]) {
 		dev_warn(gxp->dev, "Thermal limit on DVFS removed\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_UD_PLUS]) {
+		dev_warn(gxp->dev, "Thermals limited to UD+\n");
 	} else if (thermal_limit >= aur_power_state2rate[AUR_UD]) {
 		dev_warn(gxp->dev, "Thermals limited to UD\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_SUD_PLUS]) {
+		dev_warn(gxp->dev, "Thermals limited to SUD+\n");
 	} else if (thermal_limit >= aur_power_state2rate[AUR_SUD]) {
 		dev_warn(gxp->dev, "Thermal limited to SUD\n");
+	} else if (thermal_limit >= aur_power_state2rate[AUR_UUD_PLUS]) {
+		dev_warn(gxp->dev, "Thermals limited to UUD+\n");
 	} else if (thermal_limit >= aur_power_state2rate[AUR_UUD]) {
 		dev_warn(gxp->dev, "Thermal limited to UUD\n");
 	} else if (thermal_limit >= aur_power_state2rate[AUR_READY]) {

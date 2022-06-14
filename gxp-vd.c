@@ -8,6 +8,7 @@
 #include <linux/bitops.h>
 #include <linux/slab.h>
 
+#include "gxp-debug-dump.h"
 #include "gxp-dma.h"
 #include "gxp-domain-pool.h"
 #include "gxp-firmware.h"
@@ -200,6 +201,31 @@ static void unmap_telemetry_buffers(struct gxp_dev *gxp,
 				->buffer_daddrs[core]);
 }
 
+static void map_debug_dump_buffer(struct gxp_dev *gxp,
+				  struct gxp_virtual_device *vd, uint virt_core,
+				  uint core)
+{
+	if (!gxp->debug_dump_mgr)
+		return;
+
+	gxp_dma_map_allocated_coherent_buffer(
+		gxp, gxp->debug_dump_mgr->buf.vaddr, vd, BIT(virt_core),
+		gxp->debug_dump_mgr->buf.size, gxp->debug_dump_mgr->buf.daddr,
+		0);
+}
+
+static void unmap_debug_dump_buffer(struct gxp_dev *gxp,
+				    struct gxp_virtual_device *vd,
+				    uint virt_core, uint core)
+{
+	if (!gxp->debug_dump_mgr)
+		return;
+
+	gxp_dma_unmap_allocated_coherent_buffer(
+		gxp, vd, BIT(virt_core), gxp->debug_dump_mgr->buf.size,
+		gxp->debug_dump_mgr->buf.daddr);
+}
+
 /* Caller must hold gxp->vd_semaphore for writing */
 int gxp_vd_start(struct gxp_virtual_device *vd)
 {
@@ -237,6 +263,7 @@ int gxp_vd_start(struct gxp_virtual_device *vd)
 			gxp_dma_domain_attach_device(gxp, vd, virt_core, core);
 			gxp_dma_map_core_resources(gxp, vd, virt_core, core);
 			map_telemetry_buffers(gxp, vd, virt_core, core);
+			map_debug_dump_buffer(gxp, vd, virt_core, core);
 			ret = gxp_firmware_run(gxp, vd, virt_core, core);
 			if (ret) {
 				dev_err(gxp->dev, "Failed to run firmware on core %u\n",
@@ -246,6 +273,8 @@ int gxp_vd_start(struct gxp_virtual_device *vd)
 				 * had their firmware start successfully, so we
 				 * need to clean up `core` here.
 				 */
+				unmap_debug_dump_buffer(gxp, vd, virt_core,
+							core);
 				unmap_telemetry_buffers(gxp, vd, virt_core,
 							core);
 				gxp_dma_unmap_core_resources(gxp, vd, virt_core,
@@ -306,6 +335,7 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp->core_to_vd[core] == vd) {
 			gxp_firmware_stop(gxp, vd, virt_core, core);
+			unmap_debug_dump_buffer(gxp, vd, virt_core, core);
 			unmap_telemetry_buffers(gxp, vd, virt_core, core);
 			gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
 			if (vd->state == GXP_VD_RUNNING)

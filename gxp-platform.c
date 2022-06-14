@@ -132,8 +132,9 @@ static struct platform_device gxp_sscd_dev = {
 #endif  // CONFIG_SUBSYSTEM_COREDUMP
 
 /* Mapping from GXP_POWER_STATE_* to enum aur_power_state in gxp-pm.h */
-static const uint aur_state_array[GXP_POWER_STATE_READY + 1] = {
-	AUR_OFF, AUR_UUD, AUR_SUD, AUR_UD, AUR_NOM, AUR_READY
+static const uint aur_state_array[GXP_NUM_POWER_STATES] = {
+	AUR_OFF,   AUR_UUD,	 AUR_SUD,      AUR_UD,	   AUR_NOM,
+	AUR_READY, AUR_UUD_PLUS, AUR_SUD_PLUS, AUR_UD_PLUS
 };
 /* Mapping from MEMORY_POWER_STATE_* to enum aur_memory_power_state in gxp-pm.h */
 static const uint aur_memory_state_array[MEMORY_POWER_STATE_MAX + 1] = {
@@ -487,7 +488,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 		return -EINVAL;
 	}
 	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
-	    ibuf.gxp_power_state > GXP_POWER_STATE_READY) {
+	    ibuf.gxp_power_state >= GXP_NUM_POWER_STATES) {
 		dev_err(gxp->dev, "Requested power state is invalid\n");
 		return -EINVAL;
 	}
@@ -1240,7 +1241,7 @@ static int gxp_acquire_wake_lock_compat(
 		return -EINVAL;
 	}
 	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
-	    ibuf.gxp_power_state > GXP_POWER_STATE_READY) {
+	    ibuf.gxp_power_state >= GXP_NUM_POWER_STATES) {
 		dev_err(gxp->dev, "Requested power state is invalid\n");
 		return -EINVAL;
 	}
@@ -1371,7 +1372,7 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 		return -EINVAL;
 	}
 	if (ibuf.gxp_power_state < GXP_POWER_STATE_OFF ||
-	    ibuf.gxp_power_state > GXP_POWER_STATE_READY) {
+	    ibuf.gxp_power_state >= GXP_NUM_POWER_STATES) {
 		dev_err(gxp->dev, "Requested power state is invalid\n");
 		return -EINVAL;
 	}
@@ -1774,6 +1775,11 @@ static int gxp_trigger_debug_dump(struct gxp_client *client,
 
 	if (!uid_eq(current_euid(), GLOBAL_ROOT_UID))
 		return -EPERM;
+
+	if (!gxp_debug_dump_is_enabled()) {
+		dev_err(gxp->dev, "Debug dump functionality is disabled\n");
+		return -EINVAL;
+	}
 
 	if (copy_from_user(&core_bits, argp, sizeof(core_bits)))
 		return -EFAULT;
@@ -2260,8 +2266,10 @@ static int __init gxp_platform_init(void)
 {
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
 	/* Registers SSCD platform device */
-	if (platform_device_register(&gxp_sscd_dev))
-		pr_err("Unable to register SSCD platform device\n");
+	if (gxp_debug_dump_is_enabled()) {
+		if (platform_device_register(&gxp_sscd_dev))
+			pr_err("Unable to register SSCD platform device\n");
+	}
 #endif
 	return platform_driver_register(&gxp_platform_driver);
 }
@@ -2270,7 +2278,8 @@ static void __exit gxp_platform_exit(void)
 {
 	platform_driver_unregister(&gxp_platform_driver);
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
-	platform_device_unregister(&gxp_sscd_dev);
+	if (gxp_debug_dump_is_enabled())
+		platform_device_unregister(&gxp_sscd_dev);
 #endif
 }
 

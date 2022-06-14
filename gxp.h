@@ -12,7 +12,7 @@
 
 /* Interface Version */
 #define GXP_INTERFACE_VERSION_MAJOR	1
-#define GXP_INTERFACE_VERSION_MINOR	2
+#define GXP_INTERFACE_VERSION_MINOR	3
 #define GXP_INTERFACE_VERSION_BUILD	0
 
 /*
@@ -126,6 +126,10 @@ struct gxp_virtual_device_ioctl {
 #define GXP_POWER_STATE_UD	3
 #define GXP_POWER_STATE_NOM	4
 #define GXP_POWER_STATE_READY	5
+#define GXP_POWER_STATE_UUD_PLUS 6
+#define GXP_POWER_STATE_SUD_PLUS 7
+#define GXP_POWER_STATE_UD_PLUS 8
+#define GXP_NUM_POWER_STATES (GXP_POWER_STATE_UD_PLUS + 1)
 
 /*
  * Memory interface power state values for use as `memory_power_state` in

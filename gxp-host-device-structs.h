@@ -265,6 +265,8 @@ struct gxp_system_descriptor {
 	uint32_t watchdog_dev_addr;
 	/* A device address for the telemetry descriptor */
 	uint32_t telemetry_dev_addr;
+	/* A device address for the common debug dump region */
+	uint32_t debug_dump_dev_addr;
 };
 
 /* A structure describing the metadata belonging to a specific application. */
