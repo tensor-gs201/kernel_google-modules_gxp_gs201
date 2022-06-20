@@ -9,6 +9,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/genalloc.h>
 
+#include "gxp-debug-dump.h"
 #include "gxp-firmware-data.h"
 #include "gxp-host-device-structs.h"
 #include "gxp-internal.h"
@@ -87,6 +88,7 @@ struct gxp_fw_data_manager {
 	struct fw_memory sys_desc_mem;
 	struct fw_memory wdog_mem;
 	struct fw_memory telemetry_mem;
+	struct fw_memory debug_dump_mem;
 };
 
 /* A container holding information for a single GXP application. */
@@ -280,6 +282,23 @@ static struct fw_memory init_telemetry(struct gxp_fw_data_manager *mgr)
 	 * depopulate the descriptor pointers on demand.
 	 */
 	memset(tel_region, 0x00, sizeof(*tel_region));
+
+	return mem;
+}
+
+static struct fw_memory init_debug_dump(struct gxp_dev *gxp)
+{
+	struct fw_memory mem;
+
+	if (gxp->debug_dump_mgr) {
+		mem.host_addr = gxp->debug_dump_mgr->buf.vaddr;
+		mem.device_addr = gxp->debug_dump_mgr->buf.daddr;
+		mem.sz = gxp->debug_dump_mgr->buf.size;
+	} else {
+		mem.host_addr = 0;
+		mem.device_addr = 0;
+		mem.sz = 0;
+	}
 
 	return mem;
 }
@@ -571,6 +590,10 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 	/* Allocate the descriptor for device-side telemetry */
 	mgr->telemetry_mem = init_telemetry(mgr);
 	mgr->system_desc->telemetry_dev_addr = mgr->telemetry_mem.device_addr;
+
+	/* Set the debug dump region parameters if available */
+	mgr->debug_dump_mem = init_debug_dump(gxp);
+	mgr->system_desc->debug_dump_dev_addr = mgr->debug_dump_mem.device_addr;
 
 	return res;
 

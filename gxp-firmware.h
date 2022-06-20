@@ -13,8 +13,8 @@
 
 #if !IS_ENABLED(CONFIG_GXP_TEST)
 
-#define AURORA_SCRATCHPAD_OFF 0x00F00000 /* Last 1M of ELF load region */
-#define AURORA_SCRATCHPAD_LEN 0x00100000 /* 1M */
+#define AURORA_SCRATCHPAD_OFF 0x000FF000 /* Last 4KB of ELF load region */
+#define AURORA_SCRATCHPAD_LEN 0x00001000 /* 4KB */
 
 #else /* CONFIG_GXP_TEST */
 /* Firmware memory is shrunk in unit tests. */

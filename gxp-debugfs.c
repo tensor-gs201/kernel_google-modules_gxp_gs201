@@ -280,6 +280,11 @@ static int gxp_debugfs_coredump(void *data, u64 val)
 	struct gxp_dev *gxp = (struct gxp_dev *)data;
 	int core;
 
+	if (!gxp_debug_dump_is_enabled()) {
+		dev_err(gxp->dev, "Debug dump functionality is disabled\n");
+		return -EINVAL;
+	}
+
 	down_read(&gxp->vd_semaphore);
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {

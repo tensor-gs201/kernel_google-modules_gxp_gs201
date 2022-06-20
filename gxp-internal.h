@@ -63,7 +63,6 @@ struct gxp_dev {
 	struct gxp_mapped_resource mbx[GXP_NUM_CORES]; /* mailbox CSRs */
 	struct gxp_mapped_resource fwbufs[GXP_NUM_CORES]; /* FW carveout */
 	struct gxp_mapped_resource fwdatabuf; /* Shared FW data carveout */
-	struct gxp_mapped_resource coredumpbuf; /* core dump carveout */
 	struct gxp_mapped_resource cmu; /* CMU CSRs */
 	struct gxp_mailbox_manager *mailbox_mgr;
 	struct gxp_power_manager *power_mgr;

@@ -250,7 +250,6 @@ void gxp_dma_init_default_resources(struct gxp_dev *gxp)
 		gxp->fwbufs[core].daddr = GXP_IOVA_FIRMWARE(core);
 	}
 	gxp->regs.daddr = GXP_IOVA_AURORA_TOP;
-	gxp->coredumpbuf.daddr = GXP_IOVA_CORE_DUMP;
 	gxp->fwdatabuf.daddr = GXP_IOVA_FW_DATA;
 }
 
@@ -309,11 +308,6 @@ int gxp_dma_map_core_resources(struct gxp_dev *gxp,
 			IOMMU_READ | IOMMU_WRITE);
 	if (ret)
 		goto err;
-	ret = iommu_map(vd->core_domains[virt_core], gxp->coredumpbuf.daddr,
-			gxp->coredumpbuf.paddr, gxp->coredumpbuf.size,
-			IOMMU_READ | IOMMU_WRITE);
-	if (ret)
-		goto err;
 	ret = iommu_map(vd->core_domains[virt_core], gxp->fwdatabuf.daddr,
 			gxp->fwdatabuf.paddr, gxp->fwdatabuf.size,
 			IOMMU_READ | IOMMU_WRITE);
@@ -355,8 +349,6 @@ void gxp_dma_unmap_core_resources(struct gxp_dev *gxp,
 	}
 	iommu_unmap(vd->core_domains[virt_core], gxp->fwdatabuf.daddr,
 		    gxp->fwdatabuf.size);
-	iommu_unmap(vd->core_domains[virt_core], gxp->coredumpbuf.daddr,
-		    gxp->coredumpbuf.size);
 	/*
 	 * TODO(b/202213606): A core should only have access to the FW
 	 * of other cores if they're in the same VD, and have the FW

@@ -19,12 +19,11 @@
 
 #define GXP_NUM_COMMON_SEGMENTS 2
 #define GXP_NUM_CORE_SEGMENTS 8
-#define GXP_CORE_DRAM_SEGMENT_IDX 7
 #define GXP_NUM_BUFFER_MAPPINGS 32
-#define GXP_DEBUG_DUMP_CORE_SEGMENT_IDX_START (GXP_NUM_COMMON_SEGMENTS + 1)
-#define GXP_DEBUG_DUMP_DRAM_SEGMENT_IDX                                        \
-	(GXP_DEBUG_DUMP_CORE_SEGMENT_IDX_START + GXP_CORE_DRAM_SEGMENT_IDX)
 #define GXP_SEG_HEADER_NAME_LENGTH 32
+#define GXP_NUM_SEGMENTS_PER_CORE \
+	(GXP_NUM_COMMON_SEGMENTS + GXP_NUM_CORE_SEGMENTS + \
+	 GXP_NUM_BUFFER_MAPPINGS + 1)
 
 #define GXP_Q7_ICACHE_SIZE 131072 /* I-cache size in bytes */
 #define GXP_Q7_ICACHE_LINESIZE 64 /* I-cache line size in bytes */
@@ -173,8 +172,15 @@ struct gxp_debug_dump_work {
 	uint core_id;
 };
 
+struct gxp_debug_dump_buffer {
+	void *vaddr;
+	dma_addr_t daddr;
+	u32 size;
+};
+
 struct gxp_debug_dump_manager {
 	struct gxp_dev *gxp;
+	struct gxp_debug_dump_buffer buf;
 	struct gxp_debug_dump_work debug_dump_works[GXP_NUM_CORES];
 	struct gxp_core_dump *core_dump; /* start of the core dump */
 	struct gxp_common_dump *common_dump;
@@ -187,14 +193,14 @@ struct gxp_debug_dump_manager {
 	 */
 	struct mutex debug_dump_lock;
 #if IS_ENABLED(CONFIG_SUBSYSTEM_COREDUMP)
-	struct sscd_segment *segs[GXP_NUM_CORES];
+	struct sscd_segment segs[GXP_NUM_CORES][GXP_NUM_SEGMENTS_PER_CORE];
 #endif
 };
 
 int gxp_debug_dump_init(struct gxp_dev *gxp, void *sscd_dev, void *sscd_pdata);
 void gxp_debug_dump_exit(struct gxp_dev *gxp);
-void gxp_debug_dump_process_dump(struct work_struct *work);
 struct work_struct *gxp_debug_dump_get_notification_handler(struct gxp_dev *gxp,
 							    uint core);
+bool gxp_debug_dump_is_enabled(void);
 
 #endif /* __GXP_DEBUG_DUMP_H__ */
