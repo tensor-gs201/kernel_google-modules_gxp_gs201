@@ -40,7 +40,7 @@ enum lpm_state {
 
 #define LPM_CFG_SW_PS_TARGET_OFFSET 2
 
-#define CORE_WAKEUP_DOORBELL 0
+#define CORE_WAKEUP_DOORBELL(__core__) (0 + (__core__))
 
 #define AUR_DVFS_DOMAIN 17
 #define AUR_DVFS_DEBUG_REQ (1 << 31)

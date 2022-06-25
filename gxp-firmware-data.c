@@ -26,7 +26,7 @@
 #define FW_DATA_DEBUG_PATTERN		0x66
 
 /* IDs for dedicated doorbells used by some system components */
-#define DOORBELL_ID_CORE_WAKEUP		0
+#define DOORBELL_ID_CORE_WAKEUP(__core__) (0 + __core__)
 
 /* IDs for dedicated sync barriers used by some system components */
 #define SYNC_BARRIER_ID_UART		1
@@ -70,7 +70,7 @@ struct gxp_fw_data_manager {
 
 	/* Doorbells allocator and reserved doorbell IDs */
 	struct range_alloc *doorbell_allocator;
-	int cores_wakeup_doorbell;
+	int core_wakeup_doorbells[GXP_NUM_CORES];
 	int semaphore_doorbells[GXP_NUM_CORES];
 
 	/* Sync barriers allocator and reserved sync barrier IDs */
@@ -510,11 +510,13 @@ int gxp_fw_data_init(struct gxp_dev *gxp)
 	/* Allocate doorbells */
 
 	/* Pinned: Cores wakeup doorbell */
-	mgr->cores_wakeup_doorbell = DOORBELL_ID_CORE_WAKEUP;
-	res = range_alloc_get(mgr->doorbell_allocator,
-			      mgr->cores_wakeup_doorbell);
-	if (res)
-		goto err;
+	for (i = 0; i < GXP_NUM_CORES; i++) {
+		mgr->core_wakeup_doorbells[i] = DOORBELL_ID_CORE_WAKEUP(i);
+		res = range_alloc_get(mgr->doorbell_allocator,
+				      mgr->core_wakeup_doorbells[i]);
+		if (res)
+			goto err;
+	}
 
 	/* Semaphores operation doorbells */
 	for (i = 0; i < GXP_NUM_CORES; i++) {

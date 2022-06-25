@@ -199,7 +199,7 @@ void gxp_lpm_destroy(struct gxp_dev *gxp)
 int gxp_lpm_up(struct gxp_dev *gxp, uint core)
 {
 	/* Clear wakeup doorbell */
-	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL);
+	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL(core));
 
 	/* Enable core PSM */
 	if (psm_enable(gxp, core)) {
@@ -224,8 +224,8 @@ void gxp_lpm_down(struct gxp_dev *gxp, uint core)
 	gxp_lpm_enable_state(gxp, core, LPM_PG_STATE);
 
 	/* Set wakeup doorbell to trigger an automatic transition to PS3 */
-	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
-	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL);
+	gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core), core);
+	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL(core));
 	msleep(25 * GXP_TIME_DELAY_FACTOR);
 
 	/*
@@ -233,7 +233,7 @@ void gxp_lpm_down(struct gxp_dev *gxp, uint core)
 	 * the core will not wake unexpectedly.
 	 */
 	gxp_write_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0, 0);
-	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL);
+	gxp_doorbell_clear(gxp, CORE_WAKEUP_DOORBELL(core));
 
 	/* Ensure core is in PS3 */
 	gxp_lpm_set_state(gxp, core, LPM_PG_STATE, /*verbose=*/true);

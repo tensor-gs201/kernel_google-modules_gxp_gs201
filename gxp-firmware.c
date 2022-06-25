@@ -170,74 +170,94 @@ static int elf_load_segments(struct gxp_dev *gxp, const u8 *elf_data,
 }
 
 static int
-gxp_firmware_load_authenticated(struct gxp_dev *gxp, const struct firmware *fw,
-				const struct gxp_mapped_resource *buffer)
+gxp_firmware_authenticate(struct gxp_dev *gxp,
+			  const struct firmware *firmwares[GXP_NUM_CORES])
 {
-	const u8 *data = fw->data;
-	size_t size = fw->size;
+	const u8 *data;
+	size_t size;
 	void *header_vaddr;
+	struct gxp_mapped_resource *buffer;
 	dma_addr_t header_dma_addr;
+	int core;
 	int ret;
 
 	if (gxp_dsp_fw_auth_disable) {
 		dev_warn(gxp->dev,
 			 "DSP FW authentication disabled, skipping\n");
-		return elf_load_segments(gxp, data + FW_HEADER_SIZE,
-					 size - FW_HEADER_SIZE, buffer);
+		return 0;
 	}
 
 	if (!gxp->gsa_dev) {
 		dev_warn(
 			gxp->dev,
 			"No GSA device available, skipping firmware authentication\n");
-		return elf_load_segments(gxp, data + FW_HEADER_SIZE,
-					 size - FW_HEADER_SIZE, buffer);
+		return 0;
 	}
 
-	if ((size - FW_HEADER_SIZE) > buffer->size) {
-		dev_err(gxp->dev, "Firmware image does not fit (%zu > %llu)\n",
-			size - FW_HEADER_SIZE, buffer->size);
-		return -EINVAL;
-	}
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		data = firmwares[core]->data;
+		size = firmwares[core]->size;
+		buffer = &gxp->fwbufs[core];
 
-	dev_dbg(gxp->dev, "Authenticating firmware\n");
+		if ((size - FW_HEADER_SIZE) > buffer->size) {
+			dev_err(gxp->dev,
+				"Firmware image does not fit (%zu > %llu)\n",
+				size - FW_HEADER_SIZE, buffer->size);
+			ret = -EINVAL;
+			goto error;
+		}
 
-	/* Allocate coherent memory for the image header */
-	header_vaddr = dma_alloc_coherent(gxp->gsa_dev, FW_HEADER_SIZE,
-					  &header_dma_addr, GFP_KERNEL);
-	if (!header_vaddr) {
-		dev_err(gxp->dev,
-			"Failed to allocate coherent memory for header\n");
-		return -ENOMEM;
-	}
+		dev_dbg(gxp->dev, "Authenticating firmware of core%u\n", core);
 
-	/* Copy the header to GSA coherent memory */
-	memcpy(header_vaddr, data, FW_HEADER_SIZE);
+		/* Allocate coherent memory for the image header */
+		header_vaddr = dma_alloc_coherent(gxp->gsa_dev, FW_HEADER_SIZE,
+						  &header_dma_addr, GFP_KERNEL);
+		if (!header_vaddr) {
+			dev_err(gxp->dev,
+				"Failed to allocate coherent memory for header\n");
+			ret = -ENOMEM;
+			goto error;
+		}
 
-	/* Copy the firmware image to the carveout location, skipping the header */
-	memcpy_toio(buffer->vaddr, data + FW_HEADER_SIZE,
-		    size - FW_HEADER_SIZE);
+		/* Copy the header to GSA coherent memory */
+		memcpy(header_vaddr, data, FW_HEADER_SIZE);
 
-	dev_dbg(gxp->dev,
-		"Requesting GSA authentication. meta = %pad payload = %pap",
-		&header_dma_addr, &buffer->paddr);
+		/* Copy the firmware image to the carveout location, skipping the header */
+		memcpy_toio(buffer->vaddr, data + FW_HEADER_SIZE,
+			    size - FW_HEADER_SIZE);
 
-	ret = gsa_authenticate_image(gxp->gsa_dev, header_dma_addr,
-				     buffer->paddr);
-	if (ret) {
-		dev_err(gxp->dev, "GSA authentication failed: %d\n", ret);
-	} else {
 		dev_dbg(gxp->dev,
-			"Authentication succeeded, loading ELF segments\n");
-		ret = elf_load_segments(gxp, data + FW_HEADER_SIZE,
-					size - FW_HEADER_SIZE, buffer);
-		if (ret)
-			dev_err(gxp->dev, "ELF parsing failed (%d)\n", ret);
+			"Requesting GSA authentication. meta = %pad payload = %pap",
+			&header_dma_addr, &buffer->paddr);
+
+		ret = gsa_authenticate_image(gxp->gsa_dev, header_dma_addr,
+					     buffer->paddr);
+
+		dma_free_coherent(gxp->gsa_dev, FW_HEADER_SIZE, header_vaddr,
+				  header_dma_addr);
+
+		if (ret) {
+			dev_err(gxp->dev, "GSA authentication failed: %d\n",
+				ret);
+			goto error;
+		}
 	}
 
-	dma_free_coherent(gxp->gsa_dev, FW_HEADER_SIZE, header_vaddr,
-			  header_dma_addr);
+	return 0;
 
+error:
+	/*
+	 * Zero out firmware buffers if we got a authentication failure on any
+	 * core.
+	 */
+	for (core -= 1; core >= 0; core--)
+		/*
+		 * TODO(b/237789581) Only the image which failed auth is being
+		 * zeroed out here. This is benign since the other buffers will
+		 * be zeroed-out next call, but should still be fixed.
+		 * The fix is ready upstream and will be in the next release.
+		 */
+		memset_io(buffer->vaddr, 0, buffer->size);
 	return ret;
 }
 
@@ -271,9 +291,11 @@ static int gxp_firmware_load(struct gxp_dev *gxp, uint core)
 	if (!gxp->firmwares[core])
 		return -ENODEV;
 
-	/* Authenticate and load firmware to System RAM */
-	ret = gxp_firmware_load_authenticated(gxp, gxp->firmwares[core],
-					      &gxp->fwbufs[core]);
+	/* Load firmware to System RAM */
+	ret = elf_load_segments(gxp,
+				gxp->firmwares[core]->data + FW_HEADER_SIZE,
+				gxp->firmwares[core]->size - FW_HEADER_SIZE,
+				&gxp->fwbufs[core]);
 	if (ret) {
 		dev_err(gxp->dev, "Unable to load elf file\n");
 		goto out_firmware_unload;
@@ -313,11 +335,11 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 
 	/* Raise wakeup doorbell */
 	dev_notice(gxp->dev, "Raising doorbell %d interrupt\n",
-		   CORE_WAKEUP_DOORBELL);
+		   CORE_WAKEUP_DOORBELL(core));
 #ifndef CONFIG_GXP_GEM5
-	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
+	gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core), core);
 #endif
-	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL);
+	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL(core));
 
 	/* Wait for core to come up */
 	dev_notice(gxp->dev, "Waiting for core %u to power up...\n", core);
@@ -375,7 +397,7 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	 */
 	ctr = 1000;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_TOP_ACCESS_OK);
-	expected_top_value = BIT(0);
+	expected_top_value = BIT(CORE_WAKEUP_DOORBELL(core));
 	while (ctr--) {
 		if (readl(core_scratchpad_base + offset) == expected_top_value)
 			break;
@@ -450,11 +472,24 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 	int ret;
 	int core;
 
+	/*
+	 * Lock the VD semaphore to ensure no core is executing the firmware
+	 * while requesting new firmware.
+	 */
+	down_read(&gxp->vd_semaphore);
+
+	if (gxp->firmware_running) {
+		dev_warn(dev, "Cannot update firmware when any core is running\n");
+		ret = -EBUSY;
+		goto out;
+	}
+
 	name_buf = fw_name_from_attr_buf(buf);
 	if (IS_ERR(name_buf)) {
 		dev_err(gxp->dev, "Invalid firmware prefix requested: %s\n",
 			buf);
-		return PTR_ERR(name_buf);
+		ret = PTR_ERR(name_buf);
+		goto out;
 	}
 
 	mutex_lock(&gxp->dsp_firmware_lock);
@@ -463,19 +498,15 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 
 	ret = request_dsp_firmware(gxp, name_buf, firmwares);
 	if (ret) {
-		mutex_unlock(&gxp->dsp_firmware_lock);
 		dev_err(gxp->dev,
 			"Failed to request firmwares with names \"%sX\" (ret=%d)\n",
 			name_buf, ret);
-		kfree(name_buf);
-		return ret;
+		goto err_request_firmware;
 	}
 
-	/*
-	 * Lock the VD semaphore to make sure no new firmware is started while
-	 * changing out the images in `gxp->firmwares`
-	 */
-	down_read(&gxp->vd_semaphore);
+	ret = gxp_firmware_authenticate(gxp, firmwares);
+	if (ret)
+		goto err_authenticate_firmware;
 
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp->firmwares[core])
@@ -486,10 +517,19 @@ static ssize_t load_dsp_firmware_store(struct device *dev,
 	kfree(gxp->firmware_name);
 	gxp->firmware_name = name_buf;
 
-	up_read(&gxp->vd_semaphore);
 	mutex_unlock(&gxp->dsp_firmware_lock);
-
+out:
+	up_read(&gxp->vd_semaphore);
 	return count;
+
+err_authenticate_firmware:
+	for (core = 0; core < GXP_NUM_CORES; core++)
+		release_firmware(firmwares[core]);
+err_request_firmware:
+	kfree(name_buf);
+	mutex_unlock(&gxp->dsp_firmware_lock);
+	up_read(&gxp->vd_semaphore);
+	return ret;
 }
 
 static DEVICE_ATTR_RW(load_dsp_firmware);
@@ -613,18 +653,34 @@ void gxp_fw_destroy(struct gxp_dev *gxp)
 int gxp_firmware_request_if_needed(struct gxp_dev *gxp)
 {
 	int ret = 0;
+	uint core;
 
 	mutex_lock(&gxp->dsp_firmware_lock);
 
-	if (!gxp->is_firmware_requested) {
-		ret = request_dsp_firmware(gxp, DSP_FIRMWARE_DEFAULT_PREFIX,
-					   gxp->firmwares);
-		if (!ret)
-			gxp->is_firmware_requested = true;
-	}
+	if (gxp->is_firmware_requested)
+		goto out;
 
+	ret = request_dsp_firmware(gxp, DSP_FIRMWARE_DEFAULT_PREFIX,
+				   gxp->firmwares);
+	if (ret)
+		goto out;
+
+	ret = gxp_firmware_authenticate(gxp, gxp->firmwares);
+	if (ret)
+		goto err_authenticate_firmware;
+
+	gxp->is_firmware_requested = true;
+
+out:
 	mutex_unlock(&gxp->dsp_firmware_lock);
+	return ret;
 
+err_authenticate_firmware:
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		release_firmware(gxp->firmwares[core]);
+		gxp->firmwares[core] = NULL;
+	}
+	mutex_unlock(&gxp->dsp_firmware_lock);
 	return ret;
 }
 
@@ -652,10 +708,10 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 #ifdef CONFIG_GXP_GEM5
 	/*
 	 * GEM5 starts firmware after LPM is programmed, so we need to call
-	 * gxp_doorbell_set_listening_core here to set GXP_REG_COMMON_INT_MASK_0
+	 * gxp_doorbell_enable_for_core() here to set GXP_REG_COMMON_INT_MASK_0
 	 * first to enable the firmware hadnshaking.
 	 */
-	gxp_doorbell_set_listening_core(gxp, CORE_WAKEUP_DOORBELL, core);
+	gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core), core);
 #endif
 	ret = gxp_firmware_setup_hw_after_block_off(gxp, core,
 						    /*verbose=*/true);

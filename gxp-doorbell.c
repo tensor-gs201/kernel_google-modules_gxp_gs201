@@ -13,18 +13,10 @@
 #define GXP_DOORBELL_STRIDE (GXP_REG_DOORBELL_1_STATUS \
 			     - GXP_REG_DOORBELL_0_STATUS)
 
-void gxp_doorbell_set_listening_core(struct gxp_dev *gxp, u32 doorbell_num,
-				     uint core)
+void gxp_doorbell_enable_for_core(struct gxp_dev *gxp, u32 doorbell_num,
+				  uint core)
 {
-	uint i;
 	u32 val;
-
-	/* Disable DOORBELL_NUM on all cores */
-	for (i = 0; i < GXP_NUM_CORES; i++) {
-		val = gxp_read_32_core(gxp, i, GXP_REG_COMMON_INT_MASK_0);
-		val &= ~BIT(doorbell_num);
-		gxp_write_32_core(gxp, i, GXP_REG_COMMON_INT_MASK_0, val);
-	}
 
 	/* Enable DOORBELL_NUM on requested core */
 	val = gxp_read_32_core(gxp, core, GXP_REG_COMMON_INT_MASK_0);
