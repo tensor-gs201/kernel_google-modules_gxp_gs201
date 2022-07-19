@@ -7,6 +7,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/mm.h>
+#include <linux/mmap_lock.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -83,6 +84,7 @@ struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
 	 * it with FOLL_WRITE.
 	 * default to read/write if find_extend_vma returns NULL
 	 */
+	mmap_read_lock(current->mm);
 	vma = find_extend_vma(current->mm, user_address & PAGE_MASK);
 	if (vma) {
 		if (!(vma->vm_flags & VM_WRITE))
@@ -91,6 +93,7 @@ struct gxp_mapping *gxp_mapping_create(struct gxp_dev *gxp,
 		dev_dbg(gxp->dev,
 			"unable to find address in VMA, assuming buffer writable");
 	}
+	mmap_read_unlock(current->mm);
 
 	/* Pin the user pages */
 	offset = user_address & (PAGE_SIZE - 1);

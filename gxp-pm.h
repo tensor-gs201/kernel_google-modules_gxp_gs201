@@ -64,13 +64,6 @@ enum aur_power_cmu_mux_state {
 #define AUR_MAX_ALLOW_STATE AUR_UD_PLUS
 #define AUR_MAX_ALLOW_MEMORY_STATE AUR_MEM_MAX
 
-/*
- * The bit to indicate non-aggressor vote for `exynos_acpm_set_rate`.
- * Lower 3 byte of frequency parameter of `exynos_acpm_set_rate` will still be
- * the requested rate.
- */
-#define AUR_NON_AGGRESSOR_BIT 24
-
 #define AUR_NUM_POWER_STATE_WORKER 16
 
 struct gxp_pm_device_ops {
@@ -85,7 +78,8 @@ struct gxp_set_acpm_state_work {
 	struct gxp_dev *gxp;
 	unsigned long state;
 	unsigned long prev_state;
-	bool aggressor_vote;
+	bool low_clkmux;
+	bool prev_low_clkmux;
 	bool using;
 };
 
@@ -101,9 +95,17 @@ struct gxp_power_manager {
 	struct gxp_dev *gxp;
 	struct mutex pm_lock;
 	uint pwr_state_req_count[AUR_NUM_POWER_STATE];
-	uint non_aggressor_pwr_state_req_count[AUR_NUM_POWER_STATE];
+	uint low_clkmux_pwr_state_req_count[AUR_NUM_POWER_STATE];
 	uint mem_pwr_state_req_count[AUR_NUM_MEMORY_POWER_STATE];
-	bool curr_aggressor_vote;
+	/*
+	 * Last set CLKMUX state by asynchronous request handler.
+	 * If a core is booting, we shouldn't change clock mux state. This is
+	 * the expected state to set after all cores booting are finished.
+	 * Otherwise, it's the real state of CLKMUX.
+	 */
+	bool curr_low_clkmux;
+	/* Last requested clock mux state */
+	bool last_scheduled_low_clkmux;
 	int curr_state;
 	int curr_memory_state;
 	struct gxp_pm_device_ops *ops;
@@ -118,7 +120,7 @@ struct gxp_power_manager {
 	/* INT/MIF requests for memory bandwidth */
 	struct exynos_pm_qos_request int_min;
 	struct exynos_pm_qos_request mif_min;
-	int force_noc_mux_normal_count;
+	int force_mux_normal_count;
 	/* Max frequency that the thermal driver/ACPM will allow in Hz */
 	unsigned long thermal_limit;
 	u64 blk_switch_count;
@@ -237,12 +239,12 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
  * @gxp: The GXP device to operate.
  * @origin_state: An existing old requested state, will be cleared. If this is
  *                the first vote, pass AUR_OFF.
- * @origin_requested_aggressor: Specify whether the existing vote was requested with
- *                              aggressor flag.
+ * @origin_requested_low_clkmux: Specify whether the existing vote was requested with
+ *                               low frequency CLKMUX flag.
  * @requested_state: The new requested state.
- * @requested_aggressor: Specify whether the new vote is requested with aggressor
- *                       flag. Will take no effect if the @requested state is
- *                       AUR_OFF.
+ * @requested_low_clkmux: Specify whether the new vote is requested with low frequency
+ *			  CLKMUX flag. Will take no effect if the @requested state is
+ *			  AUR_OFF.
  * @origin_mem_state: An existing old requested state, will be cleared. If this is
  *                the first vote, pass AUR_MEM_UNDEFINED.
  * @requested_mem_state: The new requested state.
@@ -254,23 +256,23 @@ int gxp_pm_blk_get_state_acpm(struct gxp_dev *gxp);
 
 int gxp_pm_update_requested_power_states(
 	struct gxp_dev *gxp, enum aur_power_state origin_state,
-	bool origin_requested_aggressor, enum aur_power_state requested_state,
-	bool requested_aggressor, enum aur_memory_power_state origin_mem_state,
+	bool origin_requested_low_clkmux, enum aur_power_state requested_state,
+	bool requested_low_clkmux, enum aur_memory_power_state origin_mem_state,
 	enum aur_memory_power_state requested_mem_state);
 
 /*
- * gxp_pm_force_cmu_noc_user_mux_normal() - Force PLL_CON0_NOC_USER MUX switch to the
- * normal state. This is required to guarantee LPM works when the core is starting the
- * firmware.
+ * gxp_pm_force_clkmux_normal() - Force PLL_CON0_NOC_USER and PLL_CON0_PLL_AUR MUX
+ * switch to the normal state. This is required to guarantee LPM works when the core
+ * is starting the firmware.
  */
-void gxp_pm_force_cmu_noc_user_mux_normal(struct gxp_dev *gxp);
+void gxp_pm_force_clkmux_normal(struct gxp_dev *gxp);
 
 /*
- * gxp_pm_check_cmu_noc_user_mux() - Check PLL_CON0_NOC_USER MUX state modified
- * by gxp_pm_force_cmu_noc_user_mux_normal(). If the requested state is
- * AUR_READY, should set it to AUR_CMU_MUX_LOW.
+ * gxp_pm_resume_clkmux() - Check PLL_CON0_NOC_USER and PLL_CON0_PLL_AUR MUX state
+ * modified by gxp_pm_force_clkmux_normal(). If the current vote is requested with low
+ * frequency CLKMUX flag, should set the MUX state to AUR_CMU_MUX_LOW.
  */
-void gxp_pm_check_cmu_noc_user_mux(struct gxp_dev *gxp);
+void gxp_pm_resume_clkmux(struct gxp_dev *gxp);
 
 /**
  * gxp_pm_set_thermal_limit() - Notify the power manager of a thermal limit

@@ -442,7 +442,7 @@ gxp_mailbox_command_compat(struct gxp_client *client,
 		&client->vd->mailbox_resp_queues[virt_core].queue,
 		&client->vd->mailbox_resp_queues[virt_core].lock,
 		&client->vd->mailbox_resp_queues[virt_core].waitq,
-		gxp_power_state, memory_power_state, true,
+		gxp_power_state, memory_power_state, false,
 		client->mb_eventfds[virt_core]);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
@@ -475,7 +475,7 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	int virt_core, phys_core;
 	int ret = 0;
 	uint gxp_power_state, memory_power_state;
-	bool requested_aggressor = false;
+	bool requested_low_clkmux = false;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf))) {
 		dev_err(gxp->dev,
@@ -497,6 +497,18 @@ static int gxp_mailbox_command(struct gxp_client *client,
 		dev_err(gxp->dev, "Requested memory power state is invalid\n");
 		return -EINVAL;
 	}
+
+	if (ibuf.gxp_power_state == GXP_POWER_STATE_READY) {
+		dev_warn_once(
+			gxp->dev,
+			"GXP_POWER_STATE_READY is deprecated, please set GXP_POWER_LOW_FREQ_CLKMUX with GXP_POWER_STATE_UUD state");
+		ibuf.gxp_power_state = GXP_POWER_STATE_UUD;
+	}
+
+	if(ibuf.power_flags & GXP_POWER_NON_AGGRESSOR)
+		dev_warn_once(
+			gxp->dev,
+			"GXP_POWER_NON_AGGRESSOR is deprecated, no operation here");
 
 	/* Caller must hold VIRTUAL_DEVICE wakelock */
 	down_read(&client->semaphore);
@@ -545,14 +557,14 @@ static int gxp_mailbox_command(struct gxp_client *client,
 	cmd.buffer_descriptor = buffer;
 	gxp_power_state = aur_state_array[ibuf.gxp_power_state];
 	memory_power_state = aur_memory_state_array[ibuf.memory_power_state];
-	requested_aggressor = (ibuf.power_flags & GXP_POWER_NON_AGGRESSOR) == 0;
+	requested_low_clkmux = (ibuf.power_flags & GXP_POWER_LOW_FREQ_CLKMUX) != 0;
 
 	ret = gxp_mailbox_execute_cmd_async(
 		gxp->mailbox_mgr->mailboxes[phys_core], &cmd,
 		&client->vd->mailbox_resp_queues[virt_core].queue,
 		&client->vd->mailbox_resp_queues[virt_core].lock,
 		&client->vd->mailbox_resp_queues[virt_core].waitq,
-		gxp_power_state, memory_power_state, requested_aggressor,
+		gxp_power_state, memory_power_state, requested_low_clkmux,
 		client->mb_eventfds[virt_core]);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to enqueue mailbox command (ret=%d)\n",
@@ -1254,6 +1266,13 @@ static int gxp_acquire_wake_lock_compat(
 		return -EINVAL;
 	}
 
+	if (ibuf.gxp_power_state == GXP_POWER_STATE_READY) {
+		dev_warn_once(
+			gxp->dev,
+			"GXP_POWER_STATE_READY is deprecated, please set GXP_POWER_LOW_FREQ_CLKMUX with GXP_POWER_STATE_UUD state");
+		ibuf.gxp_power_state = GXP_POWER_STATE_UUD;
+	}
+
 	down_write(&client->semaphore);
 	if ((ibuf.components_to_wake & WAKELOCK_VIRTUAL_DEVICE) &&
 	    (!client->vd)) {
@@ -1324,12 +1343,12 @@ static int gxp_acquire_wake_lock_compat(
 	}
 
 	gxp_pm_update_requested_power_states(
-		gxp, client->requested_power_state, client->requested_aggressor,
-		aur_state_array[ibuf.gxp_power_state], true,
+		gxp, client->requested_power_state, client->requested_low_clkmux,
+		aur_state_array[ibuf.gxp_power_state], false,
 		client->requested_memory_power_state,
 		aur_memory_state_array[ibuf.memory_power_state]);
 	client->requested_power_state = aur_state_array[ibuf.gxp_power_state];
-	client->requested_aggressor = true;
+	client->requested_low_clkmux = false;
 	client->requested_memory_power_state =
 		aur_memory_state_array[ibuf.memory_power_state];
 out:
@@ -1360,7 +1379,7 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 	struct gxp_dev *gxp = client->gxp;
 	struct gxp_acquire_wakelock_ioctl ibuf;
 	bool acquired_block_wakelock = false;
-	bool requested_aggressor = false;
+	bool requested_low_clkmux = false;
 	int ret = 0;
 
 	if (copy_from_user(&ibuf, argp, sizeof(ibuf)))
@@ -1384,6 +1403,18 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 			ibuf.memory_power_state);
 		return -EINVAL;
 	}
+
+	if (ibuf.gxp_power_state == GXP_POWER_STATE_READY) {
+		dev_warn_once(
+			gxp->dev,
+			"GXP_POWER_STATE_READY is deprecated, please set GXP_POWER_LOW_FREQ_CLKMUX with GXP_POWER_STATE_UUD state");
+		ibuf.gxp_power_state = GXP_POWER_STATE_UUD;
+	}
+
+	if(ibuf.flags & GXP_POWER_NON_AGGRESSOR)
+		dev_warn_once(
+			gxp->dev,
+			"GXP_POWER_NON_AGGRESSOR is deprecated, no operation here");
 
 	down_write(&client->semaphore);
 	if ((ibuf.components_to_wake & WAKELOCK_VIRTUAL_DEVICE) &&
@@ -1446,15 +1477,15 @@ static int gxp_acquire_wake_lock(struct gxp_client *client,
 
 		client->has_vd_wakelock = true;
 	}
-	requested_aggressor = (ibuf.flags & GXP_POWER_NON_AGGRESSOR) == 0;
+	requested_low_clkmux = (ibuf.flags & GXP_POWER_LOW_FREQ_CLKMUX) != 0;
 
 	gxp_pm_update_requested_power_states(
-		gxp, client->requested_power_state, client->requested_aggressor,
-		aur_state_array[ibuf.gxp_power_state], requested_aggressor,
+		gxp, client->requested_power_state, client->requested_low_clkmux,
+		aur_state_array[ibuf.gxp_power_state], requested_low_clkmux,
 		client->requested_memory_power_state,
 		aur_memory_state_array[ibuf.memory_power_state]);
 	client->requested_power_state = aur_state_array[ibuf.gxp_power_state];
-	client->requested_aggressor = requested_aggressor;
+	client->requested_low_clkmux = requested_low_clkmux;
 	client->requested_memory_power_state =
 		aur_memory_state_array[ibuf.memory_power_state];
 out:
@@ -1536,12 +1567,12 @@ static int gxp_release_wake_lock(struct gxp_client *client, __u32 __user *argp)
 		 */
 		gxp_pm_update_requested_power_states(
 			gxp, client->requested_power_state,
-			client->requested_aggressor, AUR_OFF, true,
+			client->requested_low_clkmux, AUR_OFF, false,
 			client->requested_memory_power_state,
 			AUR_MEM_UNDEFINED);
 		client->requested_power_state = AUR_OFF;
 		client->requested_memory_power_state = AUR_MEM_UNDEFINED;
-
+		client->requested_low_clkmux = false;
 		client->has_block_wakelock = false;
 	}
 

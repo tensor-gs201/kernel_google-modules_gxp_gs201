@@ -239,6 +239,7 @@ gxp_firmware_authenticate(struct gxp_dev *gxp,
 		if (ret) {
 			dev_err(gxp->dev, "GSA authentication failed: %d\n",
 				ret);
+			memset_io(buffer->vaddr, 0, buffer->size);
 			goto error;
 		}
 	}
@@ -250,14 +251,10 @@ error:
 	 * Zero out firmware buffers if we got a authentication failure on any
 	 * core.
 	 */
-	for (core -= 1; core >= 0; core--)
-		/*
-		 * TODO(b/237789581) Only the image which failed auth is being
-		 * zeroed out here. This is benign since the other buffers will
-		 * be zeroed-out next call, but should still be fixed.
-		 * The fix is ready upstream and will be in the next release.
-		 */
+	for (core -= 1; core >= 0; core--) {
+		buffer = &gxp->fwbufs[core];
 		memset_io(buffer->vaddr, 0, buffer->size);
+	}
 	return ret;
 }
 
@@ -333,14 +330,6 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	void __iomem *core_scratchpad_base;
 	int ctr;
 
-	/* Raise wakeup doorbell */
-	dev_notice(gxp->dev, "Raising doorbell %d interrupt\n",
-		   CORE_WAKEUP_DOORBELL(core));
-#ifndef CONFIG_GXP_GEM5
-	gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core), core);
-#endif
-	gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL(core));
-
 	/* Wait for core to come up */
 	dev_notice(gxp->dev, "Waiting for core %u to power up...\n", core);
 	ctr = 1000;
@@ -370,7 +359,7 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 	 */
 	ctr = 5000;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_CORE_ALIVE);
-	usleep_range(500 * GXP_TIME_DELAY_FACTOR, 1000 * GXP_TIME_DELAY_FACTOR);
+	usleep_range(50 * GXP_TIME_DELAY_FACTOR, 60 * GXP_TIME_DELAY_FACTOR);
 	while (ctr--) {
 		if (readl(core_scratchpad_base + offset) == Q7_ALIVE_MAGIC)
 			break;
@@ -385,15 +374,14 @@ static int gxp_firmware_handshake(struct gxp_dev *gxp, uint core)
 
 #ifndef CONFIG_GXP_GEM5
 	/*
-	 * Currently, the hello_world FW reads the INT_MASK0 register
-	 * (written by the driver) to validate TOP access. The value
-	 * read is echoed back by the FW to offset MSG_TOP_ACCESS_OK in
-	 * the scratchpad space, which must be compared to the value
-	 * written in the INT_MASK0 register by the driver for
-	 * confirmation.
+	 * FW reads the INT_MASK0 register (written by the driver) to
+	 * validate TOP access. The value read is echoed back by the FW to
+	 * offset MSG_TOP_ACCESS_OK in the scratchpad space, which must be
+	 * compared to the value written in the INT_MASK0 register by the
+	 * driver for confirmation.
 	 * On Gem5, FW will start early when lpm is up. This behavior will
-	 * affect the order of reading/writing INT_MASK0, so ignore this
-	 * handshaking in Gem5.
+	 * affect the order of reading/writing INT_MASK0, so ignore these
+	 * handshakes in Gem5.
 	 */
 	ctr = 1000;
 	offset = SCRATCHPAD_MSG_OFFSET(MSG_TOP_ACCESS_OK);
@@ -684,11 +672,9 @@ err_authenticate_firmware:
 	return ret;
 }
 
-int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
-		     uint virt_core, uint core)
+static int gxp_firmware_setup(struct gxp_dev *gxp, uint core)
 {
 	int ret = 0;
-	struct work_struct *work;
 
 	if (gxp->firmware_running & BIT(core)) {
 		dev_err(gxp->dev, "Firmware is already running on core %u\n",
@@ -705,35 +691,46 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 	/* Mark this as a cold boot */
 	gxp_firmware_set_boot_mode(gxp, core, GXP_BOOT_MODE_REQUEST_COLD_BOOT);
 
-#ifdef CONFIG_GXP_GEM5
-	/*
-	 * GEM5 starts firmware after LPM is programmed, so we need to call
-	 * gxp_doorbell_enable_for_core() here to set GXP_REG_COMMON_INT_MASK_0
-	 * first to enable the firmware hadnshaking.
-	 */
-	gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core), core);
-#endif
 	ret = gxp_firmware_setup_hw_after_block_off(gxp, core,
 						    /*verbose=*/true);
 	if (ret) {
 		dev_err(gxp->dev, "Failed to power up core %u\n", core);
-		goto out_firmware_unload;
+		gxp_firmware_unload(gxp, core);
 	}
 
-	/* Switch PLL_CON0_NOC_USER MUX to the normal state to guarantee LPM works */
-	gxp_pm_force_cmu_noc_user_mux_normal(gxp);
+	return ret;
+}
+
+static void gxp_firmware_wakeup_cores(struct gxp_dev *gxp, uint core_list)
+{
+	uint core;
+
+	/* Raise wakeup doorbell */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (!(core_list & BIT(core)))
+			continue;
+#ifndef CONFIG_GXP_GEM5
+		gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core),
+					     core);
+#endif
+		gxp_doorbell_set(gxp, CORE_WAKEUP_DOORBELL(core));
+	}
+}
+
+static int gxp_firmware_finish_startup(struct gxp_dev *gxp,
+				       struct gxp_virtual_device *vd,
+				       uint virt_core, uint core)
+{
+	int ret = 0;
+	struct work_struct *work;
+
 	ret = gxp_firmware_handshake(gxp, core);
 	if (ret) {
 		dev_err(gxp->dev, "Firmware handshake failed on core %u\n",
 			core);
 		gxp_pm_core_off(gxp, core);
-		goto out_check_noc_user_mux;
+		goto out_firmware_unload;
 	}
-	/*
-	 * Check if we need to set PLL_CON0_NOC_USER MUX to low state for
-	 * AUR_READY requested state.
-	 */
-	gxp_pm_check_cmu_noc_user_mux(gxp);
 
 	/* Initialize mailbox */
 	gxp->mailbox_mgr->mailboxes[core] =
@@ -761,22 +758,14 @@ int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 
 	return ret;
 
-out_check_noc_user_mux:
-	gxp_pm_check_cmu_noc_user_mux(gxp);
 out_firmware_unload:
 	gxp_firmware_unload(gxp, core);
 	return ret;
 }
 
-int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
-					  bool verbose)
-{
-	gxp_program_reset_vector(gxp, core, verbose);
-	return gxp_pm_core_on(gxp, core, verbose);
-}
-
-void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
-		       uint virt_core, uint core)
+static void gxp_firmware_stop_core(struct gxp_dev *gxp,
+				   struct gxp_virtual_device *vd,
+				   uint virt_core, uint core)
 {
 	if (!(gxp->firmware_running & BIT(core)))
 		dev_err(gxp->dev, "Firmware is not running on core %u\n", core);
@@ -795,6 +784,106 @@ void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
 	if (vd->state == GXP_VD_RUNNING)
 		gxp_pm_core_off(gxp, core);
 	gxp_firmware_unload(gxp, core);
+}
+
+int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		     uint core_list)
+{
+	int ret;
+	uint core, virt_core;
+	uint failed_cores = 0;
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (core_list & BIT(core)) {
+			ret = gxp_firmware_setup(gxp, core);
+			if (ret) {
+				failed_cores |= BIT(core);
+				dev_err(gxp->dev, "Failed to run firmware on core %u\n",
+					core);
+			}
+		}
+	}
+	if (failed_cores != 0) {
+		/*
+		 * Shut down the cores which call `gxp_firmware_setup`
+		 * successfully
+		 */
+		for (core = 0; core < GXP_NUM_CORES; core++) {
+			if (core_list & BIT(core)) {
+				if (!(failed_cores & BIT(core))) {
+					gxp_pm_core_off(gxp, core);
+					gxp_firmware_unload(gxp, core);
+				}
+			}
+		}
+		goto out;
+	}
+#ifdef CONFIG_GXP_GEM5
+	/*
+	 * GEM5 starts firmware after LPM is programmed, so we need to call
+	 * gxp_doorbell_enable_for_core here to set GXP_REG_COMMON_INT_MASK_0
+	 * first to enable the firmware handshakes.
+	 */
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (!(core_list & BIT(core)))
+			continue;
+		gxp_doorbell_enable_for_core(gxp, CORE_WAKEUP_DOORBELL(core),
+					     core);
+	}
+#endif
+	/* Switch clock mux to the normal state to guarantee LPM works */
+	gxp_pm_force_clkmux_normal(gxp);
+	gxp_firmware_wakeup_cores(gxp, core_list);
+	virt_core = 0;
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (core_list & BIT(core)) {
+			ret = gxp_firmware_finish_startup(gxp, vd, virt_core,
+							  core);
+			if (ret) {
+				failed_cores |= BIT(core);
+				dev_err(gxp->dev,
+					"Failed to run firmware on core %u\n",
+					core);
+			}
+			virt_core++;
+		}
+	}
+
+	if (failed_cores != 0) {
+		for (core = 0; core < GXP_NUM_CORES; core++) {
+			if (core_list & BIT(core)) {
+				if (!(failed_cores & BIT(core))) {
+					gxp_firmware_stop_core(gxp, vd,
+							       virt_core, core);
+				}
+			}
+		}
+	}
+	/* Check if we need to set clock mux to low state as requested */
+	gxp_pm_resume_clkmux(gxp);
+out:
+	return ret;
+}
+
+int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
+					  bool verbose)
+{
+	gxp_program_reset_vector(gxp, core, verbose);
+	return gxp_pm_core_on(gxp, core, verbose);
+}
+
+
+void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		       uint core_list)
+{
+	uint core, virt_core = 0;
+
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (core_list & BIT(core)) {
+			gxp_firmware_stop_core(gxp, vd, virt_core, core);
+			virt_core++;
+		}
+	}
 }
 
 void gxp_firmware_set_boot_mode(struct gxp_dev *gxp, uint core, u32 mode)

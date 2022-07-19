@@ -32,7 +32,7 @@ struct gxp_client *gxp_client_create(struct gxp_dev *gxp)
 	client->requested_memory_power_state = 0;
 	client->vd = NULL;
 	client->tpu_mbx_allocated = false;
-	client->requested_aggressor = false;
+	client->requested_low_clkmux = false;
 	return client;
 }
 
@@ -65,7 +65,7 @@ void gxp_client_destroy(struct gxp_client *client)
 		gxp_wakelock_release(client->gxp);
 		gxp_pm_update_requested_power_states(
 			gxp, client->requested_power_state,
-			client->requested_aggressor, AUR_OFF, true,
+			client->requested_low_clkmux, AUR_OFF, false,
 			client->requested_memory_power_state,
 			AUR_MEM_UNDEFINED);
 	}

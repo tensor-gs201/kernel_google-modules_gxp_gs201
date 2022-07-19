@@ -64,22 +64,24 @@ void gxp_fw_destroy(struct gxp_dev *gxp);
 int gxp_firmware_request_if_needed(struct gxp_dev *gxp);
 
 /*
- * Loads the firmware for the specified core in system memory and powers up the
- * core to start FW execution.
- */
-int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
-		     uint virt_core, uint core);
-/*
- * Shuts down the specified core.
- */
-void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
-		       uint virt_core, uint core);
-/*
  * Re-program the reset vector and power on the core's LPM if the block had
  * been shut down.
  */
 int gxp_firmware_setup_hw_after_block_off(struct gxp_dev *gxp, uint core,
 					  bool verbose);
+
+/*
+ *  Loads the firmware for the cores in system memory and powers up the cores
+ *  to start FW execution.
+ */
+int gxp_firmware_run(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		     uint core_list);
+
+/*
+ * Shuts down the cores and releases the resources.
+ */
+void gxp_firmware_stop(struct gxp_dev *gxp, struct gxp_virtual_device *vd,
+		       uint core_list);
 
 /*
  * Sets the specified core's boot mode or suspend request value.

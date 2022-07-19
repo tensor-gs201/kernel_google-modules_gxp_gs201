@@ -94,8 +94,11 @@ struct gxp_async_response {
 	uint gxp_power_state;
 	/* Specified memory power state vote during the command execution */
 	uint memory_power_state;
-	/* Specified whether the power state vote is requested with aggressor flag */
-	bool requested_aggressor;
+	/*
+	 * Specified whether the power state vote is requested with low
+	 * frequency CLKMUX flag.
+	 */
+	bool requested_low_clkmux;
 	/* gxp_eventfd to signal when the response completes. May be NULL */
 	struct gxp_eventfd *eventfd;
 };
@@ -206,7 +209,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  spinlock_t *queue_lock,
 				  wait_queue_head_t *queue_waitq,
 				  uint gxp_power_state, uint memory_power_state,
-				  bool requested_aggressor,
+				  bool requested_low_clkmux,
 				  struct gxp_eventfd *eventfd);
 
 int gxp_mailbox_register_interrupt_handler(struct gxp_mailbox *mailbox,

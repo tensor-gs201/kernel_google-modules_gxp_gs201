@@ -264,57 +264,37 @@ int gxp_vd_start(struct gxp_virtual_device *vd)
 			gxp_dma_map_core_resources(gxp, vd, virt_core, core);
 			map_telemetry_buffers(gxp, vd, virt_core, core);
 			map_debug_dump_buffer(gxp, vd, virt_core, core);
-			ret = gxp_firmware_run(gxp, vd, virt_core, core);
-			if (ret) {
-				dev_err(gxp->dev, "Failed to run firmware on core %u\n",
-					core);
-				/*
-				 * out_vd_stop will only clean up the cores that
-				 * had their firmware start successfully, so we
-				 * need to clean up `core` here.
-				 */
-				unmap_debug_dump_buffer(gxp, vd, virt_core,
-							core);
-				unmap_telemetry_buffers(gxp, vd, virt_core,
-							core);
-				gxp_dma_unmap_core_resources(gxp, vd, virt_core,
-							     core);
-				gxp_dma_domain_detach_device(gxp, vd,
-							     virt_core);
-				gxp->core_to_vd[core] = NULL;
-				goto out_vd_stop;
-			}
 			virt_core++;
 		}
 	}
 
-	if (cores_remaining != 0) {
-		dev_err(gxp->dev,
-			"Internal error: Failed to start %u requested cores. %u cores remaining\n",
-			vd->num_cores, cores_remaining);
-		/*
-		 * Should never reach here. Previously verified that enough
-		 * cores are available.
-		 */
-		WARN_ON(true);
-		ret = -EIO;
-		goto out_vd_stop;
-	}
+	ret = gxp_firmware_run(gxp, vd, core_list);
+	if (ret)
+		goto error;
+
 	vd->state = GXP_VD_RUNNING;
-
 	return ret;
 
-out_vd_stop:
-	gxp_vd_stop(vd);
+error:
+	virt_core = 0;
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		if (core_list & BIT(core)) {
+			unmap_debug_dump_buffer(gxp, vd, virt_core, core);
+			unmap_telemetry_buffers(gxp, vd, virt_core, core);
+			gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
+			gxp_dma_domain_detach_device(gxp, vd, virt_core);
+			gxp->core_to_vd[core] = NULL;
+			virt_core++;
+		}
+	}
 	return ret;
-
 }
 
 /* Caller must hold gxp->vd_semaphore for writing */
 void gxp_vd_stop(struct gxp_virtual_device *vd)
 {
 	struct gxp_dev *gxp = vd->gxp;
-	uint core;
+	uint core, core_list = 0;
 	uint virt_core = 0;
 	uint lpm_state;
 
@@ -332,9 +312,14 @@ void gxp_vd_stop(struct gxp_virtual_device *vd)
 		}
 	}
 
+	for (core = 0; core < GXP_NUM_CORES; core++)
+		if (gxp->core_to_vd[core] == vd)
+			core_list |= BIT(core);
+
+	gxp_firmware_stop(gxp, vd, core_list);
+
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp->core_to_vd[core] == vd) {
-			gxp_firmware_stop(gxp, vd, virt_core, core);
 			unmap_debug_dump_buffer(gxp, vd, virt_core, core);
 			unmap_telemetry_buffers(gxp, vd, virt_core, core);
 			gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
@@ -369,7 +354,7 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 			"Attempt to suspend a virtual device twice\n");
 		return;
 	}
-	gxp_pm_force_cmu_noc_user_mux_normal(gxp);
+	gxp_pm_force_clkmux_normal(gxp);
 	/*
 	 * Start the suspend process for all of this VD's cores without waiting
 	 * for completion.
@@ -432,7 +417,7 @@ void gxp_vd_suspend(struct gxp_virtual_device *vd)
 			gxp_pm_get_blk_switch_count(gxp);
 		vd->state = GXP_VD_SUSPENDED;
 	}
-	gxp_pm_check_cmu_noc_user_mux(gxp);
+	gxp_pm_resume_clkmux(gxp);
 }
 
 /*
@@ -456,7 +441,7 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 			"Attempt to resume a virtual device which was not suspended\n");
 		return -EBUSY;
 	}
-	gxp_pm_force_cmu_noc_user_mux_normal(gxp);
+	gxp_pm_force_clkmux_normal(gxp);
 	curr_blk_switch_count = gxp_pm_get_blk_switch_count(gxp);
 	/*
 	 * Start the resume process for all of this VD's cores without waiting
@@ -533,7 +518,7 @@ int gxp_vd_resume(struct gxp_virtual_device *vd)
 	} else {
 		vd->state = GXP_VD_RUNNING;
 	}
-	gxp_pm_check_cmu_noc_user_mux(gxp);
+	gxp_pm_resume_clkmux(gxp);
 	return ret;
 }
 

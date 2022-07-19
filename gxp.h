@@ -116,9 +116,10 @@ struct gxp_virtual_device_ioctl {
 /*
  * DSP subsystem Power state values for use as `gxp_power_state` in
  * `struct gxp_acquire_wakelock_ioctl`.
- * Note: GXP_POWER_STATE_READY is the state to keep the BLOCK idle. By setting
- * this state, the driver will request UUD frequency and switch the CMUMUX
- * clocks into 25 MHz to save more power.
+ * Note: GXP_POWER_STATE_READY is a deprecated state. The way to achieve
+ * original state is to request GXP_POWER_STATE_UUD with setting
+ * GXP_POWER_LOW_FREQ_CLKMUX flag. Requesting GXP_POWER_STATE_READY is treated
+ * as identical to GXP_POWER_STATE_UUD.
  */
 #define GXP_POWER_STATE_OFF	0
 #define GXP_POWER_STATE_UUD	1
@@ -146,14 +147,24 @@ struct gxp_virtual_device_ioctl {
 /*
  * GXP power flag macros, supported by `flags` in `gxp_acquire_wakelock_ioctl`
  * and `power_flags in `gxp_mailbox_command_ioctl`.
- * The client can request non-aggressor vote by this flag, which means if the
- * requested voltage is lower than the current voltage of VDD_CAM, adopt the
- * current voltage of VDD_CAM for DSP. On the other hand, if the requested
- * voltage is higher, adopt the requested one for DSP.
  *
- * Note: aggressor votes will have higher priority than non-aggressor votes.
+ * Non-aggressor flag is deprecated. Setting this flag is a no-op since
+ * non-aggressor support is defeatured.
  */
 #define GXP_POWER_NON_AGGRESSOR		(1 << 0)
+/*
+ * The client can request low frequency clkmux vote by this flag, which means
+ * the kernel driver will switch the CLKMUX clocks to save more power.
+ *
+ * Note: The kernel driver keep seperate track of low frequency clkmux votes
+ * and normal votes, and the low frequency clkmux votes will have lower priority
+ * than all normal votes.
+ * For example, if the kerenl driver has two votes, one is GXP_POWER_STATE_UUD
+ * without GXP_POWER_LOW_FREQ_CLKMUX, and the other one is GXP_POWER_STATE_NOM
+ * with GXP_POWER_LOW_FREQ_CLKMUX. The voting result is GXP_POWER_STATE_UUD
+ * without GXP_POWER_LOW_FREQ_CLKMUX.
+ */
+#define GXP_POWER_LOW_FREQ_CLKMUX       (1 << 1)
 
 struct gxp_acquire_wakelock_ioctl {
 	/*
@@ -199,22 +210,11 @@ struct gxp_acquire_wakelock_ioctl {
 	 * Set RESERVED bits to 0 to ensure backwards compatibility.
 	 *
 	 * Bitfields:
-	 *   [0:0]   - NON_AGGRESSOR setting for ACPM:
-	 *               0 = AGGRESSOR, default value
-	 *               1 = NON_AGGRESSOR
-	 *             If the client makes a NON_AGGRESSOR request, the DSP is
-	 *             only guaranteed to operate at `gxp_power_state` when it
-	 *             is the only component active on its voltage rail. If
-	 *             another component becomes active on the rail, at any
-	 *             point while a NON_AGGRESSOR request is active, the rail
-	 *             will defer to the other component's requested state.
-	 *
-	 *             Note: An AGGRESSOR request from any client overrides all
-	 *             NON_AGGRESSOR requests. At that point, the DSP will
-	 *             operate at the AGGRESSOR request's `gxp_power_state`,
-	 *             regardless of other components on the DSP's rail or what
-	 *             power state any NON_AGGRESSOR requests specified.
-	 *   [31:1]  - RESERVED
+	 *   [0:0]   - Deprecated, do not use
+	 *   [1:1]   - LOW_FREQ_CLKMUX setting for power management
+	 *		 0 = Don't switch CLKMUX clocks, default value
+	 *		 1 = Switch CLKMUX clocks
+	 *   [31:2]  - RESERVED
 	 */
 	__u32 flags;
 };
@@ -483,12 +483,11 @@ struct gxp_mailbox_command_ioctl {
 	 * Set RESERVED bits to 0 to ensure backwards compatibility.
 	 *
 	 * Bitfields:
-	 *   [0:0]   - NON_AGGRESSOR setting for ACPM:
-	 *               0 = AGGRESSOR, default value
-	 *               1 = NON_AGGRESSOR
-	 *             Note: It takes effect only if every client holds a
-	 *             wakelock with NON_AGGRESSOR.
-	 *   [31:1]  - RESERVED
+	 *   [0:0]   - Deprecated, do not use
+	 *   [1:1]   - LOW_FREQ_CLKMUX setting for power management
+	 *		 0 = Don't switch CLKMUX clocks, default value
+	 *		 1 = Switch CLKMUX clocks
+	 *   [31:2]  - RESERVED
 	 */
 	__u32 power_flags;
 };

@@ -33,7 +33,7 @@ struct gxp_client {
 	uint requested_power_state;
 	/* Value is one of the MEMORY_POWER_STATE_* values from gxp.h. */
 	uint requested_memory_power_state;
-	bool requested_aggressor;
+	bool requested_low_clkmux;
 
 	struct gxp_virtual_device *vd;
 	bool tpu_mbx_allocated;

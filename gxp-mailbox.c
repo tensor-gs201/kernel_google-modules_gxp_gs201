@@ -234,8 +234,8 @@ static void gxp_mailbox_handle_response(struct gxp_mailbox *mailbox,
 				gxp_pm_update_requested_power_states(
 					async_resp->mailbox->gxp,
 					async_resp->gxp_power_state,
-					async_resp->requested_aggressor,
-					AUR_OFF, true,
+					async_resp->requested_low_clkmux,
+					AUR_OFF, false,
 					async_resp->memory_power_state,
 					AUR_MEM_UNDEFINED);
 
@@ -828,7 +828,7 @@ static void async_cmd_timeout_work(struct work_struct *work)
 
 		gxp_pm_update_requested_power_states(
 			async_resp->mailbox->gxp, async_resp->gxp_power_state,
-			async_resp->requested_aggressor, AUR_OFF, true,
+			async_resp->requested_low_clkmux, AUR_OFF, false,
 			async_resp->memory_power_state, AUR_MEM_UNDEFINED);
 
 		if (async_resp->eventfd) {
@@ -848,7 +848,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 				  spinlock_t *queue_lock,
 				  wait_queue_head_t *queue_waitq,
 				  uint gxp_power_state, uint memory_power_state,
-				  bool requested_aggressor,
+				  bool requested_low_clkmux,
 				  struct gxp_eventfd *eventfd)
 {
 	struct gxp_async_response *async_resp;
@@ -864,7 +864,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 	async_resp->dest_queue_waitq = queue_waitq;
 	async_resp->gxp_power_state = gxp_power_state;
 	async_resp->memory_power_state = memory_power_state;
-	async_resp->requested_aggressor = requested_aggressor;
+	async_resp->requested_low_clkmux = requested_low_clkmux;
 	if (eventfd && gxp_eventfd_get(eventfd))
 		async_resp->eventfd = eventfd;
 	else
@@ -875,8 +875,8 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 			      msecs_to_jiffies(MAILBOX_TIMEOUT));
 
 	gxp_pm_update_requested_power_states(
-		mailbox->gxp, AUR_OFF, true, gxp_power_state,
-		requested_aggressor, AUR_MEM_UNDEFINED, memory_power_state);
+		mailbox->gxp, AUR_OFF, false, gxp_power_state,
+		requested_low_clkmux, AUR_MEM_UNDEFINED, memory_power_state);
 	ret = gxp_mailbox_enqueue_cmd(mailbox, cmd, &async_resp->resp,
 				      /* resp_is_async = */ true);
 	if (ret)
@@ -886,7 +886,7 @@ int gxp_mailbox_execute_cmd_async(struct gxp_mailbox *mailbox,
 
 err_free_resp:
 	gxp_pm_update_requested_power_states(mailbox->gxp, gxp_power_state,
-					     requested_aggressor, AUR_OFF, true,
+					     requested_low_clkmux, AUR_OFF, false,
 					     memory_power_state,
 					     AUR_MEM_UNDEFINED);
 	cancel_delayed_work_sync(&async_resp->timeout_work);
