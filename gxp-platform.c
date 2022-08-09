@@ -13,6 +13,7 @@
 #include <linux/cred.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/genalloc.h>
 #include <linux/kthread.h>
@@ -182,6 +183,11 @@ static int gxp_release(struct inode *inode, struct file *file)
 	 */
 	if (!client)
 		return 0;
+
+	if (client->enabled_telemetry_logging)
+		gxp_telemetry_disable(client->gxp, GXP_TELEMETRY_TYPE_LOGGING);
+	if (client->enabled_telemetry_tracing)
+		gxp_telemetry_disable(client->gxp, GXP_TELEMETRY_TYPE_TRACING);
 
 	mutex_lock(&client->gxp->client_list_lock);
 	list_del(&client->list_entry);
@@ -986,6 +992,7 @@ static int gxp_enable_telemetry(struct gxp_client *client,
 {
 	struct gxp_dev *gxp = client->gxp;
 	__u8 type;
+	int ret;
 
 	if (copy_from_user(&type, argp, sizeof(type)))
 		return -EFAULT;
@@ -994,13 +1001,25 @@ static int gxp_enable_telemetry(struct gxp_client *client,
 	    type != GXP_TELEMETRY_TYPE_TRACING)
 		return -EINVAL;
 
-	return gxp_telemetry_enable(gxp, type);
+	ret = gxp_telemetry_enable(gxp, type);
+
+	/*
+	 * Record what telemetry types this client enabled so they can be
+	 * cleaned-up if the client closes without disabling them.
+	 */
+	if (!ret && type == GXP_TELEMETRY_TYPE_LOGGING)
+		client->enabled_telemetry_logging = true;
+	if (!ret && type == GXP_TELEMETRY_TYPE_TRACING)
+		client->enabled_telemetry_tracing = true;
+
+	return ret;
 }
 
 static int gxp_disable_telemetry(struct gxp_client *client, __u8 __user *argp)
 {
 	struct gxp_dev *gxp = client->gxp;
 	__u8 type;
+	int ret;
 
 	if (copy_from_user(&type, argp, sizeof(type)))
 		return -EFAULT;
@@ -1009,7 +1028,14 @@ static int gxp_disable_telemetry(struct gxp_client *client, __u8 __user *argp)
 	    type != GXP_TELEMETRY_TYPE_TRACING)
 		return -EINVAL;
 
-	return gxp_telemetry_disable(gxp, type);
+	ret = gxp_telemetry_disable(gxp, type);
+
+	if (!ret && type == GXP_TELEMETRY_TYPE_LOGGING)
+		client->enabled_telemetry_logging = false;
+	if (!ret && type == GXP_TELEMETRY_TYPE_TRACING)
+		client->enabled_telemetry_tracing = false;
+
+	return ret;
 }
 
 static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
@@ -1063,9 +1089,8 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 		goto out;
 	}
 
-	if (client->tpu_mbx_allocated) {
-		dev_err(gxp->dev, "%s: Mappings already exist for TPU mailboxes\n",
-			__func__);
+	if (client->tpu_file) {
+		dev_err(gxp->dev, "Mappings already exist for TPU mailboxes");
 		ret = -EBUSY;
 		goto out_free;
 	}
@@ -1078,8 +1103,28 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 				     ALLOCATE_EXTERNAL_MAILBOX, &gxp_tpu_info,
 				     mbx_info);
 	if (ret) {
-		dev_err(gxp->dev, "%s: Failed to allocate ext tpu mailboxes %d\n",
-			__func__, ret);
+		dev_err(gxp->dev, "Failed to allocate ext TPU mailboxes %d",
+			ret);
+		goto out_free;
+	}
+	/*
+	 * If someone is attacking us through this interface -
+	 * it's possible that ibuf.tpu_fd here is already a different file from
+	 * the one passed to edgetpu_ext_driver_cmd() (if the runtime closes the
+	 * FD and opens another file exactly between the TPU driver call above
+	 * and the fget below).
+	 * But the worst consequence of this attack is we fget() ourselves (GXP
+	 * FD), which only leads to memory leak (because the file object has a
+	 * reference to itself). The race is also hard to hit so we don't insist
+	 * on preventing it.
+	 */
+	client->tpu_file = fget(ibuf.tpu_fd);
+	if (!client->tpu_file) {
+		edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
+				       EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
+				       FREE_EXTERNAL_MAILBOX, &gxp_tpu_info,
+				       NULL);
+		ret = -EINVAL;
 		goto out_free;
 	}
 	/* Align queue size to page size for iommu map. */
@@ -1089,8 +1134,9 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	ret = gxp_dma_map_tpu_buffer(gxp, client->vd, virtual_core_list,
 				     phys_core_list, mbx_info);
 	if (ret) {
-		dev_err(gxp->dev, "%s: failed to map TPU mailbox buffer %d\n",
-			__func__, ret);
+		dev_err(gxp->dev, "Failed to map TPU mailbox buffer %d", ret);
+		fput(client->tpu_file);
+		client->tpu_file = NULL;
 		edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
 				       EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
 				       FREE_EXTERNAL_MAILBOX, &gxp_tpu_info,
@@ -1101,7 +1147,6 @@ static int gxp_map_tpu_mbx_queue(struct gxp_client *client,
 	client->mbx_desc.virt_core_list = virtual_core_list;
 	client->mbx_desc.cmdq_size = mbx_info->cmdq_size;
 	client->mbx_desc.respq_size = mbx_info->respq_size;
-	client->tpu_mbx_allocated = true;
 
 out_free:
 	kfree(mbx_info);
@@ -1138,9 +1183,8 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 		goto out;
 	}
 
-	if (!client->tpu_mbx_allocated) {
-		dev_err(gxp->dev, "%s: No mappings exist for TPU mailboxes\n",
-			__func__);
+	if (!client->tpu_file) {
+		dev_err(gxp->dev, "No mappings exist for TPU mailboxes");
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1148,16 +1192,11 @@ static int gxp_unmap_tpu_mbx_queue(struct gxp_client *client,
 	gxp_dma_unmap_tpu_buffer(gxp, client->vd, client->mbx_desc);
 
 	gxp_tpu_info.tpu_fd = ibuf.tpu_fd;
-	ret = edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
-				     EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
-				     FREE_EXTERNAL_MAILBOX, &gxp_tpu_info,
-				     NULL);
-	if (ret) {
-		dev_err(gxp->dev, "%s: Failed to free ext tpu mailboxes %d\n",
-			__func__, ret);
-		goto out;
-	}
-	client->tpu_mbx_allocated = false;
+	edgetpu_ext_driver_cmd(gxp->tpu_dev.dev,
+			       EDGETPU_EXTERNAL_CLIENT_TYPE_DSP,
+			       FREE_EXTERNAL_MAILBOX, &gxp_tpu_info, NULL);
+	fput(client->tpu_file);
+	client->tpu_file = NULL;
 
 out:
 	up_write(&client->semaphore);

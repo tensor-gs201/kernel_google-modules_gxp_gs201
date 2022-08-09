@@ -78,67 +78,51 @@ int gxp_telemetry_init(struct gxp_dev *gxp)
 /* Wrapper struct to be used by the telemetry vma_ops. */
 struct telemetry_vma_data {
 	struct gxp_dev *gxp;
-	struct buffer_data *data;
+	struct buffer_data *buff_data;
 	u8 type;
+	refcount_t ref_count;
 };
 
 static void gxp_telemetry_vma_open(struct vm_area_struct *vma)
 {
-	struct gxp_dev *gxp;
-	struct buffer_data *data;
-
-	gxp = ((struct telemetry_vma_data *)vma->vm_private_data)->gxp;
-	data = ((struct telemetry_vma_data *)vma->vm_private_data)->data;
+	struct telemetry_vma_data *vma_data =
+		(struct telemetry_vma_data *)vma->vm_private_data;
+	struct gxp_dev *gxp = vma_data->gxp;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
 
-	refcount_inc(&data->ref_count);
+	refcount_inc(&vma_data->ref_count);
 
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 }
 
-/*
- * Forward declaration of telemetry_disable_locked() so that
- * gxp_telemetry_vma_close() can invoke the locked version without having to
- * release `telemetry_mgr->lock` and calling gxp_telemetry_disable().
- */
-static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type);
+static void free_telemetry_buffers(struct gxp_dev *gxp, struct buffer_data *data);
 
 static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 {
-	struct gxp_dev *gxp;
-	struct buffer_data *data;
-	u8 type;
-	int i;
-	uint virt_core;
-	struct gxp_virtual_device *vd;
-
-	gxp = ((struct telemetry_vma_data *)vma->vm_private_data)->gxp;
-	data = ((struct telemetry_vma_data *)vma->vm_private_data)->data;
-	type = ((struct telemetry_vma_data *)vma->vm_private_data)->type;
+	struct telemetry_vma_data *vma_data =
+		(struct telemetry_vma_data *)vma->vm_private_data;
+	struct gxp_dev *gxp = vma_data->gxp;
+	struct buffer_data *buff_data = vma_data->buff_data;
+	u8 type = vma_data->type;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
 
-	down_read(&gxp->vd_semaphore);
-	if (refcount_dec_and_test(&data->ref_count)) {
-		if (data->host_status & GXP_TELEMETRY_HOST_STATUS_ENABLED)
-			telemetry_disable_locked(gxp, type);
+	if (!refcount_dec_and_test(&vma_data->ref_count))
+		goto out;
 
-		for (i = 0; i < GXP_NUM_CORES; i++) {
-			vd = gxp->core_to_vd[i];
-			if (vd != NULL) {
-				virt_core =
-					gxp_vd_phys_core_to_virt_core(vd, i);
-				gxp_dma_free_coherent(gxp, vd, BIT(virt_core),
-						      data->size,
-						      data->buffers[i],
-						      data->buffer_daddrs[i]);
-			} else {
-				gxp_dma_free_coherent(gxp, NULL, 0, data->size,
-						      data->buffers[i],
-						      data->buffer_daddrs[i]);
-			}
-		}
+	/*
+	 * Free the telemetry buffers if they are no longer in use.
+	 *
+	 * If a client enabled telemetry, then closed their VMA without
+	 * disabling it, firmware will still be expecting those buffers to be
+	 * mapped. If this is the case, telemetry will be disabled, and the
+	 * buffers freed, when the client is closed.
+	 *
+	 * We cannot disable telemetry here, since attempting to lock the
+	 * `vd_semaphore` while holding the mmap lock can lead to deadlocks.
+	 */
+	if (refcount_dec_and_test(&buff_data->ref_count)) {
 		switch (type) {
 		case GXP_TELEMETRY_TYPE_LOGGING:
 			gxp->telemetry_mgr->logging_buff_data = NULL;
@@ -150,11 +134,12 @@ static void gxp_telemetry_vma_close(struct vm_area_struct *vma)
 			dev_warn(gxp->dev, "%s called with invalid type %u\n",
 				 __func__, type);
 		}
-		kfree(data);
-		kfree(vma->vm_private_data);
+		free_telemetry_buffers(gxp, buff_data);
 	}
-	up_read(&gxp->vd_semaphore);
 
+	kfree(vma_data);
+
+out:
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 }
 
@@ -202,7 +187,6 @@ static int check_telemetry_type_availability(struct gxp_dev *gxp, u8 type)
  * @size: The size of buffer to allocate for each core
  *
  * Caller must hold the telemetry_manager's lock.
- * Caller must hold gxp->vd_semaphore for reading.
  *
  * Return: A pointer to the `struct buffer_data` if successful, NULL otherwise
  */
@@ -211,8 +195,10 @@ static struct buffer_data *allocate_telemetry_buffers(struct gxp_dev *gxp,
 {
 	struct buffer_data *data;
 	int i;
-	uint virt_core;
-	struct gxp_virtual_device *vd;
+	void *buf;
+	dma_addr_t daddr;
+
+	size = size < PAGE_SIZE ? PAGE_SIZE : size;
 
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -220,47 +206,49 @@ static struct buffer_data *allocate_telemetry_buffers(struct gxp_dev *gxp,
 
 	/* Allocate cache-coherent buffers for logging/tracing to */
 	for (i = 0; i < GXP_NUM_CORES; i++) {
-		/*
-		 * If the core is not allocated, we cannot map the buffer on
-		 * that core.
-		 */
-		vd = gxp->core_to_vd[i];
-		if (vd != NULL) {
-			virt_core = gxp_vd_phys_core_to_virt_core(vd, i);
-			data->buffers[i] = gxp_dma_alloc_coherent(
-				gxp, vd, BIT(virt_core), size,
-				&data->buffer_daddrs[i], GFP_KERNEL, 0);
-		} else {
-			data->buffers[i] =
-				gxp_dma_alloc_coherent(gxp, NULL, 0, size,
-						       &data->buffer_daddrs[i],
-						       GFP_KERNEL, 0);
-		}
-		if (!data->buffers[i])
+		/* Allocate a coherent buffer in the default domain */
+		buf = dma_alloc_coherent(gxp->dev, size, &daddr, GFP_KERNEL);
+		if (!buf) {
+			dev_err(gxp->dev,
+				"Failed to allocate coherent buffer\n");
 			goto err_alloc;
+		}
+		data->buffers[i] = buf;
+		data->buffer_daddrs[i] = daddr;
 	}
 	data->size = size;
 	refcount_set(&data->ref_count, 1);
+	data->is_enabled = false;
 
 	return data;
 
 err_alloc:
-	for (; i > 0; i--) {
-		vd = gxp->core_to_vd[i-1];
-		if (vd != NULL) {
-			virt_core = gxp_vd_phys_core_to_virt_core(vd, i);
-			gxp_dma_free_coherent(gxp, vd, BIT(virt_core), size,
-					      data->buffers[i - 1],
-					      data->buffer_daddrs[i - 1]);
-		} else {
-			gxp_dma_free_coherent(gxp, NULL, 0, size,
-					      data->buffers[i - 1],
-					      data->buffer_daddrs[i - 1]);
-		}
-	}
+	while (i--)
+		dma_free_coherent(gxp->dev, size, data->buffers[i],
+				  data->buffer_daddrs[i]);
 	kfree(data);
 
 	return NULL;
+}
+
+/**
+ * free_telemetry_buffers() - Unmap and free a `struct buffer_data`
+ * @gxp: The GXP device the buffers were allocated for
+ * @data: The descriptor of the buffers to unmap and free
+ *
+ * Caller must hold the telemetry_manager's lock.
+ */
+static void free_telemetry_buffers(struct gxp_dev *gxp, struct buffer_data *data)
+{
+	int i;
+
+	lockdep_assert_held(&gxp->telemetry_mgr->lock);
+
+	for (i = 0; i < GXP_NUM_CORES; i++)
+		dma_free_coherent(gxp->dev, data->size, data->buffers[i],
+				  data->buffer_daddrs[i]);
+
+	kfree(data);
 }
 
 /**
@@ -268,7 +256,7 @@ err_alloc:
  *                             user-space vm_area.
  * @gxp: The GXP device the buffers were allocated for
  * @vma: A vm area to remap the buffers into
- * @data: The data describing a set of telemetry buffers to remap
+ * @buff_data: The data describing a set of telemetry buffers to remap
  *
  * Caller must hold the telemetry_manager's lock.
  *
@@ -278,7 +266,7 @@ err_alloc:
  */
 static int remap_telemetry_buffers(struct gxp_dev *gxp,
 				   struct vm_area_struct *vma,
-				   struct buffer_data *data)
+				   struct buffer_data *buff_data)
 {
 	unsigned long orig_pgoff = vma->vm_pgoff;
 	int i;
@@ -296,7 +284,7 @@ static int remap_telemetry_buffers(struct gxp_dev *gxp,
 		 * Remap each core's buffer a page at a time, in case it is not
 		 * physically contiguous.
 		 */
-		for (offset = 0; offset < data->size; offset += PAGE_SIZE) {
+		for (offset = 0; offset < buff_data->size; offset += PAGE_SIZE) {
 			/*
 			 * `virt_to_phys()` does not work on memory allocated
 			 * by `dma_alloc_coherent()`, so we have to use
@@ -307,9 +295,10 @@ static int remap_telemetry_buffers(struct gxp_dev *gxp,
 			 */
 			phys = iommu_iova_to_phys(
 				iommu_get_domain_for_dev(gxp->dev),
-				data->buffer_daddrs[i] + offset);
+				buff_data->buffer_daddrs[i] + offset);
 			ret = remap_pfn_range(
-				vma, vma->vm_start + data->size * i + offset,
+				vma,
+				vma->vm_start + buff_data->size * i + offset,
 				phys >> PAGE_SHIFT, PAGE_SIZE,
 				vma->vm_page_prot);
 			if (ret)
@@ -331,10 +320,8 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 	struct telemetry_vma_data *vma_data;
 	size_t total_size = vma->vm_end - vma->vm_start;
 	size_t size = total_size / GXP_NUM_CORES;
-	struct buffer_data *data;
+	struct buffer_data *buff_data;
 	int i;
-	struct gxp_virtual_device *vd;
-	uint virt_core;
 
 	if (!gxp->telemetry_mgr)
 		return -ENODEV;
@@ -344,7 +331,6 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 		return -EINVAL;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
-	down_read(&gxp->vd_semaphore);
 
 	ret = check_telemetry_type_availability(gxp, type);
 	if (ret)
@@ -356,53 +342,43 @@ int gxp_telemetry_mmap_buffers(struct gxp_dev *gxp, u8 type,
 		goto err;
 	}
 
-	data = allocate_telemetry_buffers(gxp, size);
-	if (!data) {
+	buff_data = allocate_telemetry_buffers(gxp, size);
+	if (!buff_data) {
 		ret = -ENOMEM;
 		goto err_free_vma_data;
 	}
 
-	ret = remap_telemetry_buffers(gxp, vma, data);
+	ret = remap_telemetry_buffers(gxp, vma, buff_data);
 	if (ret)
 		goto err_free_buffers;
 
 	vma_data->gxp = gxp;
-	vma_data->data = data;
+	vma_data->buff_data = buff_data;
 	vma_data->type = type;
+	refcount_set(&vma_data->ref_count, 1);
 	vma->vm_private_data = vma_data;
 
 	/* Save book-keeping on the buffers in the telemetry manager */
 	if (type == GXP_TELEMETRY_TYPE_LOGGING)
-		gxp->telemetry_mgr->logging_buff_data = data;
+		gxp->telemetry_mgr->logging_buff_data = buff_data;
 	else /* type == GXP_TELEMETRY_TYPE_TRACING */
-		gxp->telemetry_mgr->tracing_buff_data = data;
+		gxp->telemetry_mgr->tracing_buff_data = buff_data;
 
-	up_read(&gxp->vd_semaphore);
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 
 	return 0;
 
 err_free_buffers:
-	for (i = 0; i < GXP_NUM_CORES; i++) {
-		vd = gxp->core_to_vd[i];
-		if (vd != NULL) {
-			virt_core = gxp_vd_phys_core_to_virt_core(vd, i);
-			gxp_dma_free_coherent(gxp, vd, BIT(virt_core),
-					      data->size, data->buffers[i],
-					      data->buffer_daddrs[i]);
-		} else {
-			gxp_dma_free_coherent(gxp, NULL, 0, data->size,
-					      data->buffers[i],
-					      data->buffer_daddrs[i]);
-		}
-	}
-	kfree(data);
+	for (i = 0; i < GXP_NUM_CORES; i++)
+		dma_free_coherent(gxp->dev, buff_data->size,
+				  buff_data->buffers[i],
+				  buff_data->buffer_daddrs[i]);
+	kfree(buff_data);
 
 err_free_vma_data:
 	kfree(vma_data);
 
 err:
-	up_read(&gxp->vd_semaphore);
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 	return ret;
 }
@@ -411,7 +387,8 @@ int gxp_telemetry_enable(struct gxp_dev *gxp, u8 type)
 {
 	struct buffer_data *data;
 	int ret = 0;
-	uint core;
+	uint core, virt_core;
+	struct gxp_virtual_device *vd;
 
 	mutex_lock(&gxp->telemetry_mgr->lock);
 
@@ -432,20 +409,49 @@ int gxp_telemetry_enable(struct gxp_dev *gxp, u8 type)
 		goto out;
 	}
 
+	/* Map the buffers for any cores already running */
+	down_read(&gxp->vd_semaphore);
+	for (core = 0; core < GXP_NUM_CORES; core++) {
+		vd = gxp->core_to_vd[core];
+		if (vd != NULL) {
+			virt_core = gxp_vd_phys_core_to_virt_core(vd, core);
+			ret = gxp_dma_map_allocated_coherent_buffer(
+				gxp, data->buffers[core], vd, BIT(virt_core),
+				data->size, data->buffer_daddrs[core], 0);
+			if (ret)
+				goto err;
+		}
+	}
+
 	/* Populate the buffer fields in firmware-data */
 	data->host_status |= GXP_TELEMETRY_HOST_STATUS_ENABLED;
 	gxp_fw_data_set_telemetry_descriptors(gxp, type, data->host_status,
 					      data->buffer_daddrs, data->size);
 
 	/* Notify any running cores that firmware-data was updated */
-	down_read(&gxp->vd_semaphore);
 	for (core = 0; core < GXP_NUM_CORES; core++) {
 		if (gxp_is_fw_running(gxp, core))
 			gxp_notification_send(gxp, core,
 					      CORE_NOTIF_TELEMETRY_STATUS);
 	}
-	up_read(&gxp->vd_semaphore);
 
+	refcount_inc(&data->ref_count);
+	data->is_enabled = true;
+
+	goto up_sem;
+err:
+	while (core--) {
+		vd = gxp->core_to_vd[core];
+		if (vd != NULL) {
+			virt_core = gxp_vd_phys_core_to_virt_core(vd, core);
+			gxp_dma_unmap_allocated_coherent_buffer(
+				gxp, vd, BIT(virt_core), data->size,
+				data->buffer_daddrs[core]);
+		}
+	}
+
+up_sem:
+	up_read(&gxp->vd_semaphore);
 out:
 	mutex_unlock(&gxp->telemetry_mgr->lock);
 
@@ -529,7 +535,8 @@ static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type)
 	struct buffer_data *data;
 	int ret = 0;
 	dma_addr_t null_daddrs[GXP_NUM_CORES] = {0};
-	uint core;
+	uint core, virt_core;
+	struct gxp_virtual_device *vd;
 
 	/* Cleanup telemetry manager's book-keeping */
 	switch (type) {
@@ -549,6 +556,8 @@ static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type)
 	if (!(data->host_status & GXP_TELEMETRY_HOST_STATUS_ENABLED))
 		return 0;
 
+	data->is_enabled = false;
+
 	/* Clear the log buffer fields in firmware-data */
 	data->host_status &= ~GXP_TELEMETRY_HOST_STATUS_ENABLED;
 	gxp_fw_data_set_telemetry_descriptors(gxp, type, data->host_status,
@@ -564,6 +573,28 @@ static int telemetry_disable_locked(struct gxp_dev *gxp, u8 type)
 					"%s: core%u failed to disable telemetry (type=%u, ret=%d)\n",
 					__func__, core, type, ret);
 		}
+		vd = gxp->core_to_vd[core];
+		if (vd != NULL) {
+			virt_core = gxp_vd_phys_core_to_virt_core(vd, core);
+			gxp_dma_unmap_allocated_coherent_buffer(
+				gxp, vd, BIT(virt_core), data->size,
+				data->buffer_daddrs[core]);
+		}
+	}
+
+	if (refcount_dec_and_test(&data->ref_count)) {
+		switch (type) {
+		case GXP_TELEMETRY_TYPE_LOGGING:
+			gxp->telemetry_mgr->logging_buff_data = NULL;
+			break;
+		case GXP_TELEMETRY_TYPE_TRACING:
+			gxp->telemetry_mgr->tracing_buff_data = NULL;
+			break;
+		default:
+			/* NO-OP, we returned above if `type` was invalid */
+			break;
+		}
+		free_telemetry_buffers(gxp, data);
 	}
 
 	return 0;

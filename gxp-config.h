@@ -18,7 +18,7 @@
 
 #endif /* unknown */
 
-#ifdef CONFIG_GXP_GEM5
+#if IS_ENABLED(CONFIG_GXP_GEM5)
 #undef GXP_NUM_CORES
 #define GXP_NUM_CORES 1
 #endif

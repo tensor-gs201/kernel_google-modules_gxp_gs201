@@ -156,7 +156,7 @@ struct gxp_virtual_device_ioctl {
  * The client can request low frequency clkmux vote by this flag, which means
  * the kernel driver will switch the CLKMUX clocks to save more power.
  *
- * Note: The kernel driver keep seperate track of low frequency clkmux votes
+ * Note: The kernel driver keep separate track of low frequency clkmux votes
  * and normal votes, and the low frequency clkmux votes will have lower priority
  * than all normal votes.
  * For example, if the kerenl driver has two votes, one is GXP_POWER_STATE_UUD

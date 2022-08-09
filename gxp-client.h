@@ -7,6 +7,7 @@
 #ifndef __GXP_CLIENT_H__
 #define __GXP_CLIENT_H__
 
+#include <linux/file.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/types.h>
@@ -36,7 +37,7 @@ struct gxp_client {
 	bool requested_low_clkmux;
 
 	struct gxp_virtual_device *vd;
-	bool tpu_mbx_allocated;
+	struct file *tpu_file;
 	struct gxp_tpu_mbx_desc mbx_desc;
 
 	struct gxp_eventfd *mb_eventfds[GXP_NUM_CORES];
@@ -45,6 +46,13 @@ struct gxp_client {
 	pid_t tgid;
 	/* client process ID is really the thread ID, may be transient. */
 	pid_t pid;
+
+	/*
+	 * Indicates whether the driver needs to disable telemetry when this
+	 * client closes. For when the client fails to disable telemetry itself.
+	 */
+	bool enabled_telemetry_logging;
+	bool enabled_telemetry_tracing;
 };
 
 /*

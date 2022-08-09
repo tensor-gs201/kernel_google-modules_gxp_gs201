@@ -159,56 +159,72 @@ void gxp_vd_release(struct gxp_virtual_device *vd)
 	kfree(vd);
 }
 
-static void map_telemetry_buffers(struct gxp_dev *gxp,
+static int map_telemetry_buffers(struct gxp_dev *gxp,
 				  struct gxp_virtual_device *vd, uint virt_core,
 				  uint core)
 {
-	if (gxp->telemetry_mgr->logging_buff_data)
-		gxp_dma_map_allocated_coherent_buffer(
-			gxp,
-			gxp->telemetry_mgr->logging_buff_data->buffers[core],
-			vd, BIT(virt_core),
-			gxp->telemetry_mgr->logging_buff_data->size,
-			gxp->telemetry_mgr->logging_buff_data
-				->buffer_daddrs[core],
-			0);
-	if (gxp->telemetry_mgr->tracing_buff_data)
-		gxp_dma_map_allocated_coherent_buffer(
-			gxp,
-			gxp->telemetry_mgr->tracing_buff_data->buffers[core],
-			vd, BIT(virt_core),
-			gxp->telemetry_mgr->tracing_buff_data->size,
-			gxp->telemetry_mgr->tracing_buff_data
-				->buffer_daddrs[core],
-			0);
+	int ret = 0;
+	struct buffer_data *buff_data;
+
+	/* Map logging buffers if logging is enabled */
+	buff_data = gxp->telemetry_mgr->logging_buff_data;
+	if (buff_data && buff_data->is_enabled) {
+		ret = gxp_dma_map_allocated_coherent_buffer(
+			gxp, buff_data->buffers[core], vd, BIT(virt_core),
+			buff_data->size, buff_data->buffer_daddrs[core], 0);
+		/* Don't bother checking tracing if logging fails */
+		if (ret)
+			return ret;
+	}
+
+	/* Map tracing buffers if tracing is enabled */
+	buff_data = gxp->telemetry_mgr->tracing_buff_data;
+	if (buff_data && buff_data->is_enabled) {
+		ret = gxp_dma_map_allocated_coherent_buffer(
+			gxp, buff_data->buffers[core], vd, BIT(virt_core),
+			buff_data->size, buff_data->buffer_daddrs[core], 0);
+		/* If tracing fails, unmap logging if it was enabled */
+		if (ret) {
+			buff_data = gxp->telemetry_mgr->logging_buff_data;
+			if (buff_data && buff_data->is_enabled)
+				gxp_dma_unmap_allocated_coherent_buffer(
+					gxp, vd, BIT(virt_core),
+					buff_data->size,
+					buff_data->buffer_daddrs[core]);
+		}
+	}
+
+	return ret;
 }
 
 static void unmap_telemetry_buffers(struct gxp_dev *gxp,
 				    struct gxp_virtual_device *vd,
 				    uint virt_core, uint core)
 {
-	if (gxp->telemetry_mgr->logging_buff_data)
+	struct buffer_data *buff_data;
+
+	buff_data = gxp->telemetry_mgr->logging_buff_data;
+	if (buff_data && buff_data->is_enabled)
 		gxp_dma_unmap_allocated_coherent_buffer(
-			gxp, vd, BIT(virt_core),
-			gxp->telemetry_mgr->logging_buff_data->size,
-			gxp->telemetry_mgr->logging_buff_data
-				->buffer_daddrs[core]);
-	if (gxp->telemetry_mgr->tracing_buff_data)
+			gxp, vd, BIT(virt_core), buff_data->size,
+			buff_data->buffer_daddrs[core]);
+
+	buff_data = gxp->telemetry_mgr->tracing_buff_data;
+	if (buff_data && buff_data->is_enabled)
 		gxp_dma_unmap_allocated_coherent_buffer(
-			gxp, vd, BIT(virt_core),
-			gxp->telemetry_mgr->tracing_buff_data->size,
-			gxp->telemetry_mgr->tracing_buff_data
-				->buffer_daddrs[core]);
+			gxp, vd, BIT(virt_core), buff_data->size,
+			buff_data->buffer_daddrs[core]);
 }
 
-static void map_debug_dump_buffer(struct gxp_dev *gxp,
-				  struct gxp_virtual_device *vd, uint virt_core,
-				  uint core)
+static int map_debug_dump_buffer(struct gxp_dev *gxp,
+				 struct gxp_virtual_device *vd, uint virt_core,
+				 uint core)
 {
+	/* If debug-dump is not enabled, nothing to map */
 	if (!gxp->debug_dump_mgr)
-		return;
+		return 0;
 
-	gxp_dma_map_allocated_coherent_buffer(
+	return gxp_dma_map_allocated_coherent_buffer(
 		gxp, gxp->debug_dump_mgr->buf.vaddr, vd, BIT(virt_core),
 		gxp->debug_dump_mgr->buf.size, gxp->debug_dump_mgr->buf.daddr,
 		0);
@@ -260,33 +276,53 @@ int gxp_vd_start(struct gxp_virtual_device *vd)
 		if (core_list & BIT(core)) {
 			gxp->core_to_vd[core] = vd;
 			cores_remaining--;
-			gxp_dma_domain_attach_device(gxp, vd, virt_core, core);
-			gxp_dma_map_core_resources(gxp, vd, virt_core, core);
-			map_telemetry_buffers(gxp, vd, virt_core, core);
-			map_debug_dump_buffer(gxp, vd, virt_core, core);
+			ret = gxp_dma_domain_attach_device(gxp, vd, virt_core,
+							   core);
+			if (ret)
+				goto err_clean_all_cores;
+			ret = gxp_dma_map_core_resources(gxp, vd, virt_core,
+							 core);
+			if (ret)
+				goto err_detach_domain;
+			ret = map_telemetry_buffers(gxp, vd, virt_core, core);
+			if (ret)
+				goto err_unmap_res;
+			ret = map_debug_dump_buffer(gxp, vd, virt_core, core);
+			if (ret)
+				goto err_unmap_telem;
 			virt_core++;
 		}
 	}
 
 	ret = gxp_firmware_run(gxp, vd, core_list);
 	if (ret)
-		goto error;
+		goto err_clean_all_cores;
 
 	vd->state = GXP_VD_RUNNING;
 	return ret;
 
-error:
-	virt_core = 0;
-	for (core = 0; core < GXP_NUM_CORES; core++) {
+err_unmap_telem:
+	unmap_telemetry_buffers(gxp, vd, virt_core, core);
+err_unmap_res:
+	gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
+err_detach_domain:
+	gxp_dma_domain_detach_device(gxp, vd, virt_core);
+err_clean_all_cores:
+	gxp->core_to_vd[core] = NULL;
+	virt_core--;
+	while (core > 0) {
+		core--;
 		if (core_list & BIT(core)) {
 			unmap_debug_dump_buffer(gxp, vd, virt_core, core);
 			unmap_telemetry_buffers(gxp, vd, virt_core, core);
 			gxp_dma_unmap_core_resources(gxp, vd, virt_core, core);
 			gxp_dma_domain_detach_device(gxp, vd, virt_core);
 			gxp->core_to_vd[core] = NULL;
-			virt_core++;
+			virt_core--;
 		}
 	}
+	gxp_fw_data_destroy_app(gxp, vd->fw_app);
+
 	return ret;
 }
 
