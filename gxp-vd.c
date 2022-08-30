@@ -166,6 +166,8 @@ static int map_telemetry_buffers(struct gxp_dev *gxp,
 	int ret = 0;
 	struct buffer_data *buff_data;
 
+	mutex_lock(&gxp->telemetry_mgr->lock);
+
 	/* Map logging buffers if logging is enabled */
 	buff_data = gxp->telemetry_mgr->logging_buff_data;
 	if (buff_data && buff_data->is_enabled) {
@@ -174,7 +176,7 @@ static int map_telemetry_buffers(struct gxp_dev *gxp,
 			buff_data->size, buff_data->buffer_daddrs[core], 0);
 		/* Don't bother checking tracing if logging fails */
 		if (ret)
-			return ret;
+			goto out;
 	}
 
 	/* Map tracing buffers if tracing is enabled */
@@ -194,6 +196,9 @@ static int map_telemetry_buffers(struct gxp_dev *gxp,
 		}
 	}
 
+out:
+	mutex_unlock(&gxp->telemetry_mgr->lock);
+
 	return ret;
 }
 
@@ -202,6 +207,8 @@ static void unmap_telemetry_buffers(struct gxp_dev *gxp,
 				    uint virt_core, uint core)
 {
 	struct buffer_data *buff_data;
+
+	mutex_lock(&gxp->telemetry_mgr->lock);
 
 	buff_data = gxp->telemetry_mgr->logging_buff_data;
 	if (buff_data && buff_data->is_enabled)
@@ -214,6 +221,8 @@ static void unmap_telemetry_buffers(struct gxp_dev *gxp,
 		gxp_dma_unmap_allocated_coherent_buffer(
 			gxp, vd, BIT(virt_core), buff_data->size,
 			buff_data->buffer_daddrs[core]);
+
+	mutex_unlock(&gxp->telemetry_mgr->lock);
 }
 
 static int map_debug_dump_buffer(struct gxp_dev *gxp,
