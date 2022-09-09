@@ -5,6 +5,7 @@
  * Copyright (C) 2021 Google LLC
  */
 
+#include <linux/dma-iommu.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/platform_device.h>
@@ -214,6 +215,9 @@ int gxp_dma_init(struct gxp_dev *gxp)
 		dev_err(gxp->dev, "Failed to enable aux support in SysMMU\n");
 		goto err_unreg_fault_handler;
 	}
+
+	/* Enable best fit algorithm to minimize fragmentation */
+	iommu_dma_enable_best_fit_algo(gxp->dev);
 
 	gxp->dma_mgr = &(mgr->dma_mgr);
 
